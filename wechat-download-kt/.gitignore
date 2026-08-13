@@ -1,0 +1,11 @@
+.gradle/
+build/
+*.iml
+*.class
+.idea/
+out/
+data/
+qrcode/
+config.yaml
+.env
+*.log
