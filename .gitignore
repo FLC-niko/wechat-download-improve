@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# 外部项目目录（不应提交到此仓库）
+we-mp-rss-all/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 运行时数据
+data/
+*.log
