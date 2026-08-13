@@ -6,6 +6,7 @@ build/
 out/
 data/
 qrcode/
+logs/
 config.yaml
 .env
 *.log
