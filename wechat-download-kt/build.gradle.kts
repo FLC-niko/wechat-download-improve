@@ -48,6 +48,13 @@ dependencies {
     // Coroutines（与 Worker 一致）
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
 
+    // RabbitMQ Java client（与 Worker 一致）
+    implementation("com.rabbitmq:amqp-client:5.18.0")
+
+    // 二维码生成（微信读书扫码登录推送）
+    implementation("com.google.zxing:core:3.5.2")
+    implementation("com.google.zxing:javase:3.5.2")
+
     // 测试
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5:1.9.20")
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.1")

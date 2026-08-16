@@ -16,6 +16,20 @@ rss:
   poll_interval: 3600        # 轮询间隔（秒）
   articles_per_poll: 10      # 每次轮询拉取文章数
 
+# RabbitMQ 配置（与 we-mp-rss-kotlin Worker 保持一致）
+rabbitmq:
+  host: "localhost"
+  port: 5672
+  username: "guest"
+  password: "guest"
+  pro_virtual_host: "pro"
+  test_virtual_host: "test"
+  thdag_virtual_host: "thdag"
+  reconnect_initial_delay_ms: 5000
+  reconnect_max_delay_ms: 60000
+  max_task_retry: 5          # 任务最大重试次数，超过进死信队列
+  task_retry_delay_ms: 60000
+
 notification:
   wecom_webhook_url: ""      # 企业微信群机器人 Webhook
   feishu_webhook_url: ""     # 飞书机器人 Webhook

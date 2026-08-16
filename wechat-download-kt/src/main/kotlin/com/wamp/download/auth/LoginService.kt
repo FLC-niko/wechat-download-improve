@@ -315,7 +315,7 @@ class LoginService(
                 val html = resp.body?.string().orEmpty()
                 // 从 HTML 中提取 nick_name
                 val nickRegex = Regex("""nick_name\s*[:=]\s*["']([^"']+)["']""")
-                nickRegex.find(html)?.let { nickname = it.groupValues[1] }
+                nickRegex.find(html)?.let { nickname = decodeHtmlEntities(it.groupValues[1]) }
             }
         } catch (e: Exception) {
             logger.warn("获取昵称失败: ${e.message}")
@@ -378,6 +378,28 @@ class LoginService(
         // redirect_url 格式: /cgi-bin/home?t=home/index&lang=zh_CN&token=123456
         val tokenRegex = Regex("""token=(\d+)""")
         return tokenRegex.find(redirectUrl)?.groupValues?.get(1)
+    }
+
+    /**
+     * 解码常见 HTML 实体（微信 HTML 中 nick_name 常包含 &nbsp; 等）
+     */
+    private fun decodeHtmlEntities(text: String): String {
+        return text
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            // 数字实体 &#160; &#xA0; 等
+            .replace(Regex("&#(\\d+);")) { m ->
+                m.groupValues[1].toIntOrNull()?.let { it.toChar().toString() } ?: m.value
+            }
+            .replace(Regex("&#x([0-9a-fA-F]+);")) { m ->
+                m.groupValues[1].toIntOrNull(16)?.let { it.toChar().toString() } ?: m.value
+            }
+            .trim()
     }
 
     private fun ByteArray.startsWithPNG(): Boolean =

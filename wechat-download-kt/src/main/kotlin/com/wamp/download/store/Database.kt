@@ -18,6 +18,7 @@ object Subscriptions : Table("subscriptions") {
     val headImg = text("head_img").default("")
     val createdAt = long("created_at")
     val lastPoll = long("last_poll").default(0L)
+    val wereadMpId = text("weread_mpid").default("")
 
     override val primaryKey = PrimaryKey(fakeid)
 }
@@ -58,11 +59,18 @@ object Database {
             driver = "org.sqlite.JDBC",
         )
 
-        transaction {
-            exec("PRAGMA journal_mode=WAL")
-            exec("PRAGMA foreign_keys=ON")
+        // PRAGMA 必须在事务外执行（WAL 模式不能从事务内切换），使用原生 JDBC 连接
+        java.sql.DriverManager.getConnection("jdbc:sqlite:$dbPath").use { conn ->
+            conn.createStatement().use { st ->
+                st.execute("PRAGMA journal_mode=WAL")
+                st.execute("PRAGMA foreign_keys=ON")
+                st.execute("PRAGMA busy_timeout=5000")
+            }
+        }
 
-            SchemaUtils.create(Subscriptions, Articles)
+        // 建表单独一个事务（createMissingTablesAndColumns 可为旧表补齐新增列）
+        transaction {
+            SchemaUtils.createMissingTablesAndColumns(Subscriptions, Articles)
             logger.info("数据库初始化完成: $dbPath")
         }
     }

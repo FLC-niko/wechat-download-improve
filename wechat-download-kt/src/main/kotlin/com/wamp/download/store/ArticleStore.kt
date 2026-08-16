@@ -83,6 +83,18 @@ object ArticleStore {
     }
 
     /**
+     * 取该公众号任一篇文章链接（用于微信读书 wxs2mp 解析 mpId）
+     */
+    fun sampleLink(fakeid: String): String? = Database.query {
+        Articles.selectAll()
+            .where { (Articles.fakeid eq fakeid) and (Articles.link neq "") }
+            .orderBy(Articles.publishTime, SortOrder.DESC)
+            .limit(1)
+            .singleOrNull()
+            ?.get(Articles.link)
+    }
+
+    /**
      * feed 增量接口：按 publish_time 正序 + 游标返回，对齐 Python 版 get_feed_articles
      */
     fun getFeedArticles(since: Long = 0L, fakeid: String? = null, limit: Int = 50): List<Article> =

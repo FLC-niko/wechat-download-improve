@@ -16,6 +16,7 @@ data class Subscription(
     val headImg: String = "",
     val createdAt: Long = Instant.now().epochSecond,
     val lastPoll: Long = 0L,
+    val wereadMpId: String = "",
 )
 
 /**
@@ -42,16 +43,7 @@ object SubscriptionStore {
     fun get(fakeid: String): Subscription? = Database.query {
         Subscriptions.selectAll()
             .where { Subscriptions.fakeid eq fakeid }
-            .map {
-                Subscription(
-                    fakeid = it[Subscriptions.fakeid],
-                    nickname = it[Subscriptions.nickname],
-                    alias = it[Subscriptions.alias],
-                    headImg = it[Subscriptions.headImg],
-                    createdAt = it[Subscriptions.createdAt],
-                    lastPoll = it[Subscriptions.lastPoll],
-                )
-            }
+            .map { it.toSubscription() }
             .singleOrNull()
     }
 
@@ -69,16 +61,7 @@ object SubscriptionStore {
             val rows = query
                 .orderBy(Subscriptions.createdAt, SortOrder.DESC)
                 .limit(limit, offset.toLong())
-                .map {
-                    Subscription(
-                        fakeid = it[Subscriptions.fakeid],
-                        nickname = it[Subscriptions.nickname],
-                        alias = it[Subscriptions.alias],
-                        headImg = it[Subscriptions.headImg],
-                        createdAt = it[Subscriptions.createdAt],
-                        lastPoll = it[Subscriptions.lastPoll],
-                    )
-                }
+                .map { it.toSubscription() }
             rows to total
         }
 
@@ -86,9 +69,41 @@ object SubscriptionStore {
         Subscriptions.selectAll().map { it[Subscriptions.fakeid] }
     }
 
+    fun findByNickname(nickname: String): Subscription? = Database.query {
+        Subscriptions.selectAll()
+            .where { Subscriptions.nickname eq nickname }
+            .map { it.toSubscription() }
+            .singleOrNull()
+    }
+
     fun updateLastPoll(fakeid: String) = Database.query {
         Subscriptions.update({ Subscriptions.fakeid eq fakeid }) {
             it[Subscriptions.lastPoll] = Instant.now().epochSecond
         }
     }
+
+    /** 记录该公众号的微信读书 mpId（供回退通道复用） */
+    fun saveWereadMpId(fakeid: String, mpId: String) = Database.query {
+        Subscriptions.update({ Subscriptions.fakeid eq fakeid }) {
+            it[Subscriptions.wereadMpId] = mpId
+        }
+    }
+
+    /** 按微信读书 mpId 反查公众号，找不到返回 null */
+    fun findByWereadMpId(mpId: String): Subscription? = Database.query {
+        Subscriptions.selectAll()
+            .where { Subscriptions.wereadMpId eq mpId }
+            .map { it.toSubscription() }
+            .singleOrNull()
+    }
+
+    private fun ResultRow.toSubscription() = Subscription(
+        fakeid = this[Subscriptions.fakeid],
+        nickname = this[Subscriptions.nickname],
+        alias = this[Subscriptions.alias],
+        headImg = this[Subscriptions.headImg],
+        createdAt = this[Subscriptions.createdAt],
+        lastPoll = this[Subscriptions.lastPoll],
+        wereadMpId = this[Subscriptions.wereadMpId],
+    )
 }
