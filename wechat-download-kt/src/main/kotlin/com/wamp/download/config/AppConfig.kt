@@ -57,6 +57,10 @@ object AppConfig {
     val wereadWebBaseUrl: String get() = getString("weread.web_base_url", "https://weread.qq.com")
     val wereadCredentialsFile: String get() = getString("weread.credentials_file", "data/.weread_web_credentials.json")
 
+    // 多账号池：账号凭证存储目录 + 频控冷却时长
+    val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")
+    val wereadFreqControlCooldown: Long get() = getLong("weread.freq_control_cooldown", 300L)
+
     // wr_skey 双层刷新保活（wr_skey 有效期 5400s，刷新间隔必须 < 5400s）
     val wereadRefreshInterval: Long get() = getLong("weread.refresh_interval", 3000L)   // 50 分钟
     val wereadRefreshFailThreshold: Int get() = getInt("weread.refresh_fail_threshold", 3)
@@ -66,6 +70,10 @@ object AppConfig {
     val wereadContentJitter: Long get() = getLong("weread.content_jitter", 5L)          // 随机抖动（秒）
     val wereadMaxPages: Int get() = getInt("weread.max_pages", 50)
     val wereadPageSize: Int get() = getInt("weread.page_size", 10)
+
+    // 请求节流（防多任务并发叠加触发风控）
+    val wereadMaxConcurrentPerAccount: Int get() = getInt("weread.max_concurrent_per_account", 1)  // 单账号同时在途请求数
+    val wereadMinRequestInterval: Long get() = getLong("weread.min_request_interval", 2L)          // 同一账号两次请求最小间隔（秒）
 
     // 空页重试
     val wereadEmptyRetryMax: Int get() = getInt("weread.empty_retry_max", 3)

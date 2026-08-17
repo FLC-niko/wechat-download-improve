@@ -194,8 +194,8 @@ class TaskProcessor(
         subscription: Subscription?,
         targetStartTs: Long?,
     ): List<WxApiClient.WxArticle> {
-        if (!weReadWebClient.isLoggedIn()) {
-            logger.warn("【L2 微信读书】未登录，跳过回退通道")
+        if (com.wamp.download.weread.WeReadAccountPool.size() == 0) {
+            logger.warn("【L2 微信读书】账号池为空，跳过回退通道")
             return emptyList()
         }
 

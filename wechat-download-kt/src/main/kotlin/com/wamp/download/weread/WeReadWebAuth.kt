@@ -10,6 +10,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -41,26 +42,31 @@ object WeReadWebAuth {
 
     fun isLoggedIn(): Boolean = WeReadCookieStore.isLoggedIn()
 
-    /** 重新扫码进行中标志（防重入：多任务/多协程同时触发时只发起一次） */
-    @Volatile
-    private var reloginInProgress = false
+    /** 重新扫码进行中标志（防重入：按账号隔离，每账号同时只发起一次） */
+    private val reloginInProgress = ConcurrentHashMap<String, Boolean>()
+
+    /** 达到重新扫码阈值时异步发起登录（操作主账号，兼容入口） */
+    fun requestReloginIfNeeded() {
+        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return
+        requestReloginIfNeeded(vid)
+    }
 
     /**
-     * 达到重新扫码阈值时异步发起登录（防重入）
+     * 达到重新扫码阈值时异步发起登录（防重入，按账号隔离）
      *
      * 在抓取链路（被动刷新失败）中调用，不阻塞当前协程。
      * 由独立线程执行扫码登录流程，结束自动复位标志。
      */
-    fun requestReloginIfNeeded() {
-        if (reloginInProgress) return
-        if (!shouldRelogin()) return
-        reloginInProgress = true
+    fun requestReloginIfNeeded(vid: String) {
+        if (reloginInProgress.getOrDefault(vid, false)) return
+        if (!shouldRelogin(vid)) return
+        reloginInProgress[vid] = true
         Thread {
             try {
-                logger.warn("微信读书连续刷新失败达到阈值，异步触发重新扫码")
+                logger.warn("微信读书连续刷新失败达到阈值，异步触发重新扫码: vid=$vid")
                 startLogin()
             } finally {
-                reloginInProgress = false
+                reloginInProgress.remove(vid)
             }
         }.start()
     }
@@ -216,7 +222,15 @@ object WeReadWebAuth {
     }
 
     /**
-     * 主动刷新保活（wr_skey 双层刷新的"主动"层）
+     * 主动刷新保活（操作主账号，兼容入口）
+     */
+    fun proactiveRefresh(): Boolean {
+        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return false
+        return proactiveRefresh(vid)
+    }
+
+    /**
+     * 主动刷新保活（wr_skey 双层刷新的"主动"层，按账号）
      *
      * 通过 HEAD 官网首页带旧 cookie 探测凭证状态：
      * - HTTP 401 → 凭证失效，标记失败
@@ -226,52 +240,59 @@ object WeReadWebAuth {
      *
      * @return true=仍保持登录，false=登录态已失效需重新扫码
      */
-    fun proactiveRefresh(): Boolean {
-        if (!WeReadCookieStore.isLoggedIn()) return false
+    fun proactiveRefresh(vid: String): Boolean {
+        val account = WeReadAccountPool.get(vid) ?: return false
+        val creds = account.credentials
+        if (creds.wrSkey.isEmpty() || creds.wrVid.isEmpty()) return false
         return try {
             val req = Request.Builder()
                 .url("$baseUrl/")
                 .head()
-                .header("Cookie", WeReadCookieStore.get().toCookieString())
+                .header("Cookie", creds.toCookieString())
                 .header("User-Agent", UA)
                 .build()
             client.newCall(req).execute().use { resp ->
                 if (resp.code == 401) {
-                    WeReadCookieStore.markRefreshFailed()
-                    logger.warn("微信读书刷新失败（401），连续失败 ${WeReadCookieStore.get().refreshFailCount} 次")
+                    WeReadAccountPool.markRefreshFailed(vid)
+                    logger.warn("微信读书刷新失败（401），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
                     false
                 } else {
                     val setCookies = resp.headers("set-cookie")
                     if (setCookies.isEmpty()) {
                         // 无 set-cookie：凭证仍有效，仅更新时间戳防频繁探测
-                        WeReadCookieStore.markRefreshed()
-                        logger.debug("微信读书凭证仍有效（无 set-cookie）")
+                        WeReadAccountPool.markRefreshed(vid)
+                        logger.debug("微信读书凭证仍有效（无 set-cookie）: vid=$vid")
                         true
-                    } else if (WeReadCookieStore.updateFromSetCookie(setCookies)) {
+                    } else if (WeReadAccountPool.updateFromSetCookie(vid, setCookies)) {
                         // 拿到有效新凭证
-                        WeReadCookieStore.markRefreshed()
-                        logger.debug("微信读书凭证刷新成功")
+                        logger.debug("微信读书凭证刷新成功: vid=$vid")
                         true
                     } else {
                         // set-cookie 全是清空（wr_skey=; Max-Age=0）→ 服务端已登出
-                        WeReadCookieStore.markRefreshFailed()
-                        logger.warn("微信读书凭证已被服务端清空（登录超时），连续失败 ${WeReadCookieStore.get().refreshFailCount} 次")
+                        WeReadAccountPool.markRefreshFailed(vid)
+                        logger.warn("微信读书凭证已被服务端清空（登录超时），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
                         false
                     }
                 }
             }
         } catch (e: Exception) {
-            WeReadCookieStore.markRefreshFailed()
-            logger.warn("微信读书刷新异常: ${e.message}")
+            WeReadAccountPool.markRefreshFailed(vid)
+            logger.warn("微信读书刷新异常: ${e.message}: vid=$vid")
             false
         }
     }
 
     /**
-     * 连续刷新失败是否达到需重新扫码的阈值
+     * 连续刷新失败是否达到需重新扫码的阈值（操作主账号，兼容入口）
      */
-    fun shouldRelogin(): Boolean =
-        WeReadCookieStore.get().refreshFailCount >= AppConfig.wereadRefreshFailThreshold
+    fun shouldRelogin(): Boolean {
+        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return false
+        return shouldRelogin(vid)
+    }
+
+    /** 连续刷新失败是否达到需重新扫码的阈值（按账号） */
+    fun shouldRelogin(vid: String): Boolean =
+        (WeReadAccountPool.get(vid)?.credentials?.refreshFailCount ?: 0) >= AppConfig.wereadRefreshFailThreshold
 
     /**
      * 清除登录状态

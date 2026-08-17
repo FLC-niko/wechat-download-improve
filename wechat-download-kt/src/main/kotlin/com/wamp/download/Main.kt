@@ -26,6 +26,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.slf4j.LoggerFactory
 
 fun main() {
@@ -54,12 +57,21 @@ fun main() {
     // JVM shutdown hook：Ctrl+C / kill 时清理资源，避免残留进程
     Runtime.getRuntime().addShutdownHook(Thread {
         logger.info("收到关闭信号，正在清理资源...")
-        try {
-            rabbitMqService.stop()
-        } catch (e: Exception) {
-            logger.warn("关闭 RabbitMQ 异常: ${e.message}")
-        }
+        // 先取消后台协程，让轮询/消费/保活立即停止
         scope.cancel()
+        try {
+            // RabbitMQ 关闭是阻塞网络调用，断网/自动恢复时可能长时间不返回；
+            // 用超时兜底，保证 Ctrl+C 能顺利退出，不残留进程
+            runBlocking {
+                withTimeout(5000) {
+                    withContext(Dispatchers.IO) {
+                        rabbitMqService.stop()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("关闭 RabbitMQ 超时或异常: ${e.message}")
+        }
         logger.info("资源清理完成，退出")
     })
 
@@ -85,18 +97,19 @@ fun main() {
         scope.launch { RssPoller.start() }
         scope.launch { LoginReminder.start() }
         scope.launch { loginChecker.start() }
-        // 微信读书凭证主动刷新保活（wr_skey 双层刷新的"主动"层）
+        // 微信读书凭证主动刷新保活（wr_skey 双层刷新的"主动"层，多账号遍历）
         scope.launch {
             val auth = com.wamp.download.weread.WeReadWebAuth
-            val store = com.wamp.download.weread.WeReadCookieStore
+            val pool = com.wamp.download.weread.WeReadAccountPool
             while (true) {
                 try {
-                    if (auth.isLoggedIn()) {
+                    pool.list().forEach { account ->
+                        val vid = account.vid
                         when {
-                            // 连续刷新失败达到阈值 → 凭证真失效，推送二维码重新扫码（防重入）
-                            auth.shouldRelogin() -> auth.requestReloginIfNeeded()
+                            // 连续刷新失败达到阈值 → 凭证真失效，推送二维码重新扫码（按账号防重入）
+                            auth.shouldRelogin(vid) -> auth.requestReloginIfNeeded(vid)
                             // 距上次刷新超过阈值 → 主动刷新保活
-                            store.get().needRefresh() -> auth.proactiveRefresh()
+                            account.credentials.needRefresh() -> auth.proactiveRefresh(vid)
                         }
                     }
                 } catch (e: Exception) {
@@ -162,13 +175,11 @@ fun main() {
 
             // 微信读书官方直连回退通道：状态查询 + 手动触发扫码登录
             get("/api/weread/status") {
-                val creds = com.wamp.download.weread.WeReadCookieStore.get()
+                val pool = com.wamp.download.weread.WeReadAccountPool
                 call.respond(mapOf(
-                    "logged_in" to com.wamp.download.weread.WeReadWebAuth.isLoggedIn(),
-                    "username" to creds.username,
+                    "account_count" to pool.size(),
+                    "accounts" to accountMap(pool.list()),
                     "base_url" to AppConfig.wereadWebBaseUrl,
-                    "refresh_fail_count" to creds.refreshFailCount,
-                    "need_relogin" to com.wamp.download.weread.WeReadWebAuth.shouldRelogin(),
                     "channels" to com.wamp.download.task.ChannelStateManager.snapshot(),
                 ))
             }
@@ -192,6 +203,47 @@ fun main() {
                     }
                 }
             }
+
+            // ── 微信读书账号池管理 ──
+            get("/api/weread/account/list") {
+                call.respond(mapOf(
+                    "accounts" to accountMap(com.wamp.download.weread.WeReadAccountPool.list()),
+                ))
+            }
+            post("/api/weread/account/enable") {
+                val body = call.receive<Map<String, String>>()
+                val vid = body["vid"] ?: ""
+                val ok = com.wamp.download.weread.WeReadAccountPool.setEnabled(vid, true)
+                call.respond(mapOf("ok" to ok, "vid" to vid))
+            }
+            post("/api/weread/account/disable") {
+                val body = call.receive<Map<String, String>>()
+                val vid = body["vid"] ?: ""
+                val ok = com.wamp.download.weread.WeReadAccountPool.setEnabled(vid, false)
+                call.respond(mapOf("ok" to ok, "vid" to vid))
+            }
+            post("/api/weread/account/delete") {
+                val body = call.receive<Map<String, String>>()
+                val vid = body["vid"] ?: ""
+                val ok = com.wamp.download.weread.WeReadAccountPool.delete(vid)
+                call.respond(mapOf("ok" to ok, "vid" to vid))
+            }
         }
     }).start(wait = true)
 }
+
+/** 账号列表序列化为路由返回结构 */
+private fun accountMap(accounts: List<com.wamp.download.weread.WeReadAccount>): List<Map<String, Any>> =
+    accounts.map { acc ->
+        mapOf(
+            "vid" to acc.vid,
+            "username" to acc.credentials.username,
+            "status" to acc.status.name,
+            "total_requests" to acc.totalRequests,
+            "freq_control_count" to acc.freqControlCount,
+            "last_used_time" to acc.lastUsedTime,
+            "cooldown_until" to acc.cooldownUntil,
+            "disabled_reason" to acc.disabledReason,
+            "refresh_fail_count" to acc.credentials.refreshFailCount,
+        )
+    }
