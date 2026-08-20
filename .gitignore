@@ -3,6 +3,7 @@
 
 # 外部项目目录（不应提交到此仓库）
 we-mp-rss-all/
+archive-system-crawling-android-master/
 
 # IDE
 .idea/

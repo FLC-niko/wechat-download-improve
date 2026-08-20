@@ -86,7 +86,7 @@ class WeReadWebClient {
             .header("Sec-Fetch-Site", "same-origin")
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Dest", "empty")
-            .header("User-Agent", UA)
+            .header("User-Agent", randomUA())
     }
 
     // --- 请求节流（防多任务并发叠加触发风控） ---
@@ -364,7 +364,15 @@ class WeReadWebClient {
     }
 
     private companion object {
-        const val UA =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        // UA 池：覆盖主流桌面浏览器，每次请求随机选取，防 UA 维度画像
+        val UA_POOL = listOf(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        )
+
+        fun randomUA(): String = UA_POOL[Random.nextInt(UA_POOL.size)]
     }
 }
