@@ -1,6 +1,7 @@
 package com.wamp.download
 
 import com.wamp.download.adapter.wxAdapterRoutes
+import com.wamp.download.adb.AdbDeviceSupervisor
 import com.wamp.download.article.articleRoutes
 import com.wamp.download.auth.authRoutes
 import com.wamp.download.auth.LoginChecker
@@ -38,6 +39,19 @@ fun main() {
     val logger = LoggerFactory.getLogger("Main")
     val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    // 动态发现 adb devices；不写死 USB 序列号或无线 ADB 地址。
+    val adbDeviceSupervisor = AdbDeviceSupervisor()
+    val recoveryManager = com.wamp.download.weread.DeviceRecoveryManager(
+        supervisor = adbDeviceSupervisor,
+        scope = scope,
+    )
+    if (AppConfig.adbEnabled) {
+        com.wamp.download.weread.WeReadWebAuth.deviceRecoveryHandler = recoveryManager::request
+        adbDeviceSupervisor.refresh()
+        adbDeviceSupervisor.start(scope)
+        recoveryManager.start()
+    }
+
     // 微信 API 客户端（搜索公众号 + 获取文章）
     val wxClient = WxApiClient()
 
@@ -59,6 +73,7 @@ fun main() {
         logger.info("收到关闭信号，正在清理资源...")
         // 先取消后台协程，让轮询/消费/保活立即停止
         scope.cancel()
+        adbDeviceSupervisor.stop()
         try {
             // RabbitMQ 关闭是阻塞网络调用，断网/自动恢复时可能长时间不返回；
             // 用超时兜底，保证 Ctrl+C 能顺利退出，不残留进程
@@ -107,7 +122,13 @@ fun main() {
                         val vid = account.vid
                         when {
                             // 连续刷新失败达到阈值 → 凭证真失效，推送二维码重新扫码（按账号防重入）
-                            auth.shouldRelogin(vid) -> auth.requestReloginIfNeeded(vid)
+                            auth.shouldRelogin(vid) -> {
+                                if (AppConfig.adbEnabled) {
+                                    recoveryManager.request(vid)
+                                } else {
+                                    auth.requestReloginIfNeeded(vid)
+                                }
+                            }
                             // 距上次刷新超过阈值 → 主动刷新保活
                             account.credentials.needRefresh() -> auth.proactiveRefresh(vid)
                         }
@@ -128,6 +149,17 @@ fun main() {
         routing {
             get("/") { call.respondText("wechat-download-kt is running") }
             get("/api/health") { call.respondText("""{"status":"ok"}""") }
+
+            get("/api/adb/status") {
+                val snapshot = adbDeviceSupervisor.snapshot()
+                call.respond(mapOf(
+                    "mode" to snapshot.mode.name,
+                    "devices" to snapshot.devices.map { device ->
+                        mapOf("serial" to device.serial, "user_ids" to device.userIds)
+                    },
+                    "pending_recovery_vids" to recoveryManager.pendingVids(),
+                ))
+            }
 
             // 二维码图片静态服务（供飞书通知引用，如 /qrcode/wx_qrcode.png）
             get("/qrcode/{file}") {
@@ -222,6 +254,29 @@ fun main() {
                 val ok = com.wamp.download.weread.WeReadAccountPool.setEnabled(vid, false)
                 call.respond(mapOf("ok" to ok, "vid" to vid))
             }
+            post("/api/weread/account/bind") {
+                val body = call.receive<Map<String, String>>()
+                val vid = body["vid"] ?: ""
+                val serial = body["serial"] ?: ""
+                val userId = body["user_id"]?.toIntOrNull() ?: 0
+                val strategy = body["strategy"] ?: "FIXED_DEVICE"
+                val account = com.wamp.download.weread.WeReadAccountPool.get(vid)
+                val ok = account != null && serial.isNotBlank() && strategy in setOf("FIXED_DEVICE", "ELASTIC_DEVICE")
+                if (ok) {
+                    account!!.boundSerial = serial
+                    account.boundUserId = userId
+                    account.bindingStrategy = strategy
+                    com.wamp.download.weread.WeReadAccountPool.saveForRecovery(account)
+                }
+                call.respond(mapOf("ok" to ok, "vid" to vid, "serial" to serial, "user_id" to userId, "strategy" to strategy))
+            }
+            post("/api/weread/account/recover") {
+                val body = call.receive<Map<String, String>>()
+                val vid = body["vid"] ?: ""
+                val exists = com.wamp.download.weread.WeReadAccountPool.get(vid) != null
+                if (exists) recoveryManager.request(vid)
+                call.respond(mapOf("ok" to exists, "vid" to vid, "message" to if (exists) "恢复任务已排队" else "账号不存在"))
+            }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
@@ -239,6 +294,9 @@ private fun accountMap(accounts: List<com.wamp.download.weread.WeReadAccount>): 
             "vid" to acc.vid,
             "username" to acc.credentials.username,
             "status" to acc.status.name,
+            "bound_serial" to acc.boundSerial,
+            "bound_user_id" to acc.boundUserId,
+            "binding_strategy" to acc.bindingStrategy,
             "total_requests" to acc.totalRequests,
             "freq_control_count" to acc.freqControlCount,
             "last_used_time" to acc.lastUsedTime,

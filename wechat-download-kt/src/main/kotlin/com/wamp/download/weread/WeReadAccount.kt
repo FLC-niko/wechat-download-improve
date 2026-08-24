@@ -64,6 +64,11 @@ enum class AccountStatus {
 data class WeReadAccount(
     val vid: String,
     var credentials: WeReadWebCredentials,
+    /** 原设备槽位；serial 为空时表示尚未完成绑定。 */
+    var boundSerial: String = "",
+    var boundUserId: Int = 0,
+    /** FIXED_DEVICE 或 ELASTIC_DEVICE。默认固定在原槽位，避免跨账号串号。 */
+    var bindingStrategy: String = "FIXED_DEVICE",
     var status: AccountStatus = AccountStatus.ACTIVE,
     var totalRequests: Long = 0L,
     var freqControlCount: Long = 0L,

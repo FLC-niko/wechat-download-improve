@@ -45,6 +45,10 @@ object WeReadWebAuth {
     /** 重新扫码进行中标志（防重入：按账号隔离，每账号同时只发起一次） */
     private val reloginInProgress = ConcurrentHashMap<String, Boolean>()
 
+    /** Worker 启用 ADB 恢复时由启动入口注入；未注入则保留机器人二维码兼容路径。 */
+    @Volatile
+    var deviceRecoveryHandler: ((String) -> Unit)? = null
+
     /** 达到重新扫码阈值时异步发起登录（操作主账号，兼容入口） */
     fun requestReloginIfNeeded() {
         val vid = WeReadAccountPool.primaryAccount()?.vid ?: return
@@ -58,6 +62,11 @@ object WeReadWebAuth {
      * 由独立线程执行扫码登录流程，结束自动复位标志。
      */
     fun requestReloginIfNeeded(vid: String) {
+        if (!shouldRelogin(vid)) return
+        deviceRecoveryHandler?.let {
+            it(vid)
+            return
+        }
         if (reloginInProgress.getOrDefault(vid, false)) return
         if (!shouldRelogin(vid)) return
         reloginInProgress[vid] = true
@@ -101,6 +110,12 @@ object WeReadWebAuth {
         }
     }
 
+    /** 交由 ADB/AAOS 恢复管理器处理，保留人工通知作为无设备降级。 */
+    fun requestDeviceRecovery(vid: String, manager: DeviceRecoveryManager) {
+        if (!reloginInProgress.putIfAbsent(vid, true).let { it == null }) return
+        manager.request(vid)
+    }
+
     /**
      * 轮询扫码结果（getLoginInfo 长轮询）
      *
@@ -109,6 +124,18 @@ object WeReadWebAuth {
      * @return true=登录成功并已保存凭证
      */
     fun pollLogin(uid: String, timeoutSeconds: Long = 120): Boolean {
+        val credentials = pollLoginCredentials(uid, timeoutSeconds) ?: return false
+        WeReadCookieStore.setLoggedIn(
+            wrSkey = credentials.wrSkey,
+            wrVid = credentials.wrVid,
+            wrRt = credentials.wrRt,
+            username = credentials.username,
+        )
+        return true
+    }
+
+    /** 轮询扫码结果但不修改全局 Cookie，供指定账号恢复流程使用。 */
+    fun pollLoginCredentials(uid: String, timeoutSeconds: Long = 120): WeReadWebCredentials? {
         val start = System.currentTimeMillis()
         val deadline = start + timeoutSeconds * 1000
         while (System.currentTimeMillis() < deadline) {
@@ -133,25 +160,26 @@ object WeReadWebAuth {
                         val webLoginVid = obj.get("webLoginVid")?.asString
                         if (!accessToken.isNullOrEmpty() && !webLoginVid.isNullOrEmpty()) {
                             val username = fetchUsername(webLoginVid)
-                            WeReadCookieStore.setLoggedIn(
+                            return WeReadWebCredentials(
                                 wrSkey = accessToken,
                                 wrVid = webLoginVid,
                                 wrRt = "",
                                 username = username,
+                                loginTime = System.currentTimeMillis(),
+                                lastRefreshTime = System.currentTimeMillis(),
                             )
                             logger.info("微信读书登录成功: username=$username, vid=$webLoginVid")
-                            return true
                         }
                     } else {
                         val logicCode = obj.get("logicCode")?.asString ?: ""
                         when (logicCode) {
                             "LOGIN_TIMEOUT" -> {
                                 logger.warn("微信读书扫码等待超时")
-                                return false
+                                return null
                             }
                             "NEED_OTP", "OTP_EXPIRED", "OTP_NOT_MATCH" -> {
                                 logger.warn("微信读书需要双重验证(OTP): $logicCode，当前暂不支持自动处理")
-                                return false
+                                return null
                             }
                             else -> logger.debug("getLoginInfo 未完成: logicCode=$logicCode")
                         }
@@ -163,7 +191,7 @@ object WeReadWebAuth {
             Thread.sleep(2000)
         }
         logger.warn("微信读书扫码等待超时")
-        return false
+        return null
     }
 
     /**
@@ -323,6 +351,30 @@ object WeReadWebAuth {
             baos.toByteArray()
         } catch (e: Exception) {
             logger.error("生成二维码失败: ${e.message}")
+            null
+        }
+    }
+
+    /** 生成适合 Android MediaStore/相册导入的 24-bit sRGB JPEG。 */
+    fun generateQrJpeg(text: String, size: Int = 400): ByteArray? {
+        return try {
+            val hints = mapOf(
+                com.google.zxing.EncodeHintType.CHARACTER_SET to "UTF-8",
+                com.google.zxing.EncodeHintType.MARGIN to 1,
+            )
+            val matrix = com.google.zxing.qrcode.QRCodeWriter()
+                .encode(text, com.google.zxing.BarcodeFormat.QR_CODE, size, size, hints)
+            val image = java.awt.image.BufferedImage(size, size, java.awt.image.BufferedImage.TYPE_3BYTE_BGR)
+            for (x in 0 until size) {
+                for (y in 0 until size) {
+                    image.setRGB(x, y, if (matrix.get(x, y)) 0x000000 else 0xFFFFFF)
+                }
+            }
+            val output = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(image, "jpg", output)
+            output.toByteArray()
+        } catch (e: Exception) {
+            logger.error("生成二维码 JPEG 失败: ${e.message}")
             null
         }
     }

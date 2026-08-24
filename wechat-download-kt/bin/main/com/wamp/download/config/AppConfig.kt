@@ -79,6 +79,11 @@ object AppConfig {
     val wereadEmptyRetryMax: Int get() = getInt("weread.empty_retry_max", 3)
     val wereadEmptyRetryBackoff: Long get() = getLong("weread.empty_retry_backoff", 15L)
 
+    // ADB 自动恢复设备探查
+    val adbPollIntervalMs: Long
+        get() = getLong("adb.poll_interval_ms", 15_000L).coerceAtLeast(1_000L)
+    val adbEnabled: Boolean get() = getBool("adb.enabled", true)
+
     // 预热（拉文章前先调公众号信息接口触发关联）
     val wereadWarmupEnabled: Boolean get() = getBool("weread.warmup_enabled", true)
 

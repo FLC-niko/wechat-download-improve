@@ -35,6 +35,37 @@
 
 ## 快速开始
 
+### ADB 自动恢复设备管理
+
+Worker 不保存手机 IP 或序列号。启动时执行 `adb devices -l`，运行期间默认每
+15 秒重新探查一次：只有状态为 `device` 的设备进入在线池，`offline` 和
+`unauthorized` 不参与自动恢复。
+
+```yaml
+adb:
+  enabled: true
+  poll_interval_ms: 15000
+```
+
+当前恢复模式可通过以下接口查看：
+
+```bash
+curl http://localhost:5000/api/adb/status
+```
+
+当至少有一台 ADB 设备在线时模式为 `AUTO_RECOVERABLE`；没有在线设备时为
+`MANUAL_ONLY`。设备接入、断开或授权状态变化会在下一次探查后自动切换。当前
+恢复调度器使用返回的 `serial + user_ids` 槽位路由到主空间或分身空间，并通过
+`/api/weread/account/bind` 保存账号与设备用户空间绑定。
+
+失效账号可通过 `/api/weread/account/recover` 入队恢复。目标设备离线时，固定绑定账号
+保持挂起并等待热插拔；只有明确设置 `ELASTIC_DEVICE` 才允许借用其他在线设备。没有在线
+设备时不会执行任何 ADB 命令，只走机器人通知降级。
+
+AAOS 登录责任链位于 `archive-system-crawling-android-master/crawlingservice`，部署前先构建
+`app-debug.apk`，再运行 `./deploy_hyperos_phones.sh [/path/to/app-debug.apk]`。脚本会动态解析
+每台设备的 Android 用户 ID，不假定 XSpace 为 999。
+
 ### 1. 配置
 
 ```bash

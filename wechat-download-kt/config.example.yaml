@@ -37,3 +37,13 @@ notification:
 
 adapter:
   api_key: ""                # /api/v1/wx/* 适配壳鉴权密钥
+
+weread:
+  web_base_url: "https://weread.qq.com"
+  account_dir: "data/weread_accounts"
+  refresh_interval: 3000
+  refresh_fail_threshold: 3
+
+adb:
+  enabled: true
+  poll_interval_ms: 15000

@@ -122,6 +122,11 @@ object WeReadAccountPool {
         return true
     }
 
+    /** 持久化恢复流程更新过的账号元数据。 */
+    fun saveForRecovery(account: WeReadAccount) {
+        if (accounts[account.vid] === account) save(account)
+    }
+
     /** 主动刷新成功后调用：更新时间戳、清零失败计数 */
     fun markRefreshed(vid: String) {
         val acc = accounts[vid] ?: return
