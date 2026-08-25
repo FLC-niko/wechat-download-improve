@@ -5,6 +5,8 @@ import com.google.gson.GsonBuilder
 import com.wamp.download.config.AppConfig
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -208,7 +210,14 @@ object WeReadAccountPool {
     private fun save(account: WeReadAccount) {
         try {
             val file = File(accountDir(), "${account.vid}.json")
-            file.writeText(gson.toJson(account))
+            val temporary = File(accountDir(), ".${account.vid}.json.tmp")
+            temporary.writeText(gson.toJson(account))
+            Files.move(
+                temporary.toPath(),
+                file.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
         } catch (e: Exception) {
             logger.error("微信读书账号保存失败: vid=${account.vid}, ${e.message}")
         }

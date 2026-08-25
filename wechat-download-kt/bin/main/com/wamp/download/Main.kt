@@ -98,8 +98,14 @@ fun main() {
             }
         }
         install(CORS) {
-            anyHost()
-            allowCredentials = true
+            val allowedOrigin = AppConfig.corsAllowedOrigin
+            if (allowedOrigin.isNotBlank()) {
+                allowHost(
+                    allowedOrigin.removePrefix("https://").removePrefix("http://"),
+                    schemes = listOf("http", "https"),
+                )
+            }
+            allowCredentials = allowedOrigin.isNotBlank()
             allowMethod(io.ktor.http.HttpMethod.Get)
             allowMethod(io.ktor.http.HttpMethod.Post)
             allowMethod(io.ktor.http.HttpMethod.Put)
@@ -164,9 +170,9 @@ fun main() {
             // 二维码图片静态服务（供飞书通知引用，如 /qrcode/wx_qrcode.png）
             get("/qrcode/{file}") {
                 val file = call.parameters["file"] ?: return@get call.respondText("not found", status = io.ktor.http.HttpStatusCode.NotFound)
-                val safe = file.removePrefix("/")
-                val img = java.io.File("qrcode", safe)
-                if (!img.exists()) {
+                val root = java.io.File("qrcode").canonicalFile
+                val img = java.io.File(root, file).canonicalFile
+                if (img.parentFile != root || !img.isFile) {
                     call.respondText("not found", status = io.ktor.http.HttpStatusCode.NotFound)
                 } else {
                     call.respondBytes(img.readBytes(), contentType = io.ktor.http.ContentType.Image.PNG)
@@ -216,8 +222,10 @@ fun main() {
                 ))
             }
             post("/api/weread/login") {
-                val ok = com.wamp.download.weread.WeReadWebAuth.startLogin()
-                call.respond(mapOf("started" to ok, "message" to if (ok) "二维码已推送，请扫码" else "发起登录失败"))
+                scope.launch {
+                    com.wamp.download.weread.WeReadWebAuth.startLogin()
+                }
+                call.respond(mapOf("started" to true, "message" to "二维码已生成并推送，请扫码"))
             }
             // 用 fakeid 为公众号绑定微信读书 mpId（回退通道预绑定，wxs2mp 解析接口已下线，直接推导）
             post("/api/weread/bind") {
@@ -274,8 +282,15 @@ fun main() {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
                 val exists = com.wamp.download.weread.WeReadAccountPool.get(vid) != null
-                if (exists) recoveryManager.request(vid)
-                call.respond(mapOf("ok" to exists, "vid" to vid, "message" to if (exists) "恢复任务已排队" else "账号不存在"))
+                if (exists) {
+                    if (AppConfig.adbEnabled) {
+                        recoveryManager.request(vid)
+                    } else {
+                        // 无设备模式下，直接推送二维码供人工扫码恢复
+                        scope.launch { com.wamp.download.weread.WeReadWebAuth.startLogin(vid) }
+                    }
+                }
+                call.respond(mapOf("ok" to exists, "vid" to vid, "message" to if (exists) "恢复任务已触发" else "账号不存在"))
             }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()

@@ -4,7 +4,9 @@
 server:
   host: 0.0.0.0
   port: 5000
-  site_url: http://localhost:5000
+  # 必须填写通知接收者可访问的内网 VM 地址，不能使用 localhost
+  site_url: "http://<内网VM地址>:5000"
+  cors_allowed_origin: ""  # 仅配置可信前端来源；留空表示不允许跨域请求
 
 store:
   db_path: data/rss.db

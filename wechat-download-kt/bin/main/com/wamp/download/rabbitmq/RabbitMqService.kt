@@ -3,6 +3,7 @@ package com.wamp.download.rabbitmq
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import com.wamp.download.config.AppConfig
 
 /**
  * RabbitMQ 服务 — 组织三个 vhost 的连接与消费
@@ -48,6 +49,8 @@ class RabbitMqService(
 
         // 各 vhost 消费同一个任务队列；业务处理由 onTaskReceived 分发
         supervisor = VhostConnectionSupervisor(
+            initialRetryIntervalMs = AppConfig.rabbitmqReconnectInitialDelayMs,
+            maxRetryIntervalMs = AppConfig.rabbitmqReconnectMaxDelayMs,
             bindings = listOf(
                 VhostConnectionSupervisor.VhostBinding(
                     name = "pro",

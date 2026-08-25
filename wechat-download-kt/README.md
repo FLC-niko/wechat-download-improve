@@ -78,7 +78,9 @@ cp config.example.yaml config.yaml
 server:
   host: 0.0.0.0
   port: 5000
-  site_url: http://localhost:5000
+  # 填写通知接收者可访问的内网 VM 地址，不能使用 localhost
+  site_url: http://<内网VM地址>:5000
+  cors_allowed_origin: ""  # 无浏览器前端时保持为空
 
 store:
   db_path: data/rss.db
@@ -95,6 +97,8 @@ notification:
 adapter:
   api_key: "你的适配壳密钥"
 ```
+
+本服务按内网 Docker VM 部署时，应用在容器内监听 `0.0.0.0` 是正常的；Docker 只应把端口发布到受信任的内网网卡或内网反向代理，不应发布到公网。`/api/health` 可作为匿名健康检查，其余管理接口应通过内网访问控制或反向代理鉴权保护。`site_url` 用于通知中的二维码链接，必须是其他内网设备能够访问的 VM 地址。
 
 ### 2. 构建
 

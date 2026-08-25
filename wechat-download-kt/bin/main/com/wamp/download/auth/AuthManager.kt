@@ -4,6 +4,8 @@ import com.google.gson.Gson
 import com.wamp.download.config.AppConfig
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.time.Instant
 
 /**
@@ -50,7 +52,14 @@ object AuthManager {
         val file = File(AppConfig.credentialsFile)
         try {
             file.parentFile?.mkdirs()
-            file.writeText(gson.toJson(creds))
+            val temporary = File(file.parentFile, ".${file.name}.tmp")
+            temporary.writeText(gson.toJson(creds))
+            Files.move(
+                temporary.toPath(),
+                file.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
             logger.info("凭证已保存: ${file.absolutePath}")
         } catch (e: Exception) {
             logger.error("凭证保存失败: ${e.message}")

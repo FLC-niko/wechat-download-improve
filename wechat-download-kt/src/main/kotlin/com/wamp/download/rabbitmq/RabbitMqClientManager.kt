@@ -145,6 +145,7 @@ class RabbitMqClientManager(
         ch.queueDeclare(GZH_RESULT_QUEUE, true, false, false, null)
         ch.queueBind(GZH_RESULT_QUEUE, EXCHANGE_NEW_MEDIA, GZH_RESULT_ROUTING)
         ch.queueDeclare(SERVER_STATUS_QUEUE, true, false, false, null)
+        ch.queueDeclare(DEAD_MESSAGE_QUEUE, true, false, false, null)
     }
 
     fun isConnected(): Boolean = connection?.isOpen == true && channel?.isOpen == true

@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 微信读书官方 Web 端认证（2026 新版接口）
@@ -44,6 +45,7 @@ object WeReadWebAuth {
 
     /** 重新扫码进行中标志（防重入：按账号隔离，每账号同时只发起一次） */
     private val reloginInProgress = ConcurrentHashMap<String, Boolean>()
+    private val loginInProgress = AtomicBoolean(false)
 
     /** Worker 启用 ADB 恢复时由启动入口注入；未注入则保留机器人二维码兼容路径。 */
     @Volatile
@@ -70,14 +72,14 @@ object WeReadWebAuth {
         if (reloginInProgress.getOrDefault(vid, false)) return
         if (!shouldRelogin(vid)) return
         reloginInProgress[vid] = true
-        Thread {
+        kotlin.concurrent.thread(isDaemon = true) {
             try {
                 logger.warn("微信读书连续刷新失败达到阈值，异步触发重新扫码: vid=$vid")
-                startLogin()
+                startLogin(vid)
             } finally {
                 reloginInProgress.remove(vid)
             }
-        }.start()
+        }
     }
 
     /**
@@ -221,32 +223,69 @@ object WeReadWebAuth {
     /**
      * 发起完整扫码登录（获取二维码 + 生成图片推送机器人 + 轮询）
      *
+     * @param targetVid 期望扫码的账号 vid（可选，用于在无设备模式下推送时提示用户，并校验扫码结果）
      * @return true=登录成功
      */
-    fun startLogin(): Boolean {
+    fun startLogin(targetVid: String? = null): Boolean {
+        if (!loginInProgress.compareAndSet(false, true)) {
+            logger.warn("微信读书登录流程已在进行中，忽略重复请求: targetVid=$targetVid")
+            return false
+        }
+        return try {
+            startLoginInternal(targetVid)
+        } finally {
+            loginInProgress.set(false)
+        }
+    }
+
+    private fun startLoginInternal(targetVid: String?): Boolean {
         val (uid, scanUrl) = createLogin() ?: return false
+
+        val accountName = targetVid?.let { WeReadAccountPool.get(it)?.credentials?.username }
+        val messageSuffix = if (accountName != null) "（请使用账号 $accountName 扫码，vid=$targetVid）" else "（公众号采集回退通道）"
+        val qrFileName = if (targetVid != null) "wx_qrcode_$targetVid.png" else "wx_qrcode.png"
+
         // 将扫码链接生成二维码图片并推送到通知机器人
         val qrPng = generateQrPng(scanUrl)
         if (qrPng != null) {
             // 保存到 qrcode 目录供飞书卡片引用
             try {
                 val dir = java.io.File("qrcode").apply { mkdirs() }
-                java.io.File(dir, "wx_qrcode.png").writeBytes(qrPng)
+                java.io.File(dir, qrFileName).writeBytes(qrPng)
             } catch (e: Exception) {
                 logger.warn("保存二维码图片失败: ${e.message}")
             }
             kotlinx.coroutines.runBlocking {
-                WebhookNotifier.pushQrcode(qrPng, "请使用微信扫码登录微信读书（公众号采集回退通道）")
+                WebhookNotifier.pushQrcode(qrPng, "请使用微信扫码登录微信读书$messageSuffix")
             }
         } else {
             kotlinx.coroutines.runBlocking {
                 WebhookNotifier.notify("weread_login_qr", mapOf(
-                    "message" to "微信读书需要重新登录，请打开链接扫码",
+                    "message" to "微信读书需要重新登录$messageSuffix，请打开链接扫码",
                     "scan_url" to scanUrl,
                 ))
             }
         }
-        return pollLogin(uid)
+
+        val credentials = pollLoginCredentials(uid) ?: return false
+        if (targetVid != null && credentials.wrVid != targetVid) {
+            logger.warn("扫码账号与目标账号不匹配，拒绝写入: target=$targetVid, scanned=${credentials.wrVid}")
+            return false
+        }
+
+        WeReadCookieStore.setLoggedIn(
+            wrSkey = credentials.wrSkey,
+            wrVid = credentials.wrVid,
+            wrRt = credentials.wrRt,
+            username = credentials.username,
+        )
+        // 登录成功后，复位账号状态为 ACTIVE
+        WeReadAccountPool.get(credentials.wrVid)?.let { acc ->
+            acc.status = AccountStatus.ACTIVE
+            acc.disabledReason = ""
+            WeReadAccountPool.saveForRecovery(acc)
+        }
+        return true
     }
 
     /**
