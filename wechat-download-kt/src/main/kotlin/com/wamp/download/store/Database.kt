@@ -43,6 +43,18 @@ object Articles : IntIdTable("articles") {
     }
 }
 
+object RabbitInbox : Table("rabbit_inbox") {
+    val idempotencyKey = varchar("idempotency_key", 255)
+    val eventId = varchar("event_id", 255)
+    val workflowId = varchar("workflow_id", 255)
+    val resultEventId = varchar("result_event_id", 255)
+    val status = varchar("status", 32)
+    val receivedAt = long("received_at")
+    val updatedAt = long("updated_at")
+
+    override val primaryKey = PrimaryKey(idempotencyKey)
+}
+
 /**
  * 数据库管理器
  */
@@ -70,7 +82,7 @@ object Database {
 
         // 建表单独一个事务（createMissingTablesAndColumns 可为旧表补齐新增列）
         transaction {
-            SchemaUtils.createMissingTablesAndColumns(Subscriptions, Articles)
+            SchemaUtils.createMissingTablesAndColumns(Subscriptions, Articles, RabbitInbox)
             logger.info("数据库初始化完成: $dbPath")
         }
     }

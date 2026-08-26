@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import com.wamp.download.config.AppConfig
+import com.wamp.download.store.InboxStore
 
 /**
  * RabbitMQ 服务 — 组织三个 vhost 的连接与消费
@@ -16,7 +17,7 @@ import com.wamp.download.config.AppConfig
  * ArticleFetcher 拉取文章后把链接发布到结果队列）。
  */
 class RabbitMqService(
-    private var onTaskReceived: suspend (GzhAutoFromBackend) -> Unit = {}
+    private var onTaskReceived: suspend (GzhAutoBta, ResultQueuePublisher) -> Unit = { _, _ -> }
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(RabbitMqService::class.java)
@@ -25,8 +26,6 @@ class RabbitMqService(
     val proManager = RabbitMqClientManager()
     val testManager = RabbitMqClientManager()
     val thdagManager = RabbitMqClientManager()
-
-    val resultPublisher = ResultQueuePublisher(proManager)
 
     private var supervisor: VhostConnectionSupervisor? = null
     private var started = false
@@ -39,7 +38,7 @@ class RabbitMqService(
      */
     fun start(
         scope: CoroutineScope,
-        onTaskReceived: (suspend (GzhAutoFromBackend) -> Unit)? = null
+        onTaskReceived: (suspend (GzhAutoBta, ResultQueuePublisher) -> Unit)? = null
     ) {
         if (started) return
         started = true
@@ -80,10 +79,26 @@ class RabbitMqService(
     private suspend fun startConsumer(manager: RabbitMqClientManager, env: String) {
         manager.startConsumer(GZH_TASK_QUEUE, autoAck = false, prefetch = 1) { _, ctx ->
             try {
-                val task = ctx.decode<GzhAutoFromBackend>()
-                logger.info("【$env】收到任务 jobId=${task.jobId}, gzh=${task.gzhName}, 日期范围=${task.tempTimeStamp}")
-                onTaskReceived(task)
+                val task = ctx.decode<GzhAutoBta>()
+                val claim = InboxStore.claim(
+                    InboxStore.InboxMessage(
+                        idempotencyKey = task.idempotencyKey,
+                        eventId = task.eventId,
+                        workflowId = task.workflowId,
+                    )
+                )
+                if (!claim.claimed) {
+                    logger.info("【$env】跳过重复任务 idempotencyKey=${task.idempotencyKey}")
+                    return@startConsumer
+                }
+                logger.info("【$env】收到任务 workflowId=${task.workflowId}, gzh=${task.payload.account.name}, 日期范围=${task.payload.captureWindow}")
+                onTaskReceived(task, ResultQueuePublisher(manager, claim.resultEventId))
+                InboxStore.markCompleted(task.idempotencyKey)
             } catch (e: Exception) {
+                runCatching {
+                    val task = ctx.decode<GzhAutoBta>()
+                    InboxStore.markFailed(task.idempotencyKey)
+                }
                 logger.error("【$env】任务处理失败 correlationId=${ctx.correlationId}", e)
                 throw e  // 触发 RabbitMQ 层的重试/死信
             }

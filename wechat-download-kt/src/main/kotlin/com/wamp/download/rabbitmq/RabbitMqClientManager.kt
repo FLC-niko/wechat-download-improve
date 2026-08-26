@@ -7,6 +7,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -139,6 +140,7 @@ class RabbitMqClientManager(
     }
 
     private fun declareTopology(ch: Channel) {
+        ch.confirmSelect()
         ch.exchangeDeclare(EXCHANGE_NEW_MEDIA, BuiltinExchangeType.DIRECT, true)
         ch.queueDeclare(GZH_TASK_QUEUE, true, false, false, null)
         ch.queueBind(GZH_TASK_QUEUE, EXCHANGE_NEW_MEDIA, GZH_TASK_ROUTING)
@@ -155,7 +157,37 @@ class RabbitMqClientManager(
         publish(queue, bytes)
     }
 
+    suspend fun publishJson(
+        routingKey: String,
+        payload: Any,
+        eventId: String,
+        workflowId: String,
+        producerService: String,
+        headers: Map<String, Any?> = emptyMap(),
+    ) {
+        val bytes = gson.toJson(payload).toByteArray(Charsets.UTF_8)
+        publish(
+            routingKey = routingKey,
+            body = bytes,
+            eventId = eventId,
+            workflowId = workflowId,
+            producerService = producerService,
+            headers = headers,
+        )
+    }
+
     suspend fun publish(queue: String, body: ByteArray) {
+        publish(queue, body, eventId = null, workflowId = null, producerService = null)
+    }
+
+    suspend fun publish(
+        routingKey: String,
+        body: ByteArray,
+        eventId: String?,
+        workflowId: String?,
+        producerService: String?,
+        headers: Map<String, Any?> = emptyMap(),
+    ) {
         withContext(Dispatchers.IO) {
             val maxRetries = 3
             var lastException: IOException? = null
@@ -164,8 +196,27 @@ class RabbitMqClientManager(
                 try {
                     val ch = getValidChannel()
                     channelOperationMutex.withLock {
-                        ch.queueDeclare(queue, true, false, false, null)
-                        ch.basicPublish(EXCHANGE_NEW_MEDIA, queueRouting(queue), basicProps(), body)
+                        ch.queueDeclare(routingKey, true, false, false, null)
+                        val returned = AtomicReference<String?>(null)
+                        val returnListener = ReturnListener { replyCode, replyText, _, returnedRoutingKey, _, _ ->
+                            returned.set("replyCode=$replyCode, text=$replyText, routingKey=$returnedRoutingKey")
+                        }
+                        ch.addReturnListener(returnListener)
+                        try {
+                            ch.basicPublish(
+                                EXCHANGE_NEW_MEDIA,
+                                queueRouting(routingKey),
+                                true,
+                                basicProps(eventId, workflowId, producerService, headers),
+                                body,
+                            )
+                            ch.waitForConfirmsOrDie(5_000)
+                            returned.get()?.let {
+                                throw IOException("RabbitMQ returned message: $it")
+                            }
+                        } finally {
+                            ch.removeReturnListener(returnListener)
+                        }
                     }
                     return@withContext
                 } catch (e: IOException) {
@@ -188,8 +239,22 @@ class RabbitMqClientManager(
         else -> queue
     }
 
-    private fun basicProps(): AMQP.BasicProperties = AMQP.BasicProperties.Builder()
+    private fun basicProps(
+        eventId: String? = null,
+        workflowId: String? = null,
+        producerService: String? = null,
+        headers: Map<String, Any?> = emptyMap(),
+    ): AMQP.BasicProperties = AMQP.BasicProperties.Builder()
         .contentType("application/json")
+        .contentEncoding("utf-8")
+        .type(RABBIT_SCHEMA_VERSION)
+        .messageId(eventId)
+        .correlationId(workflowId)
+        .headers(buildMap {
+            put("x-schema-version", RABBIT_SCHEMA_VERSION)
+            if (producerService != null) put("x-producer-service", producerService)
+            putAll(headers)
+        })
         .deliveryMode(2) // persistent
         .build()
 
@@ -243,6 +308,9 @@ class RabbitMqClientManager(
      * 原消息仅在替代消息发布成功后才确认，从而避免异常路径丢消息。
      */
     private suspend fun retryOrDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
+        if (shouldRequeue(ctx) && TASK_RETRY_DELAY_MS > 0) {
+            delay(TASK_RETRY_DELAY_MS)
+        }
         channelOperationMutex.withLock {
             if (!ch.isOpen) {
                 logger.warn("【RabbitMQ】失败消息所在 channel 已关闭；消息将由 broker 重新投递")
@@ -257,12 +325,14 @@ class RabbitMqClientManager(
                 headers["x-retry-count"] = nextRetry
                 val retryProperties = ctx.delivery.properties.builder().headers(headers).build()
                 ch.basicPublish(EXCHANGE_NEW_MEDIA, queueRouting(ctx.queue), retryProperties, ctx.body)
+                ch.waitForConfirmsOrDie(5_000)
                 ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
                 logger.warn("【RabbitMQ】任务处理失败，已安排第 $nextRetry 次重试")
             } else {
                 headers["x-final-retry-count"] = ctx.retryCount
                 val deadProperties = ctx.delivery.properties.builder().headers(headers).build()
                 ch.basicPublish("", DEAD_MESSAGE_QUEUE, deadProperties, ctx.body)
+                ch.waitForConfirmsOrDie(5_000)
                 ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
                 logger.error("【RabbitMQ】任务重试次数耗尽，已隔离到 $DEAD_MESSAGE_QUEUE", error)
             }

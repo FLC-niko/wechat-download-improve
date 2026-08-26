@@ -2,8 +2,18 @@ package com.wamp.download.task
 
 import com.wamp.download.auth.LoginChecker
 import com.wamp.download.config.AppConfig
+import com.wamp.download.rabbitmq.GzhAutoBta
 import com.wamp.download.rabbitmq.GzhAutoFromBackend
+import com.wamp.download.rabbitmq.RabbitBusiness
+import com.wamp.download.rabbitmq.RabbitProducer
+import com.wamp.download.rabbitmq.CaptureWindow
+import com.wamp.download.rabbitmq.CollectionOptions
+import com.wamp.download.rabbitmq.GzhAccount
+import com.wamp.download.rabbitmq.GzhAutoBtaPayload
+import com.wamp.download.rabbitmq.AtdError
+import com.wamp.download.rabbitmq.RABBIT_SCHEMA_VERSION
 import com.wamp.download.rabbitmq.ResultQueuePublisher
+import com.wamp.download.rabbitmq.SeedArticle
 import com.wamp.download.store.Article
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.Subscription
@@ -12,8 +22,6 @@ import com.wamp.download.weread.WeReadWebClient
 import com.wamp.download.wx.WxApiClient
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
-import java.time.LocalDate
-import java.time.ZoneId
 import kotlin.random.Random
 
 /**
@@ -48,6 +56,27 @@ class TaskProcessor(
      * 处理一条任务
      */
     suspend fun process(task: GzhAutoFromBackend) {
+        processLegacy(task, resultPublisher)
+    }
+
+    suspend fun process(task: GzhAutoBta, publisher: ResultQueuePublisher) {
+        val legacyTask = GzhAutoFromBackend(
+            queueName = task.payload.account.entryUrl ?: "",
+            image = task.payload.account.qrImage?.objectKey ?: "",
+            gzhName = task.payload.account.name,
+            tempTimeStamp = listOf(task.payload.captureWindow.startsAt, task.payload.captureWindow.endsAt),
+            url = task.payload.account.entryUrl ?: "",
+            jobId = task.business.jobId,
+            correlationId = task.workflowId,
+        )
+        processLegacy(legacyTask, publisher, task)
+    }
+
+    private suspend fun processLegacy(
+        task: GzhAutoFromBackend,
+        publisher: ResultQueuePublisher?,
+        v2Task: GzhAutoBta? = null,
+    ) {
         val gzhName = task.gzhName
         val dateRange = task.tempTimeStamp
         logger.info("【任务处理】开始: gzh=$gzhName, 日期=$dateRange, jobId=${task.jobId}")
@@ -61,8 +90,8 @@ class TaskProcessor(
             loginChecker.startRecoveryAndWait()
             // 恢复后再次检查
             if (!loginChecker.isTokenValid(forceRefresh = true)) {
-                logger.error("【任务处理】登录恢复失败，发布空结果: gzh=$gzhName")
-                publishEmpty(task)
+                logger.error("【任务处理】登录恢复失败，发布失败结果: gzh=$gzhName")
+                publishFailed(task, publisher, "AUTH_RECOVERY_FAILED", "登录恢复失败", v2Task)
                 return
             }
         }
@@ -76,13 +105,13 @@ class TaskProcessor(
             if (e.message?.contains("ret=") == true || e.message?.contains("未登录") == true) {
                 loginChecker.startRecoveryAndWait()
             }
-            publishEmpty(task)
+            publishFailed(task, publisher, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败", v2Task)
             return
         }
 
         if (fakeid.isNullOrEmpty()) {
-            logger.warn("【任务处理】公众号不存在: gzh=$gzhName，发布空结果")
-            publishEmpty(task)
+            logger.warn("【任务处理】公众号不存在: gzh=$gzhName，发布失败结果")
+            publishFailed(task, publisher, "ACCOUNT_NOT_FOUND", "公众号不存在", v2Task)
             return
         }
 
@@ -98,9 +127,9 @@ class TaskProcessor(
                 // L3: 本地缓存兜底
                 ?: fetchFromLocalCache(fakeid, startTs, endTs).takeIf { it.isNotEmpty() }?.let { it to "cache" }
                 ?: run {
-                    // 全链路失败：告警 + 空结果
-                    logger.error("【任务处理】L1/L2/L3 全部失败，发布空结果: gzh=$gzhName")
-                    publishEmpty(task)
+                    // 全链路失败：告警 + FAILED
+                    logger.error("【任务处理】L1/L2/L3 全部失败，发布失败结果: gzh=$gzhName")
+                    publishFailed(task, publisher, "ARTICLE_FETCH_FAILED", "L1/L2/L3 全部采集失败", v2Task)
                     return
                 }
 
@@ -132,8 +161,16 @@ class TaskProcessor(
 
         // 发布结果
         val urls = filtered.map { it.link }
-        if (resultPublisher != null) {
-            resultPublisher.publishArticles(gzhName, task.jobId, task.correlationId, dateRange, urls)
+        if (publisher != null) {
+            if (v2Task != null) {
+                publisher.publish(
+                    input = v2Task,
+                    status = if (urls.isEmpty()) "EMPTY" else "SUCCEEDED",
+                    seedArticles = urls.distinct().map { SeedArticle(url = it) },
+                )
+            } else {
+                publisher.publishArticles(gzhName, task.jobId, task.correlationId, dateRange, urls)
+            }
         }
         logger.info("【任务处理】完成: gzh=$gzhName, 匹配 ${filtered.size}/${articles.size} 篇, 发布 ${urls.size} 条结果")
     }
@@ -302,13 +339,35 @@ class TaskProcessor(
         return fakeid
     }
 
-    private suspend fun publishEmpty(task: GzhAutoFromBackend) {
-        resultPublisher?.publishEmptyResult(
+    private suspend fun publishEmpty(task: GzhAutoFromBackend, publisher: ResultQueuePublisher? = resultPublisher) {
+        publisher?.publishEmptyResult(
             gzhName = task.gzhName,
             jobId = task.jobId,
             correlationId = task.correlationId,
             tempTimeStamp = task.tempTimeStamp,
         )
+    }
+
+    private suspend fun publishFailed(
+        task: GzhAutoFromBackend,
+        publisher: ResultQueuePublisher?,
+        code: String,
+        message: String,
+        v2Task: GzhAutoBta? = null,
+    ) {
+        val error = AtdError(code = code, message = message, retryable = code != "ACCOUNT_NOT_FOUND")
+        if (publisher == null) return
+        if (v2Task != null) {
+            publisher.publish(input = v2Task, status = "FAILED", error = error)
+        } else {
+            publisher.publishFailedResult(
+                gzhName = task.gzhName,
+                jobId = task.jobId,
+                correlationId = task.correlationId,
+                tempTimeStamp = task.tempTimeStamp,
+                error = error,
+            )
+        }
     }
 
     /**
@@ -317,16 +376,10 @@ class TaskProcessor(
      * @return Pair(startTs, endTs) 秒级时间戳，解析失败返回 null
      */
     private fun parseDateRange(range: List<String>): Pair<Long?, Long?> {
-        if (range.size < 2) return Pair(null, null)
-        return try {
-            val zone = ZoneId.systemDefault()
-            val startTs = LocalDate.parse(range[0]).atStartOfDay(zone).toEpochSecond()
-            // 结束日期按包含处理（到当天 23:59:59）
-            val endTs = LocalDate.parse(range[1]).plusDays(1).atStartOfDay(zone).toEpochSecond() - 1
-            Pair(startTs, endTs)
-        } catch (e: Exception) {
-            logger.warn("【任务处理】日期范围解析失败: $range, ${e.message}")
-            Pair(null, null)
+        val parsed = CaptureWindowParser.parse(range)
+        if (parsed.first == null || parsed.second == null) {
+            logger.warn("【任务处理】采集时间窗口解析失败: $range")
         }
+        return parsed
     }
 }

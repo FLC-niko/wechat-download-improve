@@ -9,6 +9,10 @@ import com.wamp.download.config.AppConfig
 import com.wamp.download.feed.feedRoutes
 import com.wamp.download.notify.LoginReminder
 import com.wamp.download.poller.RssPoller
+import com.wamp.download.rabbitmq.DEAD_MESSAGE_QUEUE
+import com.wamp.download.rabbitmq.EXCHANGE_NEW_MEDIA
+import com.wamp.download.rabbitmq.GZH_RESULT_QUEUE
+import com.wamp.download.rabbitmq.GZH_TASK_QUEUE
 import com.wamp.download.rabbitmq.RabbitMqService
 import com.wamp.download.store.Database
 import com.wamp.download.task.TaskProcessor
@@ -65,7 +69,6 @@ fun main() {
     val taskProcessor = TaskProcessor(
         wxClient = wxClient,
         loginChecker = loginChecker,
-        resultPublisher = rabbitMqService.resultPublisher,
     )
 
     // JVM shutdown hook：Ctrl+C / kill 时清理资源，避免残留进程
@@ -146,8 +149,8 @@ fun main() {
             }
         }
         scope.launch {
-            rabbitMqService.start(scope, onTaskReceived = { task ->
-                taskProcessor.process(task)
+            rabbitMqService.start(scope, onTaskReceived = { task, publisher ->
+                taskProcessor.process(task, publisher)
             })
         }
         logger.info("后台任务已启动: RSS轮询器 + 登录提醒 + 登录检查 + RabbitMQ + 任务处理 + 微信读书刷新保活")
@@ -186,10 +189,10 @@ fun main() {
                     "rabbitmq" to mapOf(
                         "host" to AppConfig.rabbitmqHost,
                         "port" to AppConfig.rabbitmqPort,
-                        "exchange" to "new-media-backend",
-                        "task_queue" to "gzh-auto-BTA-queue",
-                        "result_queue" to "gzh-auto-ATD-queue",
-                        "dead_letter_queue" to "dead-message-queue",
+                        "exchange" to EXCHANGE_NEW_MEDIA,
+                        "task_queue" to GZH_TASK_QUEUE,
+                        "result_queue" to GZH_RESULT_QUEUE,
+                        "dead_letter_queue" to DEAD_MESSAGE_QUEUE,
                         "vhosts" to states.mapValues { it.value.name }
                     )
                 ))
