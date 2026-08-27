@@ -13,6 +13,7 @@ import com.wamp.download.rabbitmq.GzhAutoBtaPayload
 import com.wamp.download.rabbitmq.AtdError
 import com.wamp.download.rabbitmq.RABBIT_SCHEMA_VERSION
 import com.wamp.download.rabbitmq.ResultQueuePublisher
+import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.rabbitmq.SeedArticle
 import com.wamp.download.store.Article
 import com.wamp.download.store.ArticleStore
@@ -56,84 +57,91 @@ class TaskProcessor(
      * 处理一条任务
      */
     suspend fun process(task: GzhAutoFromBackend) {
-        processLegacy(task, resultPublisher)
+        process(task, resultPublisher)
+    }
+
+    suspend fun process(task: GzhAutoFromBackend, publisher: ResultQueuePublisher?) {
+        processTask(
+            task = ProcessingTask(
+                gzhName = task.gzhName,
+                dateRange = task.tempTimeStamp,
+                jobId = task.jobId,
+                correlationId = task.correlationId,
+                publisher = publisher,
+                v2Task = null,
+            )
+        )
     }
 
     suspend fun process(task: GzhAutoBta, publisher: ResultQueuePublisher) {
-        val legacyTask = GzhAutoFromBackend(
-            queueName = task.payload.account.entryUrl ?: "",
-            image = task.payload.account.qrImage?.objectKey ?: "",
-            gzhName = task.payload.account.name,
-            tempTimeStamp = listOf(task.payload.captureWindow.startsAt, task.payload.captureWindow.endsAt),
-            url = task.payload.account.entryUrl ?: "",
-            jobId = task.business.jobId,
-            correlationId = task.workflowId,
+        processTask(
+            task = ProcessingTask(
+                gzhName = task.payload.account.name,
+                dateRange = listOf(task.payload.captureWindow.startsAt, task.payload.captureWindow.endsAt),
+                jobId = task.business.jobId,
+                correlationId = task.workflowId,
+                publisher = publisher,
+                v2Task = task,
+            )
         )
-        processLegacy(legacyTask, publisher, task)
     }
 
-    private suspend fun processLegacy(
-        task: GzhAutoFromBackend,
-        publisher: ResultQueuePublisher?,
-        v2Task: GzhAutoBta? = null,
-    ) {
-        val gzhName = task.gzhName
-        val dateRange = task.tempTimeStamp
-        logger.info("【任务处理】开始: gzh=$gzhName, 日期=$dateRange, jobId=${task.jobId}")
+    private suspend fun processTask(task: ProcessingTask) {
+        logger.info("【任务处理】开始: gzh=${task.gzhName}, 日期=${task.dateRange}, jobId=${task.jobId}")
 
         // 1. 等待登录恢复（如果正在恢复）
         loginChecker.waitForRecoveryComplete()
 
         // 2. 检查 token 有效性
         if (!loginChecker.isTokenValid()) {
-            logger.warn("【任务处理】token 无效，触发登录恢复: gzh=$gzhName")
+            logger.warn("【任务处理】token 无效，触发登录恢复: gzh=${task.gzhName}")
             loginChecker.startRecoveryAndWait()
             // 恢复后再次检查
             if (!loginChecker.isTokenValid(forceRefresh = true)) {
-                logger.error("【任务处理】登录恢复失败，发布失败结果: gzh=$gzhName")
-                publishFailed(task, publisher, "AUTH_RECOVERY_FAILED", "登录恢复失败", v2Task)
+                logger.error("【任务处理】登录恢复失败，发布失败结果: gzh=${task.gzhName}")
+                publishFailed(task, "AUTH_RECOVERY_FAILED", "登录恢复失败")
                 return
             }
         }
 
         // 3. 搜索公众号 → 获取 fakeid
         val fakeid = try {
-            findOrCreateSubscription(gzhName)
+            findOrCreateSubscription(task.gzhName)
         } catch (e: Exception) {
-            logger.error("【任务处理】搜索公众号失败: gzh=$gzhName, error=${e.message}")
+            logger.error("【任务处理】搜索公众号失败: gzh=${task.gzhName}, error=${e.message}")
             // 如果是登录失效导致的搜索失败，触发恢复
             if (e.message?.contains("ret=") == true || e.message?.contains("未登录") == true) {
                 loginChecker.startRecoveryAndWait()
             }
-            publishFailed(task, publisher, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败", v2Task)
+            publishFailed(task, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败")
             return
         }
 
         if (fakeid.isNullOrEmpty()) {
-            logger.warn("【任务处理】公众号不存在: gzh=$gzhName，发布失败结果")
-            publishFailed(task, publisher, "ACCOUNT_NOT_FOUND", "公众号不存在", v2Task)
+            logger.warn("【任务处理】公众号不存在: gzh=${task.gzhName}，发布失败结果")
+            publishFailed(task, "ACCOUNT_NOT_FOUND", "公众号不存在")
             return
         }
 
         val subscription = SubscriptionStore.get(fakeid)
-        val (startTs, endTs) = parseDateRange(dateRange)
+        val (startTs, endTs) = parseDateRange(task.dateRange)
 
         // --- 工业级回退链路 L1 → L2 → L3 ---
         val (articles, sourceName) =
             // L1: 主通道（带频控降级检查 + 重试 + 退避）
             fetchViaMainChannel(fakeid)?.takeIf { it.isNotEmpty() }?.let { it to "main" }
                 // L2: 微信读书官方直连
-                ?: fetchFromWeRead(gzhName, fakeid, subscription, startTs).takeIf { it.isNotEmpty() }?.let { it to "weread-web" }
+                ?: fetchFromWeRead(task.gzhName, fakeid, subscription, startTs).takeIf { it.isNotEmpty() }?.let { it to "weread-web" }
                 // L3: 本地缓存兜底
                 ?: fetchFromLocalCache(fakeid, startTs, endTs).takeIf { it.isNotEmpty() }?.let { it to "cache" }
                 ?: run {
                     // 全链路失败：告警 + FAILED
-                    logger.error("【任务处理】L1/L2/L3 全部失败，发布失败结果: gzh=$gzhName")
-                    publishFailed(task, publisher, "ARTICLE_FETCH_FAILED", "L1/L2/L3 全部采集失败", v2Task)
+                    logger.error("【任务处理】L1/L2/L3 全部失败，发布失败结果: gzh=${task.gzhName}")
+                    publishFailed(task, "ARTICLE_FETCH_FAILED", "L1/L2/L3 全部采集失败")
                     return
                 }
 
-        logger.info("【任务处理】获取到 ${articles.size} 篇文章: gzh=$gzhName (source=$sourceName)")
+        logger.info("【任务处理】获取到 ${articles.size} 篇文章: gzh=${task.gzhName} (source=$sourceName)")
 
         // 按日期范围过滤
         val filtered = if (startTs != null && endTs != null) {
@@ -161,19 +169,28 @@ class TaskProcessor(
 
         // 发布结果
         val urls = filtered.map { it.link }
-        if (publisher != null) {
-            if (v2Task != null) {
+        task.publisher?.let { publisher ->
+            if (task.v2Task != null) {
                 publisher.publish(
-                    input = v2Task,
+                    input = task.v2Task,
                     status = if (urls.isEmpty()) "EMPTY" else "SUCCEEDED",
                     seedArticles = urls.distinct().map { SeedArticle(url = it) },
                 )
             } else {
-                publisher.publishArticles(gzhName, task.jobId, task.correlationId, dateRange, urls)
+                publisher.publishArticles(task.gzhName, task.jobId, task.correlationId, task.dateRange, urls)
             }
         }
-        logger.info("【任务处理】完成: gzh=$gzhName, 匹配 ${filtered.size}/${articles.size} 篇, 发布 ${urls.size} 条结果")
+        logger.info("【任务处理】完成: gzh=${task.gzhName}, 匹配 ${filtered.size}/${articles.size} 篇, 发布 ${urls.size} 条结果")
     }
+
+    private data class ProcessingTask(
+        val gzhName: String,
+        val dateRange: List<String>,
+        val jobId: Long,
+        val correlationId: String,
+        val publisher: ResultQueuePublisher?,
+        val v2Task: GzhAutoBta?,
+    )
 
     /**
      * L1 主通道：appmsgpublish 获取文章列表（带降级检查 + 重试 + 退避）
@@ -349,22 +366,20 @@ class TaskProcessor(
     }
 
     private suspend fun publishFailed(
-        task: GzhAutoFromBackend,
-        publisher: ResultQueuePublisher?,
+        task: ProcessingTask,
         code: String,
         message: String,
-        v2Task: GzhAutoBta? = null,
     ) {
         val error = AtdError(code = code, message = message, retryable = code != "ACCOUNT_NOT_FOUND")
-        if (publisher == null) return
-        if (v2Task != null) {
-            publisher.publish(input = v2Task, status = "FAILED", error = error)
+        val publisher = task.publisher ?: return
+        if (task.v2Task != null) {
+            publisher.publish(input = task.v2Task, status = "FAILED", error = error)
         } else {
             publisher.publishFailedResult(
                 gzhName = task.gzhName,
                 jobId = task.jobId,
                 correlationId = task.correlationId,
-                tempTimeStamp = task.tempTimeStamp,
+                tempTimeStamp = task.dateRange,
                 error = error,
             )
         }

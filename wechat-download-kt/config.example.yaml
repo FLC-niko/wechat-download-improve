@@ -26,6 +26,7 @@ rabbitmq:
   password: "guest"
   pro_virtual_host: "pro"
   test_virtual_host: "test"
+  xdag_virtual_host: "xdag"
   thdag_virtual_host: "thdag"
   reconnect_initial_delay_ms: 5000
   reconnect_max_delay_ms: 60000

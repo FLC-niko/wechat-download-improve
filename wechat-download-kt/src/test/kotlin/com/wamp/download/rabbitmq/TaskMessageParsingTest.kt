@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 
 /**
@@ -73,5 +74,26 @@ class TaskMessageParsingTest {
         assertEquals("EMPTY", result.payload.status)
         assertEquals(9223372036854775807L, result.business.jobId)
         assertNotNull(result.payload.captureWindow)
+    }
+
+    @Test
+    fun `拒绝缺少 correlationId 的旧版任务`() {
+        val json = """
+        {
+            "queueName": "gzh-auto-DTB-queue-hzdag",
+            "image": "",
+            "gzhName": "测试公众号",
+            "tempTimeStamp": ["2026-01-01", "2026-01-02"],
+            "url": null,
+            "jobId": 1,
+            "correlationId": null
+        }
+        """.trimIndent()
+
+        val error = assertFailsWith<RabbitTaskFormatException> {
+            RabbitTaskDecoder.decode(json.toByteArray())
+        }
+
+        assertEquals("旧版任务缺少 correlationId", error.message)
     }
 }

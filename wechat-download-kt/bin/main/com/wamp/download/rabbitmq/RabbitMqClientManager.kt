@@ -15,12 +15,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * RabbitMQ 客户端管理器 — 参照 Worker 的 RabbitMqClientManager 实现
  *
  * 功能：
- * - 支持 new-media-backend exchange + BTA/ATD/状态队列 拓扑
+ * - 支持 new-media-backend direct exchange + BTA/ATD/状态队列拓扑
  * - JSON 发布、任务消费（手动 ack）、去重与重试
  * - 网络断开自动恢复，channel/connection 线程安全
  */
 class RabbitMqClientManager(
-    private val gson: Gson = Gson()
+    private val gson: Gson = Gson(),
+    private val enableGzhTopology: Boolean = true,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(RabbitMqClientManager::class.java)
@@ -93,7 +94,9 @@ class RabbitMqClientManager(
                 val ch = conn.createChannel()
                 connection = conn
                 channel = ch
-                declareTopology(ch)
+                if (enableGzhTopology) {
+                    declareTopology(ch)
+                }
                 closed.set(false)
                 logger.info("【RabbitMQ:${settings.virtualHost}】连接成功")
             }
@@ -147,7 +150,6 @@ class RabbitMqClientManager(
         ch.queueDeclare(GZH_RESULT_QUEUE, true, false, false, null)
         ch.queueBind(GZH_RESULT_QUEUE, EXCHANGE_NEW_MEDIA, GZH_RESULT_ROUTING)
         ch.queueDeclare(SERVER_STATUS_QUEUE, true, false, false, null)
-        ch.queueDeclare(DEAD_MESSAGE_QUEUE, true, false, false, null)
     }
 
     fun isConnected(): Boolean = connection?.isOpen == true && channel?.isOpen == true
@@ -177,7 +179,13 @@ class RabbitMqClientManager(
     }
 
     suspend fun publish(queue: String, body: ByteArray) {
-        publish(queue, body, eventId = null, workflowId = null, producerService = null)
+        publish(
+            routingKey = queueRouting(queue),
+            body = body,
+            eventId = null,
+            workflowId = null,
+            producerService = null,
+        )
     }
 
     suspend fun publish(
@@ -196,27 +204,14 @@ class RabbitMqClientManager(
                 try {
                     val ch = getValidChannel()
                     channelOperationMutex.withLock {
-                        ch.queueDeclare(routingKey, true, false, false, null)
-                        val returned = AtomicReference<String?>(null)
-                        val returnListener = ReturnListener { replyCode, replyText, _, returnedRoutingKey, _, _ ->
-                            returned.set("replyCode=$replyCode, text=$replyText, routingKey=$returnedRoutingKey")
-                        }
-                        ch.addReturnListener(returnListener)
-                        try {
-                            ch.basicPublish(
-                                EXCHANGE_NEW_MEDIA,
-                                queueRouting(routingKey),
-                                true,
-                                basicProps(eventId, workflowId, producerService, headers),
-                                body,
-                            )
-                            ch.waitForConfirmsOrDie(5_000)
-                            returned.get()?.let {
-                                throw IOException("RabbitMQ returned message: $it")
-                            }
-                        } finally {
-                            ch.removeReturnListener(returnListener)
-                        }
+                        ch.queueDeclare(queueForRoutingKey(routingKey), true, false, false, null)
+                        publishAndConfirm(
+                            ch = ch,
+                            exchange = EXCHANGE_NEW_MEDIA,
+                            routingKey = routingKey,
+                            properties = basicProps(eventId, workflowId, producerService, headers),
+                            body = body,
+                        )
                     }
                     return@withContext
                 } catch (e: IOException) {
@@ -233,10 +228,37 @@ class RabbitMqClientManager(
         }
     }
 
+    private fun publishAndConfirm(
+        ch: Channel,
+        exchange: String,
+        routingKey: String,
+        properties: AMQP.BasicProperties,
+        body: ByteArray,
+    ) {
+        val returned = AtomicReference<String?>(null)
+        val returnListener = ReturnListener { replyCode, replyText, _, returnedRoutingKey, _, _ ->
+            returned.set("replyCode=$replyCode, text=$replyText, routingKey=$returnedRoutingKey")
+        }
+        ch.addReturnListener(returnListener)
+        try {
+            ch.basicPublish(exchange, routingKey, true, properties, body)
+            ch.waitForConfirmsOrDie(5_000)
+            returned.get()?.let { throw IOException("RabbitMQ returned message: $it") }
+        } finally {
+            ch.removeReturnListener(returnListener)
+        }
+    }
+
     private fun queueRouting(queue: String): String = when (queue) {
         GZH_TASK_QUEUE -> GZH_TASK_ROUTING
         GZH_RESULT_QUEUE -> GZH_RESULT_ROUTING
         else -> queue
+    }
+
+    private fun queueForRoutingKey(routingKey: String): String = when (routingKey) {
+        GZH_TASK_ROUTING -> GZH_TASK_QUEUE
+        GZH_RESULT_ROUTING -> GZH_RESULT_QUEUE
+        else -> routingKey
     }
 
     private fun basicProps(
@@ -278,6 +300,12 @@ class RabbitMqClientManager(
                     if (!autoAck) acknowledge(ch, ctx)
                 } catch (e: CancellationException) {
                     throw e
+                } catch (e: RabbitTaskFormatException) {
+                    logger.warn("【RabbitMQ】消息格式非法，拒绝且不重新入队: ${e.message}")
+                    if (!autoAck) {
+                        runCatching { rejectWithoutRequeue(ch, ctx) }
+                            .onFailure { logger.error("【RabbitMQ】拒绝格式非法消息失败", it) }
+                    }
                 } catch (e: Exception) {
                     logger.error("【RabbitMQ】消费处理异常", e)
                     if (!autoAck) {
@@ -303,38 +331,66 @@ class RabbitMqClientManager(
         }
     }
 
-    /**
-     * 将失败消息重新发布并增加重试次数；超过上限后投递到死信队列。
-     * 原消息仅在替代消息发布成功后才确认，从而避免异常路径丢消息。
-     */
-    private suspend fun retryOrDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
-        if (shouldRequeue(ctx) && TASK_RETRY_DELAY_MS > 0) {
-            delay(TASK_RETRY_DELAY_MS)
-        }
+    private suspend fun rejectWithoutRequeue(ch: Channel, ctx: DeliveryContext) {
         channelOperationMutex.withLock {
             if (!ch.isOpen) {
-                logger.warn("【RabbitMQ】失败消息所在 channel 已关闭；消息将由 broker 重新投递")
+                logger.warn("【RabbitMQ】拒绝格式非法消息时 channel 已关闭；消息将由 broker 重新投递")
                 return
             }
+            ch.basicNack(ctx.delivery.envelope.deliveryTag, false, false)
+        }
+    }
 
-            val headers = ctx.headers.toMutableMap()
-            val nextRetry = ctx.retryCount + 1
-            headers["x-last-error"] = (error.message ?: error.javaClass.simpleName).take(512)
+    /**
+     * 将失败消息重新发布并增加重试次数；超过上限后拒绝且不重新入队。
+     * 当前 RabbitMQ 队列清单没有配置 DLQ，不能把失败消息转发到不存在的队列。
+     */
+    private suspend fun retryOrDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
+        try {
+            if (shouldRequeue(ctx) && TASK_RETRY_DELAY_MS > 0) {
+                delay(TASK_RETRY_DELAY_MS)
+            }
+            channelOperationMutex.withLock {
+                if (!ch.isOpen) {
+                    logger.warn("【RabbitMQ】失败消息所在 channel 已关闭；消息将由 broker 重新投递")
+                    return
+                }
 
-            if (shouldRequeue(ctx)) {
-                headers["x-retry-count"] = nextRetry
-                val retryProperties = ctx.delivery.properties.builder().headers(headers).build()
-                ch.basicPublish(EXCHANGE_NEW_MEDIA, queueRouting(ctx.queue), retryProperties, ctx.body)
-                ch.waitForConfirmsOrDie(5_000)
-                ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
-                logger.warn("【RabbitMQ】任务处理失败，已安排第 $nextRetry 次重试")
-            } else {
-                headers["x-final-retry-count"] = ctx.retryCount
-                val deadProperties = ctx.delivery.properties.builder().headers(headers).build()
-                ch.basicPublish("", DEAD_MESSAGE_QUEUE, deadProperties, ctx.body)
-                ch.waitForConfirmsOrDie(5_000)
-                ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
-                logger.error("【RabbitMQ】任务重试次数耗尽，已隔离到 $DEAD_MESSAGE_QUEUE", error)
+                val headers = ctx.headers.toMutableMap()
+                val nextRetry = ctx.retryCount + 1
+                headers["x-last-error"] = error.javaClass.simpleName
+
+                if (shouldRequeue(ctx)) {
+                    headers["x-retry-count"] = nextRetry
+                    val retryProperties = ctx.delivery.properties.builder().headers(headers).build()
+                    publishAndConfirm(
+                        ch = ch,
+                        exchange = EXCHANGE_NEW_MEDIA,
+                        routingKey = queueRouting(ctx.queue),
+                        properties = retryProperties,
+                        body = ctx.body,
+                    )
+                    ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
+                    logger.warn("【RabbitMQ】任务处理失败，已安排第 $nextRetry 次重试")
+                } else {
+                    ch.basicNack(ctx.delivery.envelope.deliveryTag, false, false)
+                    logger.error("【RabbitMQ】任务重试次数耗尽；当前 vhost 未配置 DLQ，消息已拒绝且不重新入队", error)
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error("【RabbitMQ】失败消息替代发布失败；重新入队原消息", e)
+            if (ch.isOpen) {
+                runCatching {
+                    channelOperationMutex.withLock {
+                        if (ch.isOpen) {
+                            ch.basicNack(ctx.delivery.envelope.deliveryTag, false, true)
+                        }
+                    }
+                }.onFailure {
+                    logger.warn("【RabbitMQ】原消息重新入队失败；channel 关闭后由 broker 处理", it)
+                }
             }
         }
     }

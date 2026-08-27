@@ -90,7 +90,7 @@ data class GzhAutoFromBackend(
     val image: String,
     val gzhName: String,
     val tempTimeStamp: List<String>,
-    val url: String,
+    val url: String?,
     val jobId: Long,
     val correlationId: String
 )

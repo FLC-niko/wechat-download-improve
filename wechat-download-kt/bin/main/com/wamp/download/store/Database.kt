@@ -7,6 +7,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.sql.Connection
+import java.util.UUID
 
 /**
  * 数据库表定义 — 对齐 Python 版 rss_store.py 的 schema
@@ -62,8 +63,7 @@ object Database {
     private val logger = LoggerFactory.getLogger(Database::class.java)
     private var db: org.jetbrains.exposed.sql.Database? = null
 
-    fun init() {
-        val dbPath = AppConfig.dbPath
+    fun init(dbPath: String = AppConfig.dbPath) {
         File(dbPath).parentFile?.mkdirs()
 
         db = org.jetbrains.exposed.sql.Database.connect(
@@ -78,6 +78,7 @@ object Database {
                 st.execute("PRAGMA foreign_keys=ON")
                 st.execute("PRAGMA busy_timeout=5000")
             }
+            migrateRabbitInbox(conn)
         }
 
         // 建表单独一个事务（createMissingTablesAndColumns 可为旧表补齐新增列）
@@ -88,4 +89,45 @@ object Database {
     }
 
     fun <T> query(block: Transaction.() -> T): T = transaction(db, block)
+
+    private fun migrateRabbitInbox(conn: Connection) {
+        val tableExists = conn.prepareStatement(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rabbit_inbox' LIMIT 1"
+        ).use { statement ->
+            statement.executeQuery().use { rows -> rows.next() }
+        }
+        if (!tableExists) return
+
+        val hasResultEventId = conn.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA table_info(rabbit_inbox)").use { columns ->
+                generateSequence {
+                    if (columns.next()) columns.getString("name") else null
+                }.any { it == "result_event_id" }
+            }
+        }
+        if (hasResultEventId) return
+
+        conn.createStatement().use { statement ->
+            statement.executeUpdate(
+                "ALTER TABLE rabbit_inbox ADD COLUMN result_event_id VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+        }
+        conn.prepareStatement(
+            "SELECT idempotency_key FROM rabbit_inbox WHERE result_event_id = ''"
+        ).use { select ->
+            select.executeQuery().use { rows ->
+                conn.prepareStatement(
+                    "UPDATE rabbit_inbox SET result_event_id = ? WHERE idempotency_key = ?"
+                ).use { update ->
+                    while (rows.next()) {
+                        update.setString(1, "evt_legacy_${UUID.randomUUID()}")
+                        update.setString(2, rows.getString("idempotency_key"))
+                        update.addBatch()
+                    }
+                    update.executeBatch()
+                }
+            }
+        }
+        logger.info("已迁移 rabbit_inbox.result_event_id，保留历史幂等记录")
+    }
 }

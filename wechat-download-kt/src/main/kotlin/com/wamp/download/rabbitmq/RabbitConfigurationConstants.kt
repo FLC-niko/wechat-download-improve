@@ -24,16 +24,18 @@ val RABBITMQ_VIRTUAL_HOST: String
 val RABBITMQ_TEST_VIRTUAL_HOST: String
     get() = AppConfig.rabbitmqTestVirtualHost
 
+val RABBITMQ_XDAG_VIRTUAL_HOST: String
+    get() = AppConfig.rabbitmqXdagVirtualHost
+
 val RABBITMQ_THDAG_VIRTUAL_HOST: String
     get() = AppConfig.rabbitmqThdagVirtualHost
 
 // --- RabbitMQ 拓扑（业务常量，不需要外部配置）---
-const val DEAD_MESSAGE_QUEUE = "archive.gzh.auto.bta.v2.dlq"
-const val EXCHANGE_NEW_MEDIA = "archive.new-media.v2"
-const val GZH_TASK_QUEUE = "archive.gzh.auto.bta.v2"
-const val GZH_TASK_ROUTING = GZH_TASK_QUEUE
-const val GZH_RESULT_QUEUE = "archive.gzh.auto.atd.v2"
-const val GZH_RESULT_ROUTING = GZH_RESULT_QUEUE
+const val EXCHANGE_NEW_MEDIA = "new-media-backend"
+const val GZH_TASK_QUEUE = "gzh-auto-BTA-queue"
+const val GZH_TASK_ROUTING = "gzh-auto-BTA-routing"
+const val GZH_RESULT_QUEUE = "gzh-auto-ATD-queue"
+const val GZH_RESULT_ROUTING = "gzh-auto-ATD-routing"
 const val SERVER_STATUS_QUEUE = "server.queue.provideLog"
 
 // --- 任务策略（从 AppConfig 读取）---

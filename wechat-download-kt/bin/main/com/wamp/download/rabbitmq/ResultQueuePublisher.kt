@@ -69,6 +69,24 @@ class ResultQueuePublisher(
         error: AtdError? = null,
         eventId: String = defaultResultEventId ?: "evt_${UUID.randomUUID()}"
     ) {
+        val message = buildMessage(input, status, seedArticles, error, eventId)
+        clientManager.publishJson(
+            routingKey = GZH_RESULT_ROUTING,
+            payload = message,
+            eventId = message.eventId,
+            workflowId = message.workflowId,
+            producerService = "android-worker",
+        )
+        logger.info("ATD 发布成功: tenant=${input.tenantCode}, workflow=${input.workflowId}, status=$status, seedCount=${message.payload.seedArticles.size}")
+    }
+
+    internal fun buildMessage(
+        input: GzhAutoBta,
+        status: String,
+        seedArticles: List<SeedArticle> = emptyList(),
+        error: AtdError? = null,
+        eventId: String = defaultResultEventId ?: "evt_${UUID.randomUUID()}"
+    ): GzhAutoAtd {
         require(status in setOf("SUCCEEDED", "EMPTY", "FAILED")) { "不支持的 Android ATD 状态: $status" }
         require(status != "SUCCEEDED" || seedArticles.isNotEmpty()) {
             "SUCCEEDED ATD 必须至少包含一篇种子文章"
@@ -88,7 +106,7 @@ class ResultQueuePublisher(
             seedArticles = deduplicated,
             error = error,
         )
-        val message = RabbitV2Envelope(
+        return RabbitV2Envelope(
             schemaVersion = RABBIT_SCHEMA_VERSION,
             eventId = eventId,
             workflowId = input.workflowId,
@@ -103,14 +121,6 @@ class ResultQueuePublisher(
             business = input.business,
             payload = payload,
         )
-        clientManager.publishJson(
-            routingKey = GZH_RESULT_ROUTING,
-            payload = message,
-            eventId = message.eventId,
-            workflowId = message.workflowId,
-            producerService = "android-worker",
-        )
-        logger.info("ATD 发布成功: tenant=${input.tenantCode}, workflow=${input.workflowId}, status=$status, seedCount=${deduplicated.size}")
     }
 
     private fun legacyInput(

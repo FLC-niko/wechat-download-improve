@@ -34,6 +34,7 @@ object AppConfig {
     val rabbitmqPassword: String get() = getString("rabbitmq.password", "guest")
     val rabbitmqProVirtualHost: String get() = getString("rabbitmq.pro_virtual_host", "pro")
     val rabbitmqTestVirtualHost: String get() = getString("rabbitmq.test_virtual_host", "test")
+    val rabbitmqXdagVirtualHost: String get() = getString("rabbitmq.xdag_virtual_host", "xdag")
     val rabbitmqThdagVirtualHost: String get() = getString("rabbitmq.thdag_virtual_host", "thdag")
     val rabbitmqReconnectInitialDelayMs: Long
         get() = getLong("rabbitmq.reconnect_initial_delay_ms", 5_000L).coerceAtLeast(1_000L)

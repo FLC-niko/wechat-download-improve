@@ -14,6 +14,7 @@ package com.wamp.download.rabbitmq
 object RabbitMqClient {
     private var rabbitMqClientManager: RabbitMqClientManager? = null
     private var testRabbitMqClientManager: RabbitMqClientManager? = null
+    private var xdagRabbitMqClientManager: RabbitMqClientManager? = null
     private var thdagRabbitMqClientManager: RabbitMqClientManager? = null
 
     /** 返回 pro 虚拟主机管理器实例（懒加载） */
@@ -30,6 +31,14 @@ object RabbitMqClient {
             testRabbitMqClientManager = RabbitMqClientManager()
         }
         return testRabbitMqClientManager!!
+    }
+
+    /** 返回 xdag 虚拟主机管理器实例（懒加载） */
+    fun getXdagManager(): RabbitMqClientManager {
+        if (xdagRabbitMqClientManager == null) {
+            xdagRabbitMqClientManager = RabbitMqClientManager()
+        }
+        return xdagRabbitMqClientManager!!
     }
 
     /** 返回 thdag 虚拟主机管理器实例（懒加载） */
