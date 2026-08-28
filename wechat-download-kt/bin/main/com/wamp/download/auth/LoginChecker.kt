@@ -1,6 +1,8 @@
 package com.wamp.download.auth
 
 import com.wamp.download.notify.WebhookNotifier
+import com.wamp.download.config.AppConfig
+import com.wamp.download.task.ChannelStateManager
 import com.wamp.download.wx.WxApiClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -49,7 +51,7 @@ class LoginChecker(
     @Volatile
     private var lastCheckTime: Long = 0L
     @Volatile
-    private var lastCheckResult: Boolean = false
+    private var lastCheckStatus: WxApiClient.TokenStatus = WxApiClient.TokenStatus.EXPIRED
 
     fun start() {
         scope.launch {
@@ -64,23 +66,26 @@ class LoginChecker(
     }
 
     /**
-     * 快速检查 token 是否有效（带缓存）
+     * 快速检查 token 状态（带缓存）
      *
      * @param forceRefresh 强制重新探测（不使用缓存）
-     * @return true=有效, false=失效
+     * @return token 状态
      */
-    fun isTokenValid(forceRefresh: Boolean = false): Boolean {
-        if (isRecovering) return false
+    fun checkTokenStatus(forceRefresh: Boolean = false): WxApiClient.TokenStatus {
+        if (isRecovering) return WxApiClient.TokenStatus.EXPIRED
 
         val now = System.currentTimeMillis()
         if (!forceRefresh && now - lastCheckTime < tokenCacheMs) {
-            return lastCheckResult
+            return lastCheckStatus
         }
 
-        lastCheckResult = wxClient.checkTokenValid()
+        lastCheckStatus = wxClient.checkTokenStatus()
         lastCheckTime = now
-        return lastCheckResult
+        return lastCheckStatus
     }
+
+    fun isTokenValid(forceRefresh: Boolean = false): Boolean =
+        checkTokenStatus(forceRefresh) == WxApiClient.TokenStatus.VALID
 
     /**
      * 等待登录恢复完成（如果正在恢复）
@@ -111,32 +116,39 @@ class LoginChecker(
     private suspend fun checkLoginStatus() {
         val now = System.currentTimeMillis()
         // 用缓存判断，避免每次都发请求
-        if (now - lastCheckTime < tokenCacheMs && lastCheckResult) {
+        if (now - lastCheckTime < tokenCacheMs && lastCheckStatus == WxApiClient.TokenStatus.VALID) {
             return  // 缓存有效，跳过
         }
 
-        val valid = try {
-            wxClient.checkTokenValid()
+        val status = try {
+            wxClient.checkTokenStatus()
         } catch (e: Exception) {
             logger.warn("【登录检查】探测失败: ${e.message}")
             return
         }
 
         lastCheckTime = now
-        lastCheckResult = valid
+        lastCheckStatus = status
 
-        if (valid) {
-            logger.debug("【登录检查】微信登录状态有效")
-        } else {
-            logger.warn("【登录检查】微信登录失效，开始恢复流程...")
-            if (!tryBeginRecovery()) {
-                logger.info("【登录检查】已有恢复流程在进行中，跳过重复触发")
-                return
+        when (status) {
+            WxApiClient.TokenStatus.VALID -> logger.debug("【登录检查】微信登录状态有效")
+            WxApiClient.TokenStatus.RATE_LIMITED -> {
+                logger.warn("【登录检查】token 探测触发频控，标记主通道降级并跳过登录恢复")
+                ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
             }
-            try {
-                performRecovery()
-            } finally {
-                finishRecovery()
+            WxApiClient.TokenStatus.UNAVAILABLE ->
+                logger.warn("【登录检查】token 探测暂不可用，跳过登录恢复")
+            WxApiClient.TokenStatus.EXPIRED -> {
+                logger.warn("【登录检查】微信登录失效，开始恢复流程...")
+                if (!tryBeginRecovery()) {
+                    logger.info("【登录检查】已有恢复流程在进行中，跳过重复触发")
+                    return
+                }
+                try {
+                    performRecovery()
+                } finally {
+                    finishRecovery()
+                }
             }
         }
     }
@@ -155,7 +167,7 @@ class LoginChecker(
                 if (success) {
                     // 登录成功后强制刷新缓存
                     lastCheckTime = 0L
-                    lastCheckResult = wxClient.checkTokenValid()
+                    lastCheckStatus = wxClient.checkTokenStatus()
                     logger.info("【登录检查】扫码登录成功，登录状态已恢复")
                     WebhookNotifier.notify("login_success", mapOf(
                         "message" to "微信扫码登录已恢复"

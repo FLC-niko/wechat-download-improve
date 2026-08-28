@@ -9,9 +9,6 @@ import com.wamp.download.config.AppConfig
 import com.wamp.download.feed.feedRoutes
 import com.wamp.download.notify.LoginReminder
 import com.wamp.download.poller.RssPoller
-import com.wamp.download.rabbitmq.EXCHANGE_NEW_MEDIA
-import com.wamp.download.rabbitmq.GZH_RESULT_QUEUE
-import com.wamp.download.rabbitmq.GZH_TASK_QUEUE
 import com.wamp.download.rabbitmq.RabbitMqService
 import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.store.Database
@@ -101,14 +98,8 @@ fun main() {
             }
         }
         install(CORS) {
-            val allowedOrigin = AppConfig.corsAllowedOrigin
-            if (allowedOrigin.isNotBlank()) {
-                allowHost(
-                    allowedOrigin.removePrefix("https://").removePrefix("http://"),
-                    schemes = listOf("http", "https"),
-                )
-            }
-            allowCredentials = allowedOrigin.isNotBlank()
+            anyHost()
+            allowCredentials = true
             allowMethod(io.ktor.http.HttpMethod.Get)
             allowMethod(io.ktor.http.HttpMethod.Post)
             allowMethod(io.ktor.http.HttpMethod.Put)
@@ -176,9 +167,9 @@ fun main() {
             // 二维码图片静态服务（供飞书通知引用，如 /qrcode/wx_qrcode.png）
             get("/qrcode/{file}") {
                 val file = call.parameters["file"] ?: return@get call.respondText("not found", status = io.ktor.http.HttpStatusCode.NotFound)
-                val root = java.io.File("qrcode").canonicalFile
-                val img = java.io.File(root, file).canonicalFile
-                if (img.parentFile != root || !img.isFile) {
+                val safe = file.removePrefix("/")
+                val img = java.io.File("qrcode", safe)
+                if (!img.exists()) {
                     call.respondText("not found", status = io.ktor.http.HttpStatusCode.NotFound)
                 } else {
                     call.respondBytes(img.readBytes(), contentType = io.ktor.http.ContentType.Image.PNG)
@@ -192,9 +183,10 @@ fun main() {
                     "rabbitmq" to mapOf(
                         "host" to AppConfig.rabbitmqHost,
                         "port" to AppConfig.rabbitmqPort,
-                        "exchange" to EXCHANGE_NEW_MEDIA,
-                        "task_queue" to GZH_TASK_QUEUE,
-                        "result_queue" to GZH_RESULT_QUEUE,
+                        "exchange" to "new-media-backend",
+                        "task_queue" to "gzh-auto-BTA-queue",
+                        "result_queue" to "gzh-auto-ATD-queue",
+                        "dead_letter_queue" to "dead-message-queue",
                         "vhosts" to states.mapValues { it.value.name }
                     )
                 ))
@@ -228,9 +220,12 @@ fun main() {
             }
             post("/api/weread/login") {
                 scope.launch {
-                    com.wamp.download.weread.WeReadWebAuth.startLogin()
+                    val success = com.wamp.download.weread.WeReadWebAuth.startLogin()
+                    if (!success) {
+                        logger.warn("微信读书登录流程未成功完成")
+                    }
                 }
-                call.respond(mapOf("started" to true, "message" to "二维码已生成并推送，请扫码"))
+                call.respond(mapOf("started" to true, "message" to "登录任务已启动，二维码生成后将推送到通知机器人"))
             }
             // 用 fakeid 为公众号绑定微信读书 mpId（回退通道预绑定，wxs2mp 解析接口已下线，直接推导）
             post("/api/weread/bind") {
@@ -287,15 +282,8 @@ fun main() {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
                 val exists = com.wamp.download.weread.WeReadAccountPool.get(vid) != null
-                if (exists) {
-                    if (AppConfig.adbEnabled) {
-                        recoveryManager.request(vid)
-                    } else {
-                        // 无设备模式下，直接推送二维码供人工扫码恢复
-                        scope.launch { com.wamp.download.weread.WeReadWebAuth.startLogin(vid) }
-                    }
-                }
-                call.respond(mapOf("ok" to exists, "vid" to vid, "message" to if (exists) "恢复任务已触发" else "账号不存在"))
+                if (exists) recoveryManager.request(vid)
+                call.respond(mapOf("ok" to exists, "vid" to vid, "message" to if (exists) "恢复任务已排队" else "账号不存在"))
             }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()

@@ -42,20 +42,78 @@ class WxApiClient {
         val publishTime: Long,  // 秒级时间戳
     )
 
-    /**
-     * 检查 token 是否有效（轻量探测：搜索"微信"取 1 条）
-     *
-     * @return true=有效, false=失效
-     */
-    fun checkTokenValid(): Boolean {
-        if (!AuthManager.isLoggedIn()) return false
-        return try {
-            searchAccounts("微信", 1).isNotEmpty()
-        } catch (e: Exception) {
-            logger.warn("token 有效性探测失败: ${e.message}")
-            false
+    enum class TokenStatus {
+        VALID,
+        EXPIRED,
+        RATE_LIMITED,
+        UNAVAILABLE,
+    }
+
+    class WxApiException(
+        val operation: String,
+        val retCode: String,
+        val errMsg: String,
+    ) : RuntimeException("$operation API 错误: ret=$retCode, err_msg=$errMsg") {
+        val isRateLimited: Boolean
+            get() = classifyTokenFailure(retCode, errMsg) == TokenStatus.RATE_LIMITED
+
+        val isAuthExpired: Boolean
+            get() = classifyTokenFailure(retCode, errMsg) == TokenStatus.EXPIRED
+    }
+
+    companion object {
+        fun classifyTokenFailure(retCode: String?, errMsg: String): TokenStatus {
+            val normalizedMessage = errMsg.lowercase()
+            return when {
+                retCode == "200013" ||
+                    normalizedMessage.contains("freq") ||
+                    normalizedMessage.contains("频控") ||
+                    normalizedMessage.contains("频繁") -> TokenStatus.RATE_LIMITED
+                retCode == "200003" ||
+                    retCode == "200040" ||
+                    normalizedMessage.contains("invalid session") ||
+                    normalizedMessage.contains("csrf") ||
+                    normalizedMessage.contains("login") ||
+                    normalizedMessage.contains("登录超时") ||
+                    normalizedMessage.contains("登录失效") ||
+                    normalizedMessage.contains("登录过期") ||
+                    normalizedMessage.contains("请重新登录") -> TokenStatus.EXPIRED
+                else -> TokenStatus.UNAVAILABLE
+            }
+        }
+
+        private fun normalizeRetCode(ret: Any?): String? = when (ret) {
+            null -> null
+            is Number -> ret.toLong().toString()
+            else -> ret.toString().trim().removeSuffix(".0")
         }
     }
+
+    /**
+     * 检查 token 状态（轻量探测：搜索"微信"取 1 条）。
+     *
+     * 成功响应即表示凭证可用，空搜索结果不应被误判为登录失效。
+     */
+    fun checkTokenStatus(): TokenStatus {
+        if (!AuthManager.isLoggedIn() || AuthManager.isExpired()) return TokenStatus.EXPIRED
+        return try {
+            searchAccounts("微信", 1)
+            TokenStatus.VALID
+        } catch (e: WxApiException) {
+            val status = if (e.isRateLimited || e.isAuthExpired) {
+                classifyTokenFailure(e.retCode, e.errMsg)
+            } else {
+                TokenStatus.UNAVAILABLE
+            }
+            logger.warn("token 有效性探测失败: status=$status, ret=${e.retCode}, err_msg=${e.errMsg}")
+            status
+        } catch (e: Exception) {
+            logger.warn("token 有效性探测失败: ${e.message}")
+            TokenStatus.UNAVAILABLE
+        }
+    }
+
+    fun checkTokenValid(): Boolean = checkTokenStatus() == TokenStatus.VALID
 
     /**
      * 搜索公众号
@@ -95,13 +153,7 @@ class WxApiClient {
             val body = resp.body?.string().orEmpty()
             val result = gson.fromJson(body, Map::class.java) ?: return emptyList()
 
-            // 检查 base_resp 里的 ret
-            val baseResp = result["base_resp"] as? Map<*, *>
-            val ret = baseResp?.get("ret")
-            if (ret != 0.0 && ret != 0 && ret != "0") {
-                val errMsg = baseResp?.get("err_msg") ?: "未知错误"
-                throw RuntimeException("微信搜索 API 错误: ret=$ret, err_msg=$errMsg")
-            }
+            ensureApiSuccess(result, "微信搜索")
 
             val list = result["list"] as? List<*> ?: return emptyList()
             return list.mapNotNull { item ->
@@ -180,13 +232,7 @@ class WxApiClient {
             val body = resp.body?.string().orEmpty()
             val result = gson.fromJson(body, Map::class.java) ?: return emptyList()
 
-            // 检查 base_resp
-            val baseResp = result["base_resp"] as? Map<*, *>
-            val ret = baseResp?.get("ret")
-            if (ret != 0.0 && ret != 0 && ret != "0") {
-                val errMsg = baseResp?.get("err_msg") ?: "未知错误"
-                throw RuntimeException("微信文章 API 错误: fakeid=${fakeid.take(8)}..., ret=$ret, err_msg=$errMsg")
-            }
+            ensureApiSuccess(result, "微信文章(fakeid=${fakeid.take(8)}...)")
 
             // 解析 publish_page → publish_list → publish_info → appmsgex
             var publishPage = result["publish_page"]
@@ -220,5 +266,13 @@ class WxApiClient {
                 }
             }.flatten()
         }
+    }
+
+    private fun ensureApiSuccess(result: Map<*, *>, operation: String) {
+        val baseResp = result["base_resp"] as? Map<*, *> ?: return
+        val retCode = normalizeRetCode(baseResp["ret"]) ?: return
+        if (retCode == "0") return
+        val errMsg = baseResp["err_msg"]?.toString() ?: "未知错误"
+        throw WxApiException(operation, retCode, errMsg)
     }
 }

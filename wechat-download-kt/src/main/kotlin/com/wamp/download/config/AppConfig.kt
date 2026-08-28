@@ -29,7 +29,7 @@ object AppConfig {
 
     // --- RabbitMQ 配置（与 Worker 一致） ---
     val rabbitmqHost: String get() = getString("rabbitmq.host", "localhost")
-    val rabbitmqPort: Int get() = getInt("rabbitmq.port", 5672).coerceIn(1, 65535)
+    val rabbitmqPort: Int get() = getInt("rabbitmq.port", 5672)
     val rabbitmqUsername: String get() = getString("rabbitmq.username", "guest")
     val rabbitmqPassword: String get() = getString("rabbitmq.password", "guest")
     val rabbitmqProVirtualHost: String get() = getString("rabbitmq.pro_virtual_host", "pro")
@@ -44,8 +44,7 @@ object AppConfig {
 
     // --- RabbitMQ 任务策略 ---
     val maxTaskRetry: Int get() = getInt("rabbitmq.max_task_retry", 5)
-        .coerceAtLeast(0)
-    val taskRetryDelayMs: Long get() = getLong("rabbitmq.task_retry_delay_ms", 60_000L).coerceAtLeast(0L)
+    val taskRetryDelayMs: Long get() = getLong("rabbitmq.task_retry_delay_ms", 60_000L)
 
     // 通知配置
     val wecomWebhookUrl: String get() = getString("notification.wecom_webhook_url", "")
@@ -61,25 +60,25 @@ object AppConfig {
 
     // 多账号池：账号凭证存储目录 + 频控冷却时长
     val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")
-    val wereadFreqControlCooldown: Long get() = getLong("weread.freq_control_cooldown", 300L).coerceAtLeast(1L)
+    val wereadFreqControlCooldown: Long get() = getLong("weread.freq_control_cooldown", 300L)
 
     // wr_skey 双层刷新保活（wr_skey 有效期 5400s，刷新间隔必须 < 5400s）
-    val wereadRefreshInterval: Long get() = getLong("weread.refresh_interval", 3000L).coerceIn(60L, 5_000L)   // 50 分钟，不能超过凭证有效期
-    val wereadRefreshFailThreshold: Int get() = getInt("weread.refresh_fail_threshold", 3).coerceAtLeast(1)
+    val wereadRefreshInterval: Long get() = getLong("weread.refresh_interval", 3000L)   // 50 分钟
+    val wereadRefreshFailThreshold: Int get() = getInt("weread.refresh_fail_threshold", 3)
 
     // 翻页控制
-    val wereadContentInterval: Long get() = getLong("weread.content_interval", 5L).coerceAtLeast(0L)      // 翻页基础间隔（秒）
-    val wereadContentJitter: Long get() = getLong("weread.content_jitter", 5L).coerceAtLeast(0L)          // 随机抖动（秒）
-    val wereadMaxPages: Int get() = getInt("weread.max_pages", 50).coerceAtLeast(1)
-    val wereadPageSize: Int get() = getInt("weread.page_size", 10).coerceAtLeast(1)
+    val wereadContentInterval: Long get() = getLong("weread.content_interval", 5L)      // 翻页基础间隔（秒）
+    val wereadContentJitter: Long get() = getLong("weread.content_jitter", 5L)          // 随机抖动（秒）
+    val wereadMaxPages: Int get() = getInt("weread.max_pages", 50)
+    val wereadPageSize: Int get() = getInt("weread.page_size", 10)
 
     // 请求节流（防多任务并发叠加触发风控）
-    val wereadMaxConcurrentPerAccount: Int get() = getInt("weread.max_concurrent_per_account", 1).coerceAtLeast(1)  // 单账号同时在途请求数
-    val wereadMinRequestInterval: Long get() = getLong("weread.min_request_interval", 2L).coerceAtLeast(0L)          // 同一账号两次请求最小间隔（秒）
+    val wereadMaxConcurrentPerAccount: Int get() = getInt("weread.max_concurrent_per_account", 1)  // 单账号同时在途请求数
+    val wereadMinRequestInterval: Long get() = getLong("weread.min_request_interval", 2L)          // 同一账号两次请求最小间隔（秒）
 
     // 空页重试
-    val wereadEmptyRetryMax: Int get() = getInt("weread.empty_retry_max", 3).coerceAtLeast(0)
-    val wereadEmptyRetryBackoff: Long get() = getLong("weread.empty_retry_backoff", 15L).coerceAtLeast(0L)
+    val wereadEmptyRetryMax: Int get() = getInt("weread.empty_retry_max", 3)
+    val wereadEmptyRetryBackoff: Long get() = getLong("weread.empty_retry_backoff", 15L)
 
     // ADB 自动恢复设备探查
     val adbPollIntervalMs: Long
@@ -97,7 +96,6 @@ object AppConfig {
 
     // 站点 URL（用于图片代理）
     val siteUrl: String get() = getString("server.site_url", "http://localhost:5000")
-    val corsAllowedOrigin: String get() = getString("server.cors_allowed_origin", "")
 
     fun load() {
         val configFile = File("config.yaml")

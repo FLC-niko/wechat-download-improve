@@ -24,6 +24,14 @@ import java.util.concurrent.TimeUnit
  * 飞书：支持 interactive 卡片消息（markdown 内容 + 二维码图片链接）
  */
 object WebhookNotifier {
+    data class QrPushResult(
+        val wecomSuccess: Boolean,
+        val feishuSuccess: Boolean,
+    ) {
+        val anySuccess: Boolean
+            get() = wecomSuccess || feishuSuccess
+    }
+
     private val logger = LoggerFactory.getLogger(WebhookNotifier::class.java)
     private val gson = Gson()
     private val client = OkHttpClient.Builder()
@@ -100,31 +108,37 @@ object WebhookNotifier {
      * @param imageBytes 二维码图片字节数组
      * @param message 附加文字说明
      */
-    suspend fun pushQrcode(imageBytes: ByteArray, message: String = "") {
+    suspend fun pushQrcode(imageBytes: ByteArray, message: String = ""): QrPushResult {
         val wecomUrl = AppConfig.wecomWebhookUrl
         val feishuUrl = AppConfig.feishuWebhookUrl
 
         if (wecomUrl.isEmpty() && feishuUrl.isEmpty()) {
             logger.warn("未配置通知机器人 Webhook，二维码仅保存到本地")
-            return
+            return QrPushResult(wecomSuccess = false, feishuSuccess = false)
         }
 
         // 企业微信：直接推图片
-        if (wecomUrl.isNotEmpty()) {
+        val wecomSuccess = if (wecomUrl.isNotEmpty()) {
             try {
-                sendWecomImage(wecomUrl, imageBytes)
-                logger.info("二维码已推送到企业微信")
+                val success = sendWecomImage(wecomUrl, imageBytes)
+                if (success) {
+                    logger.info("二维码已推送到企业微信")
+                } else {
+                    logger.error("企业微信推送二维码失败：Webhook 返回失败")
+                }
+                success
             } catch (e: Exception) {
                 logger.error("企业微信推送二维码失败: ${e.message}")
+                false
             }
-        }
+        } else false
 
         // 飞书：推卡片消息（含二维码访问链接）
-        if (feishuUrl.isNotEmpty()) {
+        val feishuSuccess = if (feishuUrl.isNotEmpty()) {
             try {
-                val qrUrl = "${AppConfig.siteUrl}/qrcode/wx_qrcode.png"
+                val qrUrl = "${AppConfig.siteUrl}/qrcode/wx_qrcode.png?v=${System.currentTimeMillis()}"
                 val cardText = buildString {
-                    appendLine("**请扫码登录公众号后台**")
+                    appendLine("**请扫码登录微信读书**")
                     if (message.isNotEmpty()) appendLine(message)
                     appendLine()
                     appendLine("[点击查看二维码]($qrUrl)")
@@ -132,15 +146,26 @@ object WebhookNotifier {
                     appendLine("> 如果无法点击，请复制以下链接到浏览器：")
                     appendLine("> $qrUrl")
                 }
-                sendFeishuCard(feishuUrl, "登录二维码", cardText)
-                logger.info("二维码已推送到飞书")
+                val success = sendFeishuCard(feishuUrl, "微信读书登录二维码", cardText)
+                if (success) {
+                    logger.info("二维码已推送到飞书")
+                } else {
+                    logger.error("飞书推送二维码失败：Webhook 返回失败")
+                }
+                success
             } catch (e: Exception) {
                 logger.error("飞书推送二维码失败: ${e.message}")
+                false
             }
-        }
+        } else false
 
-        // 标记通知时间
-        lastNotification["qr_code_pushed"] = System.currentTimeMillis() / 1000
+        val result = QrPushResult(wecomSuccess, feishuSuccess)
+        if (result.anySuccess) {
+            lastNotification["qr_code_pushed"] = System.currentTimeMillis() / 1000
+        } else {
+            logger.error("二维码未成功推送到任何通知机器人")
+        }
+        return result
     }
 
     // ── 企业微信 ──────────────────────────────────

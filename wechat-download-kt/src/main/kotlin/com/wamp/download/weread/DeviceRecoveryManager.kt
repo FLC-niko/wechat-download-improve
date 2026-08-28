@@ -115,15 +115,7 @@ class DeviceRecoveryManager(
         }.getOrNull()
     }
 
-    private val lastNotifyTime = ConcurrentHashMap<String, Long>()
-
     private suspend fun notifyManual(account: WeReadAccount) {
-        val now = System.currentTimeMillis()
-        val last = lastNotifyTime.getOrDefault(account.vid, 0L)
-        // 限流：每小时最多提醒一次，避免在等待设备接入期间刷屏
-        if (now - last < 3600_000L) return
-        lastNotifyTime[account.vid] = now
-
         WebhookNotifier.notify("weread_login_qr", mapOf(
             "message" to "微信读书账号等待设备恢复或人工扫码",
             "vid" to account.vid,

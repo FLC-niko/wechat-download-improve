@@ -92,15 +92,25 @@ class TaskProcessor(
         // 1. 等待登录恢复（如果正在恢复）
         loginChecker.waitForRecoveryComplete()
 
-        // 2. 检查 token 有效性
-        if (!loginChecker.isTokenValid()) {
-            logger.warn("【任务处理】token 无效，触发登录恢复: gzh=${task.gzhName}")
-            loginChecker.startRecoveryAndWait()
-            // 恢复后再次检查
-            if (!loginChecker.isTokenValid(forceRefresh = true)) {
-                logger.error("【任务处理】登录恢复失败，发布失败结果: gzh=${task.gzhName}")
-                publishFailed(task, "AUTH_RECOVERY_FAILED", "登录恢复失败")
-                return
+        // 2. 检查 token 状态；频控不是登录失效，不能触发公众号扫码
+        when (val tokenStatus = loginChecker.checkTokenStatus()) {
+            WxApiClient.TokenStatus.VALID -> Unit
+            WxApiClient.TokenStatus.RATE_LIMITED -> {
+                logger.warn("【任务处理】token 探测触发频控，降级到 L2: gzh=${task.gzhName}")
+                ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+            }
+            WxApiClient.TokenStatus.UNAVAILABLE -> {
+                logger.warn("【任务处理】token 探测暂不可用，跳过扫码并继续尝试回退: gzh=${task.gzhName}")
+            }
+            WxApiClient.TokenStatus.EXPIRED -> {
+                logger.warn("【任务处理】token 已失效，触发登录恢复: gzh=${task.gzhName}")
+                loginChecker.startRecoveryAndWait()
+                // 恢复后再次检查；频控/暂不可用都不应再次触发扫码
+                if (loginChecker.checkTokenStatus(forceRefresh = true) == WxApiClient.TokenStatus.EXPIRED) {
+                    logger.error("【任务处理】登录恢复失败，发布失败结果: gzh=${task.gzhName}")
+                    publishFailed(task, "AUTH_RECOVERY_FAILED", "登录恢复失败")
+                    return
+                }
             }
         }
 
@@ -109,8 +119,12 @@ class TaskProcessor(
             findOrCreateSubscription(task.gzhName)
         } catch (e: Exception) {
             logger.error("【任务处理】搜索公众号失败: gzh=${task.gzhName}, error=${e.message}")
-            // 如果是登录失效导致的搜索失败，触发恢复
-            if (e.message?.contains("ret=") == true || e.message?.contains("未登录") == true) {
+            // 只有明确的登录失效才触发恢复；频控继续保持 L2 降级语义
+            if (e is WxApiClient.WxApiException && e.isRateLimited) {
+                ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+            } else if ((e is WxApiClient.WxApiException && e.isAuthExpired) ||
+                e.message?.contains("未登录") == true
+            ) {
                 loginChecker.startRecoveryAndWait()
             }
             publishFailed(task, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败")
@@ -216,7 +230,9 @@ class TaskProcessor(
                 logger.warn("【L1 主通道】返回空列表 (第 $round/${AppConfig.mainRetryMax} 次)")
             } catch (e: Exception) {
                 val msg = e.message ?: ""
-                if (msg.contains("200013") || msg.contains("freq") || msg.contains("频控")) {
+                if ((e is WxApiClient.WxApiException && e.isRateLimited) ||
+                    msg.contains("200013") || msg.contains("freq") || msg.contains("频控")
+                ) {
                     // 频控：标记降级，直接走回退（不继续重试，避免加剧风控）
                     logger.warn("【L1 主通道】触发频控(ret=200013)，标记降级 ${AppConfig.mainDegradedDuration}s")
                     ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
