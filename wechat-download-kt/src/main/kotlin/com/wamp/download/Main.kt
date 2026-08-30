@@ -14,6 +14,7 @@ import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.store.Database
 import com.wamp.download.task.TaskProcessor
 import com.wamp.download.wx.WxApiClient
+import com.wamp.download.weread.CredentialHealthChecker
 import com.wamp.download.weread.eink.WeReadEinkRuntime
 import com.wamp.download.weread.eink.WeReadEinkLoginCoordinator
 import io.ktor.serialization.gson.gson
@@ -120,6 +121,16 @@ fun main() {
         scope.launch { LoginReminder.start() }
         if (AppConfig.authAutoRecoveryEnabled) {
             scope.launch { loginChecker.start() }
+        }
+        // 启动凭证健康检查：重启后立即发现失效凭证（E-Ink 续签验证 / Web 账号探测），
+        // 避免失效凭证躺到第一个任务失败才发现。
+        scope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(10_000)
+            try {
+                CredentialHealthChecker.checkAll(scope)
+            } catch (e: Exception) {
+                logger.warn("启动凭证健康检查异常: ${e.message}")
+            }
         }
         // E-Ink 只按服务端明确过期时间提前续签；未提供日期时由 401/-2012 触发真实 /login 续签。
         scope.launch {
