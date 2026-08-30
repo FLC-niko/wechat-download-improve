@@ -2,9 +2,13 @@ package com.wamp.download.weread.eink
 
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class WeReadEinkSessionTest {
     @Test
@@ -60,6 +64,74 @@ class WeReadEinkSessionTest {
             assertEquals(credentials, store.load())
         } finally {
             File(credentialFile.absolutePath).delete()
+        }
+    }
+
+    @Test
+    fun `concurrent auth rejections share one refresh and rotated credentials`() {
+        var refreshRequests = 0
+        val session = WeReadEinkSession(
+            initialCredentials = credentials(),
+            transport = WeReadEinkTransport {
+                synchronized(this) { refreshRequests++ }
+                WeReadEinkResponse(
+                    200,
+                    "{\"accessToken\":\"access-2\",\"refreshToken\":\"refresh-2\"}",
+                )
+            },
+            baseUrl = "https://eink.example.test",
+        )
+        val executor = Executors.newFixedThreadPool(4)
+
+        try {
+            val results = (1..4).map {
+                executor.submit<WeReadEinkCredentials> {
+                    session.refreshIfAccessTokenWas("access-1")
+                }
+            }.map { it.get(5, TimeUnit.SECONDS) }
+
+            assertEquals(1, refreshRequests)
+            assertTrue(results.all { it.accessToken == "access-2" })
+            assertTrue(results.all { it.refreshToken == "refresh-2" })
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `rotated credentials stay active and are retried after persistence failure`() {
+        val root = Files.createTempDirectory("weread-eink-persistence-").toFile()
+        val blockedParent = File(root, "blocked").also { it.writeText("not a directory") }
+        val credentialFile = File(blockedParent, "credentials.json")
+        val store = WeReadEinkCredentialStore(credentialFile)
+        val session = WeReadEinkSession(
+            initialCredentials = credentials(),
+            transport = WeReadEinkTransport {
+                WeReadEinkResponse(
+                    200,
+                    "{\"accessToken\":\"access-2\",\"refreshToken\":\"refresh-2\"}",
+                )
+            },
+            credentialStore = store,
+            baseUrl = "https://eink.example.test",
+            clock = { 1_000L },
+        )
+
+        try {
+            val refreshed = session.refresh()
+
+            assertEquals("access-2", refreshed.accessToken)
+            assertEquals("refresh-2", session.credentials().refreshToken)
+            assertTrue(session.hasPendingPersistence())
+            assertTrue(session.lastPersistenceError().orEmpty().isNotBlank())
+
+            assertTrue(blockedParent.delete())
+            assertTrue(blockedParent.mkdir())
+            assertTrue(session.retryPendingPersistence(force = true))
+            assertFalse(session.hasPendingPersistence())
+            assertEquals("refresh-2", store.load()?.refreshToken)
+        } finally {
+            root.deleteRecursively()
         }
     }
 

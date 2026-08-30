@@ -1,6 +1,7 @@
 package com.wamp.download.weread.eink
 
 import com.wamp.download.config.AppConfig
+import com.wamp.download.notify.WebhookNotifier
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.time.Instant
@@ -81,11 +82,20 @@ object WeReadEinkRuntime {
     }
 
     /** Proactively refreshes only when WeRead supplied an actual expiry timestamp. */
-    fun refreshIfExpiryDue(
+    suspend fun refreshIfExpiryDue(
         now: Long = System.currentTimeMillis(),
         skewMs: Long = AppConfig.wereadEinkRefreshSkew * 1000L,
     ): Boolean {
         val session = activeSession ?: return false
+        if (!session.retryPendingPersistence()) {
+            WebhookNotifier.notify(
+                "weread_eink_persistence_failed",
+                mapOf(
+                    "message" to "微信读书 E-Ink 新凭证已在内存生效，但尚未写入磁盘；请检查磁盘空间和目录权限，期间不要重启服务",
+                    "error" to session.lastPersistenceError(),
+                ),
+            )
+        }
         val credentials = session.credentials()
         if (!credentials.accessTokenNeedsRefresh(now, skewMs)) return false
         return try {
@@ -113,6 +123,8 @@ object WeReadEinkRuntime {
             "access_token_expires_at_iso" to credentials?.accessTokenExpiresAt?.let(Instant::ofEpochMilli)?.toString(),
             "seconds_until_expiry" to credentials?.secondsUntilExpiry(now),
             "expiry_source" to if (credentials?.accessTokenExpiresAt == null) "server-rejection" else "server-response",
+            "credentials_persistence_pending" to (activeSession?.hasPendingPersistence() == true),
+            "credentials_persistence_error" to activeSession?.lastPersistenceError(),
         )
     }
 

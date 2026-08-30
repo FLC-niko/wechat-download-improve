@@ -38,7 +38,7 @@
 
 ### 当前上线模式：不依赖 ADB
 
-默认配置不会执行 `adb devices`，也不会启动设备监督和自动扫码恢复。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此默认关闭；已有本地订阅直接使用微信读书 Web 与本地缓存。
+默认配置不会执行 `adb devices`，也不会启动设备监督和自动扫码恢复。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此默认关闭；已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。
 
 ```yaml
 auth:
@@ -46,6 +46,9 @@ auth:
 
 weread:
   auto_relogin_enabled: false
+  eink:
+    enabled: true
+    auto_relogin_enabled: false
 
 adb:
   enabled: false
@@ -118,7 +121,7 @@ adapter:
 
 ```text
 BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众号身份
-  → E-Ink（默认关闭）→ appmsgpublish（默认关闭）→ WeRead Web → SQLite 合并
+  → E-Ink（默认开启，需先扫码取得凭证）→ appmsgpublish（默认关闭）→ WeRead Web → SQLite 合并
   → 覆盖度决策 → 发布一条 ATD → Inbox COMPLETED → ACK
 ```
 
@@ -135,7 +138,7 @@ BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众
 
 ## 开源项目调研后的取舍
 
-- 借鉴 `weread-omni`：E-Ink `/mp/chapters`、synckey 增量、`-2014/-2041` 明确错误语义和 refresh token 会话模型。E-Ink 当前保留为实验通道，默认关闭，不作为上线前置条件。
+- 借鉴 `weread-omni`：E-Ink `/mp/chapters`、synckey 增量、`-2014/-2041` 明确错误语义和 refresh token 会话模型。当前将 E-Ink 作为首选采集通道；未配置凭证时自动跳过，不阻塞 Web 与缓存兜底。
 - 借鉴 `weread-mp`：Web `/web/mp/articles` 使用最老文章 `createTime` 作为下一页游标，短页表示到底。
 - 结合 `we-mp-rss` 的频控反馈：按账号冷却、全局串行与最小请求间隔，避免多个入口各自限流造成叠加请求。
 

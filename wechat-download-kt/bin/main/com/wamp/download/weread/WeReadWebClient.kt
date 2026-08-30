@@ -106,6 +106,39 @@ class WeReadWebClient {
     /** 兼容入口：主账号是否已登录 */
     fun isLoggedIn(): Boolean = WeReadCookieStore.isLoggedIn()
 
+    /**
+     * 启动健康检查用：轻量探测账号凭证是否存活（GET /web/shelf/sync）。
+     * 只判死不判活异常：AUTH_EXPIRED 之外的结果（频控/网络异常）均不触发账号下线。
+     */
+    internal fun probeAccount(account: WeReadAccount): WeReadWebResponseKind {
+        val creds = account.credentials
+        if (!account.hasWebCredentials()) return WeReadWebResponseKind.AUTH_EXPIRED
+        val url = "$baseUrl/web/shelf/sync".toHttpUrl().newBuilder()
+            .addQueryParameter("userVid", creds.wrVid)
+            .addQueryParameter("synckey", "0")
+            .build()
+        val req = authRequest(Request.Builder().url(url), creds).get().build()
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                classifyProbeResponse(resp.code, raw)
+            }
+        } catch (e: Exception) {
+            logger.warn("微信读书账号探测异常（不判死）: vid=${creds.wrVid}, ${e.message}")
+            WeReadWebResponseKind.RETRYABLE_HTTP_ERROR
+        }
+    }
+
+    /** 探测响应判定：只有 401/-2012 判死；异常 2xx 正文按临时上游错误处理。 */
+    internal fun classifyProbeResponse(httpCode: Int, raw: String): WeReadWebResponseKind {
+        val kind = WeReadWebResponseClassifier.classify(httpCode, raw).kind
+        if (kind != WeReadWebResponseKind.SUCCESS) return kind
+        val validObject = runCatching {
+            JsonParser.parseString(raw).isJsonObject
+        }.getOrDefault(false)
+        return if (validObject) kind else WeReadWebResponseKind.RETRYABLE_HTTP_ERROR
+    }
+
     private fun authRequest(builder: Request.Builder, creds: WeReadWebCredentials): Request.Builder {
         return builder
             .header("x-vid", creds.wrVid)

@@ -75,6 +75,8 @@ object AppConfig {
         get() = getLong("weread.eink.refresh_check_interval", 60L).coerceAtLeast(10L)
     val wereadEinkRefreshSkew: Long
         get() = getLong("weread.eink.refresh_skew", 300L).coerceAtLeast(0L)
+    val wereadEinkAutoReloginEnabled: Boolean
+        get() = getBool("weread.eink.auto_relogin_enabled", wereadAutoReloginEnabled)
 
     // 多账号池：账号凭证存储目录 + 频控冷却时长
     val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")

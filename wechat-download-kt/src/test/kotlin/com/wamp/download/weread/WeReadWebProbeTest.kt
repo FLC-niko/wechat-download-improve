@@ -15,10 +15,22 @@ class WeReadWebProbeTest {
     }
 
     @Test
-    fun `probe response 200 with HTML login page is auth expired`() {
+    fun `probe response 200 with HTML is treated as transient instead of expiring account`() {
         assertEquals(
-            WeReadWebResponseKind.AUTH_EXPIRED,
+            WeReadWebResponseKind.RETRYABLE_HTTP_ERROR,
             client.classifyProbeResponse(200, "<html><body>login</body></html>"),
+        )
+    }
+
+    @Test
+    fun `probe response 200 with empty or array body is transient`() {
+        assertEquals(
+            WeReadWebResponseKind.RETRYABLE_HTTP_ERROR,
+            client.classifyProbeResponse(200, ""),
+        )
+        assertEquals(
+            WeReadWebResponseKind.RETRYABLE_HTTP_ERROR,
+            client.classifyProbeResponse(200, "[]"),
         )
     }
 

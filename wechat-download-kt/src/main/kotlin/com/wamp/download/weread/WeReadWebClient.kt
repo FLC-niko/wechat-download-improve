@@ -129,13 +129,14 @@ class WeReadWebClient {
         }
     }
 
-    /** 探测响应判定：分类器之外兜底处理 200 + HTML 登录页（重定向场景）。 */
+    /** 探测响应判定：只有 401/-2012 判死；异常 2xx 正文按临时上游错误处理。 */
     internal fun classifyProbeResponse(httpCode: Int, raw: String): WeReadWebResponseKind {
         val kind = WeReadWebResponseClassifier.classify(httpCode, raw).kind
-        if (kind == WeReadWebResponseKind.SUCCESS && !raw.trimStart().startsWith("{")) {
-            return WeReadWebResponseKind.AUTH_EXPIRED
-        }
-        return kind
+        if (kind != WeReadWebResponseKind.SUCCESS) return kind
+        val validObject = runCatching {
+            JsonParser.parseString(raw).isJsonObject
+        }.getOrDefault(false)
+        return if (validObject) kind else WeReadWebResponseKind.RETRYABLE_HTTP_ERROR
     }
 
     private fun authRequest(builder: Request.Builder, creds: WeReadWebCredentials): Request.Builder {

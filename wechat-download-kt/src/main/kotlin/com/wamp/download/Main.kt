@@ -122,7 +122,7 @@ fun main() {
         if (AppConfig.authAutoRecoveryEnabled) {
             scope.launch { loginChecker.start() }
         }
-        // 启动凭证健康检查：重启后立即发现失效凭证（E-Ink 续签验证 / Web 账号探测），
+        // 启动凭证健康检查：按明确到期时间续签 E-Ink，并探测 Web 账号，
         // 避免失效凭证躺到第一个任务失败才发现。
         scope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(10_000)

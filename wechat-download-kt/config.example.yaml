@@ -55,6 +55,7 @@ weread:
     max_pages: 1000
     refresh_check_interval: 60  # 只检查服务端明确返回的过期时间
     refresh_skew: 300           # 已知到期时间前 5 分钟续签；未知时按 401/-2012 续签
+    auto_relogin_enabled: false # E-Ink refreshToken 失效后是否自动推送新二维码
 
 adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启

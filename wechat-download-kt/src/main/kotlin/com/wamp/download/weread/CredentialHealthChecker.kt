@@ -12,9 +12,9 @@ import org.slf4j.LoggerFactory
 /**
  * 启动时凭证健康检查
  *
- * 部署重启后立即验证各渠道凭证死活，避免失效凭证一直躺到第一个任务失败才发现：
- * - E-Ink：用 refreshToken 主动续签一次（同时验证凭证链路 + 更新 accessToken）；
- *   refreshToken 也失效时告警，auto_relogin 开启时自动推送扫码。
+ * 部署重启后检查各渠道凭证状态：
+ * - E-Ink：只在缺少 accessToken 或服务端明确过期时间已到时续签；未知过期时间继续由
+ *   401/-2012 驱动，避免每次重启都无条件轮换 refreshToken。
  * - Web 渠道：对 ACTIVE 账号做一次书架轻量探测，失效账号标记 EXPIRED 并汇总告警。
  * - 主微信：由 LoginChecker 启动首查覆盖（auth_auto_recovery_enabled 开启时），此处不重复。
  *
@@ -30,8 +30,7 @@ object CredentialHealthChecker {
     }
 
     /**
-     * E-Ink：启动即用 refreshToken 换新 accessToken。
-     * 成功 = 凭证链路健康且 token 已更新；AUTH_EXPIRED = refreshToken 失效需重扫。
+     * E-Ink：仅按服务端明确过期日期或缺失 accessToken 触发续签。
      */
     private suspend fun checkEink(scope: CoroutineScope?) {
         if (!AppConfig.wereadEinkEnabled) return
@@ -40,9 +39,18 @@ object CredentialHealthChecker {
             logger.info("启动检测: E-Ink 凭证未配置，可调用 /api/weread/eink/login/start 扫码激活")
             return
         }
+        val credentials = session.credentials()
+        val now = System.currentTimeMillis()
+        val skewMs = AppConfig.wereadEinkRefreshSkew * 1000L
+        if (!credentials.accessTokenNeedsRefresh(now, skewMs)) {
+            val expiry = credentials.accessTokenExpiresAt?.toString() ?: "unknown/server-rejection"
+            logger.info("启动检测: E-Ink 凭证已加载，不做无条件轮换: expiry=$expiry")
+            return
+        }
+
         try {
             session.refresh()
-            logger.info("启动检测: E-Ink 凭证有效，accessToken 已续签")
+            logger.info("启动检测: E-Ink accessToken 缺失或已到服务端明确续签时间，续签成功")
         } catch (error: WeReadEinkApiException) {
             if (error.kind != WeReadEinkResponseKind.AUTH_EXPIRED) {
                 logger.warn("启动检测: E-Ink 凭证探测服务端异常（不判死）: ${error.message}")
@@ -52,8 +60,8 @@ object CredentialHealthChecker {
             WebhookNotifier.notify("weread_eink_expired", mapOf(
                 "message" to "微信读书 E-Ink 凭证已失效，请调用 /api/weread/eink/login/start 重新扫码",
             ))
-            if (AppConfig.wereadAutoReloginEnabled && scope != null) {
-                logger.warn("启动检测: auto_relogin 已开启，自动触发 E-Ink 扫码登录")
+            if (AppConfig.wereadEinkAutoReloginEnabled && scope != null) {
+                logger.warn("启动检测: E-Ink auto_relogin 已开启，自动触发扫码登录")
                 WeReadEinkLoginCoordinator.start(scope)
             }
         } catch (error: Exception) {

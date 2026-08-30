@@ -49,6 +49,7 @@ object WebhookNotifier {
         "login_expiring_critical" to "登录即将过期（紧急）",
         "verification_required" to "触发验证",
         "qr_code_pushed" to "二维码已推送",
+        "weread_eink_persistence_failed" to "微信读书 E-Ink 凭证落盘失败",
     )
 
     private fun enabled(): Boolean =
