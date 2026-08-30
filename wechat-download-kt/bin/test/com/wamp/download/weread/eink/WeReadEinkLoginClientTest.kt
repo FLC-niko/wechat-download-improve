@@ -64,6 +64,22 @@ class WeReadEinkLoginClientTest {
     }
 
     @Test
+    fun `refresh records server supplied access token expiry`() {
+        val issuedAt = 1_700_000_000_000L
+        val client = WeReadEinkLoginClient(
+            transport = RecordingTransport(
+                WeReadEinkResponse(200, "{\"accessToken\":\"new-access\",\"expiresIn\":7200}"),
+            ),
+            timestampProvider = { issuedAt },
+        )
+
+        val refreshed = client.refresh(credentials())
+
+        assertEquals(issuedAt, refreshed.accessTokenIssuedAt)
+        assertEquals(issuedAt + 7_200_000L, refreshed.accessTokenExpiresAt)
+    }
+
+    @Test
     fun `refresh rejects credentials for a different vid`() {
         val client = WeReadEinkLoginClient(
             transport = RecordingTransport(

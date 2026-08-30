@@ -108,7 +108,11 @@ object WebhookNotifier {
      * @param imageBytes 二维码图片字节数组
      * @param message 附加文字说明
      */
-    suspend fun pushQrcode(imageBytes: ByteArray, message: String = ""): QrPushResult {
+    suspend fun pushQrcode(
+        imageBytes: ByteArray,
+        message: String = "",
+        fileName: String = "wx_qrcode.png",
+    ): QrPushResult {
         val wecomUrl = AppConfig.wecomWebhookUrl
         val feishuUrl = AppConfig.feishuWebhookUrl
 
@@ -136,7 +140,8 @@ object WebhookNotifier {
         // 飞书：推卡片消息（含二维码访问链接）
         val feishuSuccess = if (feishuUrl.isNotEmpty()) {
             try {
-                val qrUrl = "${AppConfig.siteUrl}/qrcode/wx_qrcode.png?v=${System.currentTimeMillis()}"
+                val safeFileName = fileName.substringAfterLast('/').substringAfterLast('\\')
+                val qrUrl = "${AppConfig.siteUrl}/qrcode/$safeFileName?v=${System.currentTimeMillis()}"
                 val cardText = buildString {
                     appendLine("**请扫码登录微信读书**")
                     if (message.isNotEmpty()) appendLine(message)

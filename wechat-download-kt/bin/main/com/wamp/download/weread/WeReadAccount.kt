@@ -5,10 +5,10 @@ import com.wamp.download.config.AppConfig
 /**
  * 微信读书官方 Web 端凭证（wr_skey 系列 cookie）
  *
- * 通过扫码登录获得，wr_skey 有效期 5400s（1.5h），靠主动刷新保活。
+ * 通过 Web 扫码登录获得。新版值实际是 accessToken，接口不返回 refreshToken 或可靠过期日期。
  */
 data class WeReadWebCredentials(
-    val wrSkey: String = "",           // 核心认证凭证，有效期 5400s
+    val wrSkey: String = "",           // 新版登录中保存 accessToken（字段名为兼容旧存储）
     val wrVid: String = "",            // 用户 ID
     val wrRt: String = "",             // refresh token（session/init 返回）
     val username: String = "",         // 显示名（便于识别账号）
@@ -24,7 +24,8 @@ data class WeReadWebCredentials(
         if (isEmpty()) append("")
     }.trimEnd(' ', ';')
 
-    /** 是否需要主动刷新（距上次刷新超过阈值，默认 50 分钟） */
+    /** 旧调度兼容字段；新版 Web accessToken 不支持主动续签。 */
+    @Deprecated("Web accessToken has no refresh flow; use E-Ink credentials")
     fun needRefresh(): Boolean =
         wrSkey.isNotEmpty() &&
             (lastRefreshTime <= 0L || System.currentTimeMillis() - lastRefreshTime >= AppConfig.wereadRefreshInterval * 1000)

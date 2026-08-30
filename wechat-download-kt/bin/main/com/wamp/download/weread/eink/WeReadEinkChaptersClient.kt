@@ -69,12 +69,7 @@ class WeReadEinkChaptersClient(
         }
 
         val requestedOffset = offset ?: 0L
-        val firstCredentials = session?.credentials() ?: credentials
-        val activeCredentials = if (session != null && !firstCredentials.hasAccessToken()) {
-            session.refreshIfAccessTokenWas(null)
-        } else {
-            firstCredentials
-        }
+        val activeCredentials = session?.credentialsForRequest() ?: credentials
 
         return try {
             requestPage(accountId, count, synckey, offset, requestedOffset, activeCredentials)

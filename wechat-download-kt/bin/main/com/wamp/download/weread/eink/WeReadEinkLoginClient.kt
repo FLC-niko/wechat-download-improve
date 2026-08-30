@@ -49,10 +49,10 @@ class WeReadEinkLoginClient(
             )
         }
 
-        return parseCredentials(response.body, credentials)
+        return parseCredentials(response.body, credentials, timestamp)
     }
 
-    private fun parseCredentials(raw: String, current: WeReadEinkCredentials): WeReadEinkCredentials {
+    private fun parseCredentials(raw: String, current: WeReadEinkCredentials, issuedAt: Long): WeReadEinkCredentials {
         try {
             val root = JsonParser.parseString(raw)
             if (!root.isJsonObject) throw WeReadEinkParseException("/login returned a non-object body")
@@ -68,6 +68,8 @@ class WeReadEinkLoginClient(
                 accessToken = accessToken,
                 refreshToken = refreshToken,
                 deviceId = current.deviceId,
+                accessTokenIssuedAt = issuedAt,
+                accessTokenExpiresAt = WeReadEinkTokenExpiry.parse(obj, issuedAt),
             )
         } catch (error: WeReadEinkParseException) {
             throw error

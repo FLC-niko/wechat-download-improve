@@ -271,56 +271,16 @@ object WeReadWebAuth {
     }
 
     /**
-     * 主动刷新保活（wr_skey 双层刷新的"主动"层，按账号）
-     *
-     * 通过 HEAD 官网首页带旧 cookie 探测凭证状态：
-     * - HTTP 401 → 凭证失效，标记失败
-     * - 200 + 有效新 set-cookie → 刷新成功
-     * - 200 + set-cookie 被清空（Max-Age=0 空值）→ 凭证已失效，标记失败
-     * - 200 + 无 set-cookie → 凭证仍有效，仅更新时间戳
-     *
-     * @return true=仍保持登录，false=登录态已失效需重新扫码
+     * 新版 Web 登录只返回 accessToken，没有 refreshToken；HEAD / 只能探活，不能续签。
+     * 保留该方法作为旧调用方兼容入口，但不再发起会被误判为续签的网络请求。
      */
+    @Deprecated("Web accessToken cannot be renewed; use E-Ink refreshToken flow")
     fun proactiveRefresh(vid: String): Boolean {
         val account = WeReadAccountPool.get(vid) ?: return false
-        val creds = account.credentials
-        if (creds.wrSkey.isEmpty() || creds.wrVid.isEmpty()) return false
-        return try {
-            val req = Request.Builder()
-                .url("$baseUrl/")
-                .head()
-                .header("Cookie", creds.toCookieString())
-                .header("User-Agent", UA)
-                .build()
-            client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    WeReadAccountPool.markRefreshFailed(vid)
-                    logger.warn("微信读书刷新失败（HTTP ${resp.code}），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
-                    false
-                } else {
-                    val setCookies = resp.headers("set-cookie")
-                    if (setCookies.isEmpty()) {
-                        // 无 set-cookie：凭证仍有效，仅更新时间戳防频繁探测
-                        WeReadAccountPool.markRefreshed(vid)
-                        logger.debug("微信读书凭证仍有效（无 set-cookie）: vid=$vid")
-                        true
-                    } else if (WeReadAccountPool.updateFromSetCookie(vid, setCookies)) {
-                        // 拿到有效新凭证
-                        logger.debug("微信读书凭证刷新成功: vid=$vid")
-                        true
-                    } else {
-                        // set-cookie 全是清空（wr_skey=; Max-Age=0）→ 服务端已登出
-                        WeReadAccountPool.markRefreshFailed(vid)
-                        logger.warn("微信读书凭证已被服务端清空（登录超时），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
-                        false
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            WeReadAccountPool.markRefreshFailed(vid)
-            logger.warn("微信读书刷新异常: ${e.message}: vid=$vid")
-            false
-        }
+        if (!account.hasWebCredentials()) return false
+        WeReadAccountPool.markRefreshFailed(vid)
+        logger.warn("Web accessToken 不支持自动续签，跳过 HEAD 伪刷新并等待重新扫码或 E-Ink 通道: vid=$vid")
+        return false
     }
 
     /**

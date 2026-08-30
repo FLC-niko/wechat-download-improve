@@ -15,6 +15,7 @@ import com.wamp.download.store.Database
 import com.wamp.download.task.TaskProcessor
 import com.wamp.download.wx.WxApiClient
 import com.wamp.download.weread.eink.WeReadEinkRuntime
+import com.wamp.download.weread.eink.WeReadEinkLoginCoordinator
 import io.ktor.serialization.gson.gson
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
@@ -41,7 +42,7 @@ fun main() {
     val logger = LoggerFactory.getLogger("Main")
     val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    val einkSyncService = WeReadEinkRuntime.createSyncService()
+    WeReadEinkRuntime.initialize()
 
     // 动态发现 adb devices；不写死 USB 序列号或无线 ADB 地址。
     val adbDeviceSupervisor = AdbDeviceSupervisor()
@@ -69,7 +70,7 @@ fun main() {
     val taskProcessor = TaskProcessor(
         wxClient = wxClient,
         loginChecker = loginChecker,
-        einkSyncService = einkSyncService,
+        einkSyncServiceProvider = WeReadEinkRuntime::syncService,
     )
 
     // JVM shutdown hook：Ctrl+C / kill 时清理资源，避免残留进程
@@ -120,31 +121,15 @@ fun main() {
         if (AppConfig.authAutoRecoveryEnabled) {
             scope.launch { loginChecker.start() }
         }
-        // 微信读书凭证主动刷新保活（wr_skey 双层刷新的"主动"层，多账号遍历）
+        // E-Ink 只按服务端明确过期时间提前续签；未提供日期时由 401/-2012 触发真实 /login 续签。
         scope.launch {
-            val auth = com.wamp.download.weread.WeReadWebAuth
-            val pool = com.wamp.download.weread.WeReadAccountPool
             while (true) {
                 try {
-                    pool.list().forEach { account ->
-                        val vid = account.vid
-                        when {
-                            // 连续刷新失败达到阈值 → 凭证真失效，推送二维码重新扫码（按账号防重入）
-                            auth.shouldRelogin(vid) && (AppConfig.adbEnabled || AppConfig.wereadAutoReloginEnabled) -> {
-                                if (AppConfig.adbEnabled) {
-                                    recoveryManager.request(vid)
-                                } else {
-                                    auth.requestReloginIfNeeded(vid)
-                                }
-                            }
-                            // 距上次刷新超过阈值 → 主动刷新保活
-                            account.credentials.needRefresh() -> auth.proactiveRefresh(vid)
-                        }
-                    }
+                    WeReadEinkRuntime.refreshIfExpiryDue()
                 } catch (e: Exception) {
-                    logger.warn("微信读书刷新协程异常: ${e.message}")
+                    logger.warn("E-Ink token 续签检查异常: ${e.message}")
                 }
-                kotlinx.coroutines.delay(AppConfig.wereadRefreshInterval * 1000)
+                kotlinx.coroutines.delay(AppConfig.wereadEinkRefreshCheckInterval * 1000)
             }
         }
         scope.launch {
@@ -156,7 +141,7 @@ fun main() {
             })
         }
         logger.info(
-            "后台任务已启动: RabbitMQ + 任务处理 + 登录提醒 + 微信读书刷新保活" +
+            "后台任务已启动: RabbitMQ + 任务处理 + 登录提醒 + E-Ink真实Token续签" +
                 (if (AppConfig.authAutoRecoveryEnabled) " + 主微信自动恢复" else "（主微信自动恢复已关闭）") +
                 (if (AppConfig.rssEnabled) " + RSS轮询器" else "（RSS轮询已关闭）"),
         )
@@ -230,7 +215,23 @@ fun main() {
                     "accounts" to accountMap(pool.list()),
                     "base_url" to AppConfig.wereadWebBaseUrl,
                     "channels" to com.wamp.download.task.ChannelStateManager.snapshot(),
+                    "eink" to WeReadEinkRuntime.status(),
                 ))
+            }
+            get("/api/weread/eink/status") {
+                call.respond(mapOf(
+                    "runtime" to WeReadEinkRuntime.status(),
+                    "login" to WeReadEinkLoginCoordinator.status(),
+                ))
+            }
+            post("/api/weread/eink/login/start") {
+                val started = WeReadEinkLoginCoordinator.start(scope)
+                val message = when {
+                    !AppConfig.wereadEinkEnabled -> "E-Ink 通道未启用"
+                    started -> "E-Ink 登录已启动，二维码生成后将推送并保存到 qrcode 目录"
+                    else -> "E-Ink 登录已在进行中"
+                }
+                call.respond(mapOf("started" to started, "message" to message))
             }
             post("/api/weread/login") {
                 scope.launch {

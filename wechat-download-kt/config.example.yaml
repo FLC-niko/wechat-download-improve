@@ -47,12 +47,14 @@ weread:
   refresh_fail_threshold: 3
   auto_relogin_enabled: false  # 失效时仅告警/手动登录，避免服务自行弹出二维码
   eink:
-    enabled: false
+    enabled: true               # 真实 accessToken/refreshToken 续签通道，不依赖 ADB
     base_url: "https://i.weread.qq.com"
     credentials_file: "data/.weread_eink_credentials.json"
     sync_interval: 86400       # E-Ink 增量同步最小间隔（秒）
     page_size: 50
     max_pages: 1000
+    refresh_check_interval: 60  # 只检查服务端明确返回的过期时间
+    refresh_skew: 300           # 已知到期时间前 5 分钟续签；未知时按 401/-2012 续签
 
 adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启

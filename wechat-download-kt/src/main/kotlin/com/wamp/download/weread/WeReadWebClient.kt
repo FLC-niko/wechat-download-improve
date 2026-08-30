@@ -144,7 +144,7 @@ class WeReadWebClient {
      *
      * 内部流程：
      * 1. acquire() 取号（least_used + inUse 互斥 + 冷却过滤）
-     * 2. 用该账号请求；凭证失效（401 / errCode=-2012）→ 尝试被动刷新 → 失败则标记 EXPIRED 并换号重试
+     * 2. 用该账号请求；凭证失效（401 / errCode=-2012）→ 标记 EXPIRED 并换号
      * 3. 非失效错误不换号，直接返回空
      *
      * @return 本页文章列表 + 实际使用的账号 vid（空页时上层可据此做频控冷却）
@@ -175,23 +175,7 @@ class WeReadWebClient {
                     }
                     PageKind.EXPIRED -> {
                         lastOutcome = PageOutcome.AUTH_EXPIRED
-                        // 尝试被动刷新一次，成功则用新凭证重试本页
-                        val refreshed = WeReadWebAuth.proactiveRefresh(account.vid)
-                        if (refreshed) {
-                            val refreshedResult = fetchArticlesForAccount(account, mpId, offset)
-                            if (refreshedResult.kind == PageKind.SUCCESS) {
-                                val a2 = refreshedResult.parsed.articles
-                                WeReadAccountPool.markSuccess(account.vid)
-                                return WeReadPage(
-                                    articles = a2,
-                                    accountVid = account.vid,
-                                    outcome = if (a2.isEmpty()) PageOutcome.NO_MORE_DATA else PageOutcome.DATA,
-                                    nextOffset = refreshedResult.parsed.nextOffset,
-                                    endReached = refreshedResult.parsed.endReached,
-                                )
-                            }
-                        }
-                        // 刷新失败：标记失效，异步重扫码（按账号防重入），换号继续
+                        // 新版 Web accessToken 没有 refreshToken，不能用 HEAD 请求伪装续签。
                         WeReadAccountPool.markExpired(account.vid, "凭证失效(401/-2012)")
                         WeReadWebAuth.requestReloginIfNeeded(account.vid)
                     }

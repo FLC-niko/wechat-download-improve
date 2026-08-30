@@ -50,6 +50,7 @@ class TaskProcessor(
     private val loginChecker: LoginChecker = LoginChecker(),
     private val resultPublisher: ResultQueuePublisher? = null,
     private val einkSyncService: WeReadEinkSyncService? = null,
+    private val einkSyncServiceProvider: (() -> WeReadEinkSyncService?)? = null,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(TaskProcessor::class.java)
@@ -123,13 +124,14 @@ class TaskProcessor(
         }
 
         val fakeid = subscription.fakeid
+        val currentEinkService = einkSyncServiceProvider?.invoke() ?: einkSyncService
         val canUseEink = AppConfig.wereadEinkEnabled &&
-            einkSyncService != null &&
-            einkSyncService.canSync(subscription)
+            currentEinkService != null &&
+            currentEinkService.canSync(subscription)
 
         val sourceResults = mutableListOf<SourceFetchResult>()
         if (canUseEink) {
-            fetchFromEink(subscription, startTs, endTs)?.let(sourceResults::add)
+            fetchFromEink(currentEinkService, subscription, startTs, endTs)?.let(sourceResults::add)
         }
         if (sourceResults.none { it.coverageComplete }) {
             sourceResults += fetchViaMainChannel(fakeid, startTs)
@@ -263,11 +265,12 @@ class TaskProcessor(
     )
 
     private fun fetchFromEink(
+        service: WeReadEinkSyncService?,
         subscription: Subscription,
         startTs: Long,
         endTs: Long,
     ): SourceFetchResult? {
-        val service = einkSyncService ?: return null
+        service ?: return null
         return try {
             service.syncIfNeeded(subscription, startTs, endTs)
 

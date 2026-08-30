@@ -1,6 +1,8 @@
 package com.wamp.download.weread.eink
 
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.math.BigInteger
 
 interface WeReadEinkProfile {
     val versionHeaders: Map<String, String>
@@ -17,6 +19,10 @@ interface WeReadEinkProfile {
     ): String
 
     fun loginBodyExtras(): Map<String, Any?>
+
+    fun newDeviceId(): String
+
+    fun newInstallId(): String
 }
 
 object DefaultWeReadEinkProfile : WeReadEinkProfile {
@@ -53,4 +59,17 @@ object DefaultWeReadEinkProfile : WeReadEinkProfile {
     }
 
     override fun loginBodyExtras(): Map<String, Any?> = mapOf("deviceType" to deviceType)
+
+    override fun newDeviceId(): String {
+        val bytes = ByteArray(8).also(SecureRandom()::nextBytes)
+        bytes[0] = (bytes[0].toInt() and 0x7f).toByte()
+        val suffix = BigInteger(1, bytes).toString().padStart(19, '0')
+        return "eink334691225$suffix"
+    }
+
+    override fun newInstallId(): String = buildString {
+        append("eink31")
+        val random = SecureRandom()
+        repeat(26) { append(random.nextInt(10)) }
+    }
 }

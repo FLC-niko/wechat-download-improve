@@ -61,7 +61,7 @@ object AppConfig {
     val wereadCredentialsFile: String get() = getString("weread.credentials_file", "data/.weread_web_credentials.json")
 
     // 微信读书 E-Ink 增量通道
-    val wereadEinkEnabled: Boolean get() = getBool("weread.eink.enabled", false)
+    val wereadEinkEnabled: Boolean get() = getBool("weread.eink.enabled", true)
     val wereadEinkBaseUrl: String get() = getString("weread.eink.base_url", "https://i.weread.qq.com")
     val wereadEinkCredentialsFile: String
         get() = getString("weread.eink.credentials_file", "data/.weread_eink_credentials.json")
@@ -71,6 +71,10 @@ object AppConfig {
         get() = getInt("weread.eink.page_size", 50).coerceIn(1, 100)
     val wereadEinkMaxPages: Int
         get() = getInt("weread.eink.max_pages", 1000).coerceAtLeast(1)
+    val wereadEinkRefreshCheckInterval: Long
+        get() = getLong("weread.eink.refresh_check_interval", 60L).coerceAtLeast(10L)
+    val wereadEinkRefreshSkew: Long
+        get() = getLong("weread.eink.refresh_skew", 300L).coerceAtLeast(0L)
 
     // 多账号池：账号凭证存储目录 + 频控冷却时长
     val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")

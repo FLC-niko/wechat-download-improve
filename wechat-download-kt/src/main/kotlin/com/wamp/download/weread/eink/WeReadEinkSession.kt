@@ -10,6 +10,7 @@ class WeReadEinkSession(
     private val credentialStore: WeReadEinkCredentialStore? = null,
     baseUrl: String = DEFAULT_BASE_URL,
     profile: WeReadEinkProfile = DefaultWeReadEinkProfile,
+    private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
     private val refreshLock = Any()
     private val loginClient = WeReadEinkLoginClient(
@@ -22,6 +23,13 @@ class WeReadEinkSession(
     private var currentCredentials = initialCredentials
 
     fun credentials(): WeReadEinkCredentials = currentCredentials
+
+    /** Uses an explicit server expiry when present; unknown expiry remains server-rejection driven. */
+    fun credentialsForRequest(): WeReadEinkCredentials {
+        val snapshot = currentCredentials
+        if (!snapshot.accessTokenNeedsRefresh(clock())) return snapshot
+        return refreshIfAccessTokenWas(snapshot.accessToken)
+    }
 
     /**
      * Refreshes only if the caller failed with the session's current token.
