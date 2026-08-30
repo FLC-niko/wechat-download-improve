@@ -45,6 +45,7 @@ class WxApiClient {
     enum class TokenStatus {
         VALID,
         EXPIRED,
+        INVALIDATED,
         RATE_LIMITED,
         UNAVAILABLE,
     }
@@ -59,14 +60,17 @@ class WxApiClient {
 
         val isAuthExpired: Boolean
             get() = classifyTokenFailure(retCode, errMsg) == TokenStatus.EXPIRED
+
+        val isMainChannelInvalidated: Boolean
+            get() = classifyTokenFailure(retCode, errMsg) == TokenStatus.INVALIDATED
     }
 
     companion object {
         fun classifyTokenFailure(retCode: String?, errMsg: String): TokenStatus {
             val normalizedMessage = errMsg.lowercase()
             return when {
-                retCode == "200013" ||
-                    normalizedMessage.contains("freq") ||
+                retCode == "200013" -> TokenStatus.INVALIDATED
+                normalizedMessage.contains("freq") ||
                     normalizedMessage.contains("频控") ||
                     normalizedMessage.contains("频繁") -> TokenStatus.RATE_LIMITED
                 retCode == "200003" ||
@@ -100,7 +104,7 @@ class WxApiClient {
             searchAccounts("微信", 1)
             TokenStatus.VALID
         } catch (e: WxApiException) {
-            val status = if (e.isRateLimited || e.isAuthExpired) {
+            val status = if (e.isRateLimited || e.isAuthExpired || e.isMainChannelInvalidated) {
                 classifyTokenFailure(e.retCode, e.errMsg)
             } else {
                 TokenStatus.UNAVAILABLE

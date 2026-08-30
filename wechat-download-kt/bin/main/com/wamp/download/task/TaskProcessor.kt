@@ -33,7 +33,7 @@ import kotlin.random.Random
  * 1. 等待登录恢复（如果正在恢复）
  * 2. 检查 token 有效性，无效则触发登录恢复
  * 3. 搜索公众号名称 → 获取 fakeid
- * 4. L1 主通道：appmsgpublish（重试 + 退避 + 频控降级标记）
+ * 4. L1 主通道：appmsgpublish（默认关闭；200013 永久失效）
  * 5. L2 微信读书官方直连（weread.qq.com，空页重试 + 翻页抖动）
  * 6. L3 本地缓存兜底 + 告警
  * 7. 按日期范围过滤 → 保存到数据库 → 发布结果到 RabbitMQ
@@ -42,7 +42,7 @@ import kotlin.random.Random
  * - 直接调微信 API，不经过适配壳 HTTP 中转
  * - 文章存 SQLite，不存 JSON 文件
  * - 只获取文章链接元数据，不抓正文
- * - 微信读书官方直连作为 appmsgpublish 频控时的回退通道（第三方代理已废弃）
+ * - 微信读书官方直连是当前主采集通道（第三方代理已废弃）
  */
 class TaskProcessor(
     private val wxClient: WxApiClient = WxApiClient(),
@@ -105,8 +105,11 @@ class TaskProcessor(
                 findOrCreateSubscription(task.gzhName)?.let { SubscriptionStore.get(it) }
             } catch (e: Exception) {
                 logger.error("【任务处理】搜索公众号失败: gzh=${task.gzhName}, error=${e.message}")
-                if (e is WxApiClient.WxApiException && e.isRateLimited) {
-                    ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+                if (e is WxApiClient.WxApiException) {
+                    when {
+                        e.isMainChannelInvalidated -> ChannelStateManager.markMainChannelInvalid("ret=200013")
+                        e.isRateLimited -> ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+                    }
                 }
                 publishFailed(task, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败", retryable = false)
                 return
@@ -189,6 +192,15 @@ class TaskProcessor(
     }
 
     private suspend fun ensureMainLoginForLookup(task: ProcessingTask): Boolean {
+        if (!ChannelStateManager.isMainChannelAvailable()) {
+            publishFailed(
+                task,
+                "ACCOUNT_LOOKUP_UNAVAILABLE",
+                "公众号尚未入库，主微信通道不可用: ${ChannelStateManager.mainChannelUnavailableReason()}",
+                false,
+            )
+            return false
+        }
         loginChecker.waitForRecoveryComplete()
         return when (loginChecker.checkTokenStatus()) {
             WxApiClient.TokenStatus.VALID -> true
@@ -199,6 +211,11 @@ class TaskProcessor(
             }
             WxApiClient.TokenStatus.UNAVAILABLE -> {
                 publishFailed(task, "ACCOUNT_LOOKUP_UNAVAILABLE", "公众号尚未入库，主通道暂不可用", false)
+                false
+            }
+            WxApiClient.TokenStatus.INVALIDATED -> {
+                ChannelStateManager.markMainChannelInvalid("ret=200013")
+                publishFailed(task, "ACCOUNT_LOOKUP_CHANNEL_INVALIDATED", "公众号尚未入库，主微信接口已永久失效", false)
                 false
             }
             WxApiClient.TokenStatus.EXPIRED -> {
@@ -293,14 +310,15 @@ class TaskProcessor(
     /**
      * L1 主通道：appmsgpublish 获取文章列表（带降级检查 + 重试 + 退避）
      *
-     * - 主通道处于降级期 → 直接返回 null（走回退，避免浪费请求）
-     * - 触发频控（ret=200013）→ 标记降级，立即返回 null
+     * - 主通道关闭、失效或处于临时降级期 → 直接走回退
+     * - ret=200013 → 永久停用当前主通道，立即走回退
      * - 其他异常/空结果 → 按退避策略重试（retry_max 次）
      */
     private suspend fun fetchViaMainChannel(fakeid: String, targetStartTs: Long): SourceFetchResult {
         if (!ChannelStateManager.isMainChannelAvailable()) {
-            logger.info("【L1 主通道】处于频控降级期（剩余 ${ChannelStateManager.remainingDegradedSeconds()}s），直接走回退")
-            return SourceFetchResult("main", emptyList(), false, "channel-degraded")
+            val reason = ChannelStateManager.mainChannelUnavailableReason()
+            logger.info("【L1 主通道】不可用（$reason），直接走回退")
+            return SourceFetchResult("main", emptyList(), false, "channel-unavailable:$reason")
         }
 
         val pageSize = 20
@@ -325,11 +343,15 @@ class TaskProcessor(
                 logger.warn("【L1 主通道】返回空列表 (第 $round/${AppConfig.mainRetryMax} 次)")
             } catch (e: Exception) {
                 val msg = e.message ?: ""
+                if ((e is WxApiClient.WxApiException && e.isMainChannelInvalidated) || msg.contains("200013")) {
+                    logger.error("【L1 主通道】ret=200013 表示接口永久失效，停止后续主通道请求")
+                    ChannelStateManager.markMainChannelInvalid("ret=200013")
+                    return SourceFetchResult("main", emptyList(), false, "channel-invalidated")
+                }
                 if ((e is WxApiClient.WxApiException && e.isRateLimited) ||
-                    msg.contains("200013") || msg.contains("freq") || msg.contains("频控")
+                    msg.contains("freq") || msg.contains("频控")
                 ) {
-                    // 频控：标记降级，直接走回退（不继续重试，避免加剧风控）
-                    logger.warn("【L1 主通道】触发频控(ret=200013)，标记降级 ${AppConfig.mainDegradedDuration}s")
+                    logger.warn("【L1 主通道】触发未知临时限流，标记降级 ${AppConfig.mainDegradedDuration}s")
                     ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
                     return SourceFetchResult("main", emptyList(), false, "rate-limited")
                 }

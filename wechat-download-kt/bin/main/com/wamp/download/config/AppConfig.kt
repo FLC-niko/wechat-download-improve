@@ -104,10 +104,11 @@ object AppConfig {
     val wereadWarmupEnabled: Boolean get() = getBool("weread.warmup_enabled", true)
 
     // --- 主通道（appmsgpublish）重试策略 ---
+    val mainEnabled: Boolean get() = getBool("wx.main.enabled", false)
     val mainRetryMax: Int get() = getInt("wx.main.retry_max", 3)
     val mainBackoffBase: Long get() = getLong("wx.main.backoff_base", 5L)
     val mainBackoffMax: Long get() = getLong("wx.main.backoff_max", 60L)
-    val mainDegradedDuration: Long get() = getLong("wx.main.degraded_duration", 60L)    // 频控后降级持续（秒）
+    val mainDegradedDuration: Long get() = getLong("wx.main.degraded_duration", 60L)    // 未知临时限流的降级时间
 
     // 站点 URL（用于图片代理）
     val siteUrl: String get() = getString("server.site_url", "http://localhost:5000")

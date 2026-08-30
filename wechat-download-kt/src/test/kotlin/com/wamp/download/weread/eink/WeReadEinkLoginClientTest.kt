@@ -13,7 +13,7 @@ class WeReadEinkLoginClientTest {
             WeReadEinkResponse(
                 statusCode = 200,
                 body = """
-                    {"vid":"new-vid","accessToken":"new-access","refreshToken":"new-refresh"}
+                    {"vid":"old-vid","accessToken":"new-access","refreshToken":"new-refresh"}
                 """.trimIndent(),
             ),
         )
@@ -26,7 +26,7 @@ class WeReadEinkLoginClientTest {
 
         val refreshed = client.refresh(credentials())
 
-        assertEquals("new-vid", refreshed.vid)
+        assertEquals("old-vid", refreshed.vid)
         assertEquals("new-access", refreshed.accessToken)
         assertEquals("new-refresh", refreshed.refreshToken)
         val request = transport.requests.single()
@@ -45,6 +45,55 @@ class WeReadEinkLoginClientTest {
             "9cc1a97d6346294a24ed5354ab0238e31ea5f566ae1ba0f1c88f39aea03724f6",
             body["signature"].asString,
         )
+    }
+
+    @Test
+    fun `refresh accepts access-token-only response and preserves stable credentials`() {
+        val client = WeReadEinkLoginClient(
+            transport = RecordingTransport(
+                WeReadEinkResponse(200, "{\"accessToken\":\"new-access\"}"),
+            ),
+        )
+
+        val refreshed = client.refresh(credentials())
+
+        assertEquals("old-vid", refreshed.vid)
+        assertEquals("new-access", refreshed.accessToken)
+        assertEquals("refresh-token", refreshed.refreshToken)
+        assertEquals("eink-device", refreshed.deviceId)
+    }
+
+    @Test
+    fun `refresh rejects credentials for a different vid`() {
+        val client = WeReadEinkLoginClient(
+            transport = RecordingTransport(
+                WeReadEinkResponse(
+                    200,
+                    "{\"vid\":\"another-vid\",\"accessToken\":\"new-access\"}",
+                ),
+            ),
+        )
+
+        val error = assertFailsWith<WeReadEinkParseException> {
+            client.refresh(credentials())
+        }
+
+        assertTrue(error.message.orEmpty().contains("vid"))
+    }
+
+    @Test
+    fun `refresh still requires a new access token`() {
+        val client = WeReadEinkLoginClient(
+            transport = RecordingTransport(
+                WeReadEinkResponse(200, "{\"vid\":\"old-vid\"}"),
+            ),
+        )
+
+        val error = assertFailsWith<WeReadEinkParseException> {
+            client.refresh(credentials())
+        }
+
+        assertTrue(error.message.orEmpty().contains("accessToken"))
     }
 
     @Test

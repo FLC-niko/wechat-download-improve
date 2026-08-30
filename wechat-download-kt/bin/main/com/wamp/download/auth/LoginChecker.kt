@@ -73,6 +73,8 @@ class LoginChecker(
      */
     fun checkTokenStatus(forceRefresh: Boolean = false): WxApiClient.TokenStatus {
         if (isRecovering) return WxApiClient.TokenStatus.EXPIRED
+        if (ChannelStateManager.isMainChannelInvalidated()) return WxApiClient.TokenStatus.INVALIDATED
+        if (!AppConfig.mainEnabled) return WxApiClient.TokenStatus.UNAVAILABLE
 
         val now = System.currentTimeMillis()
         if (!forceRefresh && now - lastCheckTime < tokenCacheMs) {
@@ -133,8 +135,12 @@ class LoginChecker(
         when (status) {
             WxApiClient.TokenStatus.VALID -> logger.debug("【登录检查】微信登录状态有效")
             WxApiClient.TokenStatus.RATE_LIMITED -> {
-                logger.warn("【登录检查】token 探测触发频控，标记主通道降级并跳过登录恢复")
+                logger.warn("【登录检查】token 探测触发未知临时限流，标记主通道降级并跳过登录恢复")
                 ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+            }
+            WxApiClient.TokenStatus.INVALIDATED -> {
+                logger.error("【登录检查】主微信接口返回 200013，通道已失效，不再自动重试")
+                ChannelStateManager.markMainChannelInvalid("ret=200013")
             }
             WxApiClient.TokenStatus.UNAVAILABLE ->
                 logger.warn("【登录检查】token 探测暂不可用，跳过登录恢复")

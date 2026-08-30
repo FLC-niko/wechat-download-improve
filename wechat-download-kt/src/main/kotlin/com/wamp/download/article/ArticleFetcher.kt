@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
 /**
  * 文章列表抓取器 — 对齐 Python 版 rss_poller.py 的 _fetch_article_list
  *
- * 调微信 appmsgpublish 接口获取文章列表元数据（不抓正文，零风控风险）
+ * 可选调用微信 appmsgpublish 接口获取文章列表元数据；该通道默认关闭。
  */
 class ArticleFetcher {
     private val logger = LoggerFactory.getLogger(ArticleFetcher::class.java)
@@ -40,6 +40,10 @@ class ArticleFetcher {
      * @return 文章列表
      */
     fun fetchList(fakeid: String, begin: Int = 0, count: Int = 10): List<Article> {
+        if (!ChannelStateManager.isMainChannelAvailable()) {
+            logger.info("跳过 appmsgpublish: ${ChannelStateManager.mainChannelUnavailableReason()}")
+            return emptyList()
+        }
         val creds = AuthManager.get()
         if (!AuthManager.isLoggedIn()) {
             logger.warn("未登录，无法抓取文章列表")
@@ -85,10 +89,12 @@ class ArticleFetcher {
             if (ret != 0.0 && ret != 0 && ret != "0") {
                 val errMsg = baseResp?.get("err_msg") ?: "未知错误"
                 logger.warn("微信 API 错误: fakeid=${fakeid.take(8)}..., ret=$ret, err_msg=$errMsg")
-                // 频控（ret=200013）→ 标记主通道降级，后续直接走微信读书回退
+                // ret=200013 是永久失效标志，不是降低频率后可恢复的临时频控。
                 if (ret == 200013.0 || ret == 200013 || "200013" == ret.toString() ||
-                    errMsg.toString().contains("freq", ignoreCase = true)
+                    errMsg.toString().contains("200013")
                 ) {
+                    ChannelStateManager.markMainChannelInvalid("ret=200013")
+                } else if (errMsg.toString().contains("freq", ignoreCase = true)) {
                     ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
                 }
                 return emptyList()
@@ -130,7 +136,7 @@ class ArticleFetcher {
     }
 
     /**
-     * 抓取并保存单个公众号的文章（带回退：主通道频控 → 微信读书）
+     * 抓取并保存单个公众号的文章（主微信不可用时使用微信读书）
      *
      * @return 新增文章数
      */
@@ -150,11 +156,11 @@ class ArticleFetcher {
     /**
      * 带回退的文章列表抓取：主通道（appmsgpublish）→ 微信读书官方回退
      *
-     * 主通道被官方限制（ret=200013 频控）后返回空，此时标记降级并走
+     * 主通道返回 ret=200013 后永久停用并走
      * 微信读书回退，保证后台轮询也能持续入库最新文章。
      */
     fun fetchListWithFallback(fakeid: String, begin: Int = 0, count: Int = 10): List<Article> {
-        // 主通道处于降级期 → 直接走微信读书回退，避免反复打主通道
+        // 主通道关闭、永久失效或临时降级 → 直接走微信读书。
         if (!ChannelStateManager.isMainChannelAvailable()) {
             val fallback = fetchFromWeRead(fakeid)
             if (fallback.isNotEmpty()) return fallback
@@ -164,13 +170,13 @@ class ArticleFetcher {
         val main = fetchList(fakeid, begin, count)
         if (main.isNotEmpty()) return main
 
-        // 主通道空/失败（多为频控）→ 微信读书回退
+        // 主通道空或失败 → 微信读书回退。
         val fallback = fetchFromWeRead(fakeid)
         return if (fallback.isNotEmpty()) fallback else emptyList()
     }
 
     /**
-     * 微信读书官方直连回退（appmsgpublish 频控时）
+     * 微信读书官方直连采集通道
      *
      * mpId 定位：缓存 → fakeid 推导。只翻最近若干页拿增量文章。
      */

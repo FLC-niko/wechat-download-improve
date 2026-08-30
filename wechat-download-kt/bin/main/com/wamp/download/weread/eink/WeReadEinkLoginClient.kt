@@ -49,22 +49,25 @@ class WeReadEinkLoginClient(
             )
         }
 
-        return parseCredentials(response.body, credentials.deviceId)
+        return parseCredentials(response.body, credentials)
     }
 
-    private fun parseCredentials(raw: String, deviceId: String): WeReadEinkCredentials {
+    private fun parseCredentials(raw: String, current: WeReadEinkCredentials): WeReadEinkCredentials {
         try {
             val root = JsonParser.parseString(raw)
             if (!root.isJsonObject) throw WeReadEinkParseException("/login returned a non-object body")
             val obj = root.asJsonObject
-            val vid = requiredString(obj, "vid")
+            val returnedVid = optionalString(obj, "vid")
+            if (returnedVid != null && returnedVid != current.vid) {
+                throw WeReadEinkParseException("/login response vid does not match the current account")
+            }
             val accessToken = requiredString(obj, "accessToken")
-            val refreshToken = requiredString(obj, "refreshToken")
+            val refreshToken = optionalString(obj, "refreshToken") ?: current.refreshToken
             return WeReadEinkCredentials(
-                vid = vid,
+                vid = current.vid,
                 accessToken = accessToken,
                 refreshToken = refreshToken,
-                deviceId = deviceId,
+                deviceId = current.deviceId,
             )
         } catch (error: WeReadEinkParseException) {
             throw error
@@ -74,11 +77,16 @@ class WeReadEinkLoginClient(
     }
 
     private fun requiredString(obj: JsonObject, name: String): String {
+        return optionalString(obj, name)
+            ?: throw WeReadEinkParseException("/login response is missing $name")
+    }
+
+    private fun optionalString(obj: JsonObject, name: String): String? {
         val value = obj.get(name)
             ?.takeIf { it.isJsonPrimitive }
             ?.let { runCatching { it.asString }.getOrNull() }
             ?.takeIf { it.isNotBlank() }
-        return value ?: throw WeReadEinkParseException("/login response is missing $name")
+        return value
     }
 
     private companion object {

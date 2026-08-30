@@ -57,3 +57,8 @@ weread:
 adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启
   poll_interval_ms: 15000
+
+# 主微信接口返回 200013 后不会因降低频率而恢复，默认禁用。
+wx:
+  main:
+    enabled: false

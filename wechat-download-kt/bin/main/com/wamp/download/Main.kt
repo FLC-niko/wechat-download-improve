@@ -206,12 +206,14 @@ fun main() {
 
             // 微信登录状态查询
             get("/api/wx/status") {
+                val channelState = com.wamp.download.task.ChannelStateManager.snapshot()
                 call.respond(mapOf(
                     "logged_in" to com.wamp.download.auth.AuthManager.isLoggedIn(),
                     "is_recovering" to loginChecker.isRecovering,
                     "token_valid" to loginChecker.isTokenValid(),
                     "nickname" to com.wamp.download.auth.AuthManager.get().nickname,
                     "expire_time" to com.wamp.download.auth.AuthManager.get().expireTime,
+                    "channel" to channelState,
                 ))
             }
 

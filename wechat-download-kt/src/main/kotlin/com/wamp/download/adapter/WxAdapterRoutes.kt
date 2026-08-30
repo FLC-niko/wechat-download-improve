@@ -6,6 +6,7 @@ import com.wamp.download.auth.AuthManager
 import com.wamp.download.config.AppConfig
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.SubscriptionStore
+import com.wamp.download.task.ChannelStateManager
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -51,6 +52,10 @@ fun Route.wxAdapterRoutes() {
     )
     fun okData(data: Any?) = mapOf("code" to 0, "message" to "ok", "data" to data)
     fun err(msg: String) = mapOf("code" to -1, "message" to msg, "data" to null)
+    fun isMainChannelInvalidation(ret: Any?): Boolean = when (ret) {
+        is Number -> ret.toLong() == 200013L
+        else -> ret?.toString()?.removeSuffix(".0") == "200013"
+    }
 
     route("/api/v1/wx") {
         // ── 鉴权 ──────────────────────────────
@@ -107,6 +112,10 @@ fun Route.wxAdapterRoutes() {
             }
 
             // 否则先搜索获取 fakeid
+            if (!ChannelStateManager.isMainChannelAvailable()) {
+                call.respond(err("主微信搜索通道不可用: ${ChannelStateManager.mainChannelUnavailableReason()}"))
+                return@post
+            }
             if (!AuthManager.isLoggedIn()) {
                 call.respond(err("微信未登录，无法搜索公众号"))
                 return@post
@@ -136,6 +145,9 @@ fun Route.wxAdapterRoutes() {
                 val result = gson.fromJson(resp.body?.string().orEmpty(), Map::class.java)
                 val baseResp = result?.get("base_resp") as? Map<*, *>
                 if (baseResp?.get("ret") != 0.0 && baseResp?.get("ret") != 0) {
+                    if (isMainChannelInvalidation(baseResp?.get("ret"))) {
+                        ChannelStateManager.markMainChannelInvalid("ret=200013")
+                    }
                     call.respond(err("搜索失败: ${baseResp?.get("err_msg")}"))
                     return@post
                 }
@@ -161,6 +173,11 @@ fun Route.wxAdapterRoutes() {
             if (!call.checkAdapterAuth()) { call.respond(err("未授权")); return@get }
             val keyword = call.parameters["keyword"] ?: run {
                 call.respond(err("keyword 不能为空")); return@get
+            }
+
+            if (!ChannelStateManager.isMainChannelAvailable()) {
+                call.respond(err("主微信搜索通道不可用: ${ChannelStateManager.mainChannelUnavailableReason()}"))
+                return@get
             }
 
             if (!AuthManager.isLoggedIn()) {
@@ -192,6 +209,9 @@ fun Route.wxAdapterRoutes() {
                 val result = gson.fromJson(resp.body?.string().orEmpty(), Map::class.java)
                 val baseResp = result?.get("base_resp") as? Map<*, *>
                 if (baseResp?.get("ret") != 0.0 && baseResp?.get("ret") != 0) {
+                    if (isMainChannelInvalidation(baseResp?.get("ret"))) {
+                        ChannelStateManager.markMainChannelInvalid("ret=200013")
+                    }
                     call.respond(err("搜索失败: ${baseResp?.get("err_msg")}"))
                     return@get
                 }

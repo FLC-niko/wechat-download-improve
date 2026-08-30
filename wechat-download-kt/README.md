@@ -26,7 +26,7 @@
 |---|---|
 | **微信登录** | 服务端主动扫码登录，自动获取 token/cookie/fakeid |
 | **通知机器人** | 企业微信 + 飞书，支持文字通知 + 二维码图片推送 |
-| **文章列表抓取** | 调 `appmsgpublish` 接口，仅取元数据（零风控风险） |
+| **文章列表抓取** | 微信读书 Web 为当前主采集通道；`appmsgpublish` 默认关闭 |
 | **SQLite 存储** | 订阅表 + 文章表，对齐 Python 版 schema |
 | **feed 接口** | `/api/feed/articles.json` 增量游标拉取 |
 | **适配壳** | `/api/v1/wx/*` 路由，让 Worker 不改代码就能对接 |
@@ -38,7 +38,7 @@
 
 ### 当前上线模式：不依赖 ADB
 
-默认配置不会执行 `adb devices`，也不会启动设备监督和自动扫码恢复。已有本地订阅会直接尝试主通道、微信读书 Web 与本地缓存；主微信登录失效不会阻断后两者。
+默认配置不会执行 `adb devices`，也不会启动设备监督和自动扫码恢复。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此默认关闭；已有本地订阅直接使用微信读书 Web 与本地缓存。
 
 ```yaml
 auth:
@@ -53,6 +53,10 @@ adb:
 
 rss:
   enabled: false
+
+wx:
+  main:
+    enabled: false
 ```
 
 需要恢复凭证时使用服务端扫码登录接口和机器人通知。默认也关闭启动后的自动扫码，避免 Worker 重启时打扰账号。将来确实需要设备自动恢复，再显式设置 `adb.enabled: true`。ADB 状态仍可通过以下接口查看：
@@ -114,7 +118,7 @@ adapter:
 
 ```text
 BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众号身份
-  → E-Ink（默认关闭）→ appmsgpublish → WeRead Web → SQLite 合并
+  → E-Ink（默认关闭）→ appmsgpublish（默认关闭）→ WeRead Web → SQLite 合并
   → 覆盖度决策 → 发布一条 ATD → Inbox COMPLETED → ACK
 ```
 
@@ -126,6 +130,8 @@ BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众
 - 重试耗尽或消息格式非法会进入当前 vhost 的 `dead-message-queue`，不再静默丢弃。
 
 当前 Web 通道采用 `createTime` 游标翻页，识别 `-2012`（凭证失效）、`-2014`（频控）、`-2041`（人工验证）、HTTP 429 与 5xx。单账号限流状态在进程内全局共享，冷却到期无需重启即可恢复。
+
+主微信 `ret=200013` 单独归类为 `INVALIDATED`：进程不会冷却后重试，状态接口会暴露 `main_invalidated` 和原因。写入新凭证可以清除旧凭证的失效标记，但只有显式设置 `wx.main.enabled: true` 才会重新启用该通道。
 
 ## 开源项目调研后的取舍
 

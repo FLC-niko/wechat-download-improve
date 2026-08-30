@@ -4,6 +4,7 @@ import com.wamp.download.auth.AuthManager
 import com.wamp.download.store.Article
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.SubscriptionStore
+import com.wamp.download.task.ChannelStateManager
 import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -26,6 +27,14 @@ fun Route.articleRoutes() {
             }
             val begin = call.parameters["begin"]?.toIntOrNull() ?: 0
             val count = call.parameters["count"]?.toIntOrNull() ?: 10
+
+            if (!ChannelStateManager.isMainChannelAvailable()) {
+                call.respond(mapOf(
+                    "success" to false,
+                    "error" to "主微信文章接口不可用: ${ChannelStateManager.mainChannelUnavailableReason()}",
+                ))
+                return@get
+            }
 
             if (!AuthManager.isLoggedIn()) {
                 call.respond(mapOf("success" to false, "error" to "未登录"))

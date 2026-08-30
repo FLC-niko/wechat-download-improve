@@ -2,6 +2,7 @@ package com.wamp.download.auth
 
 import com.google.gson.Gson
 import com.wamp.download.config.AppConfig
+import com.wamp.download.task.ChannelStateManager
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.file.Files
@@ -48,6 +49,7 @@ object AuthManager {
     }
 
     fun save(creds: WechatCredentials) {
+        val previous = credentials
         credentials = creds
         val file = File(AppConfig.credentialsFile)
         try {
@@ -63,6 +65,9 @@ object AuthManager {
             logger.info("凭证已保存: ${file.absolutePath}")
         } catch (e: Exception) {
             logger.error("凭证保存失败: ${e.message}")
+        }
+        if (creds.token != previous.token || creds.cookie != previous.cookie) {
+            ChannelStateManager.resetMainChannelAfterCredentialUpdate()
         }
     }
 

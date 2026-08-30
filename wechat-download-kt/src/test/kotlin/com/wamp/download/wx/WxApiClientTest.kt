@@ -6,11 +6,15 @@ import kotlin.test.assertEquals
 class WxApiClientTest {
 
     @Test
-    fun `频控错误码不会被识别为登录过期`() {
+    fun `200013 is a permanent channel invalidation instead of a temporary rate limit`() {
         assertEquals(
-            WxApiClient.TokenStatus.RATE_LIMITED,
+            WxApiClient.TokenStatus.INVALIDATED,
             WxApiClient.classifyTokenFailure("200013", "frequency control"),
         )
+    }
+
+    @Test
+    fun `generic rate limit without 200013 remains temporary`() {
         assertEquals(
             WxApiClient.TokenStatus.RATE_LIMITED,
             WxApiClient.classifyTokenFailure(null, "请求过于频繁，触发频控"),

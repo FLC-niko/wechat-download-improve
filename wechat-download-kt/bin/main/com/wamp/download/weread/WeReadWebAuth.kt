@@ -62,7 +62,6 @@ object WeReadWebAuth {
      * 由独立线程执行扫码登录流程，结束自动复位标志。
      */
     fun requestReloginIfNeeded(vid: String) {
-        if (!AppConfig.wereadAutoReloginEnabled && deviceRecoveryHandler == null) return
         if (!shouldRelogin(vid)) return
         deviceRecoveryHandler?.let {
             it(vid)
@@ -165,7 +164,6 @@ object WeReadWebAuth {
                         val webLoginVid = obj.get("webLoginVid")?.asString
                         if (!accessToken.isNullOrEmpty() && !webLoginVid.isNullOrEmpty()) {
                             val username = fetchUsername(webLoginVid)
-                            logger.info("微信读书登录成功: username=$username, vid=$webLoginVid")
                             return WeReadWebCredentials(
                                 wrSkey = accessToken,
                                 wrVid = webLoginVid,
@@ -174,6 +172,7 @@ object WeReadWebAuth {
                                 loginTime = System.currentTimeMillis(),
                                 lastRefreshTime = System.currentTimeMillis(),
                             )
+                            logger.info("微信读书登录成功: username=$username, vid=$webLoginVid")
                         }
                     } else {
                         val logicCode = obj.get("logicCode")?.asString ?: ""
@@ -287,32 +286,33 @@ object WeReadWebAuth {
         val creds = account.credentials
         if (creds.wrSkey.isEmpty() || creds.wrVid.isEmpty()) return false
         return try {
-            WeReadRequestGate.execute(vid) {
-                val req = Request.Builder()
-                    .url("$baseUrl/")
-                    .head()
-                    .header("Cookie", creds.toCookieString())
-                    .header("User-Agent", UA)
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        WeReadAccountPool.markRefreshFailed(vid)
-                        logger.warn("微信读书刷新失败（HTTP ${resp.code}），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
-                        false
+            val req = Request.Builder()
+                .url("$baseUrl/")
+                .head()
+                .header("Cookie", creds.toCookieString())
+                .header("User-Agent", UA)
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    WeReadAccountPool.markRefreshFailed(vid)
+                    logger.warn("微信读书刷新失败（HTTP ${resp.code}），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
+                    false
+                } else {
+                    val setCookies = resp.headers("set-cookie")
+                    if (setCookies.isEmpty()) {
+                        // 无 set-cookie：凭证仍有效，仅更新时间戳防频繁探测
+                        WeReadAccountPool.markRefreshed(vid)
+                        logger.debug("微信读书凭证仍有效（无 set-cookie）: vid=$vid")
+                        true
+                    } else if (WeReadAccountPool.updateFromSetCookie(vid, setCookies)) {
+                        // 拿到有效新凭证
+                        logger.debug("微信读书凭证刷新成功: vid=$vid")
+                        true
                     } else {
-                        val setCookies = resp.headers("set-cookie")
-                        if (setCookies.isEmpty()) {
-                            WeReadAccountPool.markRefreshed(vid)
-                            logger.debug("微信读书凭证仍有效（无 set-cookie）: vid=$vid")
-                            true
-                        } else if (WeReadAccountPool.updateFromSetCookie(vid, setCookies)) {
-                            logger.debug("微信读书凭证刷新成功: vid=$vid")
-                            true
-                        } else {
-                            WeReadAccountPool.markRefreshFailed(vid)
-                            logger.warn("微信读书凭证已被服务端清空（登录超时），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
-                            false
-                        }
+                        // set-cookie 全是清空（wr_skey=; Max-Age=0）→ 服务端已登出
+                        WeReadAccountPool.markRefreshFailed(vid)
+                        logger.warn("微信读书凭证已被服务端清空（登录超时），连续失败 ${WeReadAccountPool.get(vid)?.credentials?.refreshFailCount} 次: vid=$vid")
+                        false
                     }
                 }
             }

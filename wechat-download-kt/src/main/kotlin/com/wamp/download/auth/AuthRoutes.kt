@@ -1,6 +1,7 @@
 package com.wamp.download.auth
 
 import com.wamp.download.notify.WebhookNotifier
+import com.wamp.download.task.ChannelStateManager
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
@@ -26,6 +27,7 @@ fun Route.authRoutes(scope: CoroutineScope) {
             val creds = AuthManager.get()
             val loggedIn = AuthManager.isLoggedIn()
             val expired = AuthManager.isExpired()
+            val invalidated = ChannelStateManager.isMainChannelInvalidated()
             call.respond(mapOf(
                 "authenticated" to loggedIn,
                 "loggedIn" to loggedIn,
@@ -34,8 +36,10 @@ fun Route.authRoutes(scope: CoroutineScope) {
                 "fakeid" to creds.fakeid,
                 "expireTime" to creds.expireTime,
                 "isExpired" to expired,
+                "channelInvalidated" to invalidated,
                 "status" to when {
                     !loggedIn -> "未登录，请发起扫码登录"
+                    invalidated -> "主微信接口已失效（200013），当前使用回退通道"
                     expired -> "登录已过期，请重新登录"
                     else -> "登录正常"
                 }
@@ -43,7 +47,7 @@ fun Route.authRoutes(scope: CoroutineScope) {
         }
 
         post("/start") {
-            if (AuthManager.isLoggedIn() && !AuthManager.isExpired()) {
+            if (AuthManager.isLoggedIn() && !AuthManager.isExpired() && !ChannelStateManager.isMainChannelInvalidated()) {
                 call.respond(mapOf(
                     "success" to false,
                     "message" to "当前登录状态正常，无需重复登录"
