@@ -30,41 +30,38 @@
 | **SQLite 存储** | 订阅表 + 文章表，对齐 Python 版 schema |
 | **feed 接口** | `/api/feed/articles.json` 增量游标拉取 |
 | **适配壳** | `/api/v1/wx/*` 路由，让 Worker 不改代码就能对接 |
-| **后台轮询** | 定时拉取所有订阅号的最新文章 |
+| **MQ 任务采集** | 消费 BTA，按覆盖度执行多通道降级，向同一 vhost 回复一条终态 ATD |
+| **后台轮询** | 可选；MQ Worker 模式默认关闭，避免与任务争抢账号配额 |
 | **登录提醒** | 凭证过期前 24h/6h 自动 webhook 通知 |
 
 ## 快速开始
 
-### ADB 自动恢复设备管理
+### 当前上线模式：不依赖 ADB
 
-Worker 不保存手机 IP 或序列号。启动时执行 `adb devices -l`，运行期间默认每
-15 秒重新探查一次：只有状态为 `device` 的设备进入在线池，`offline` 和
-`unauthorized` 不参与自动恢复。
+默认配置不会执行 `adb devices`，也不会启动设备监督和自动扫码恢复。已有本地订阅会直接尝试主通道、微信读书 Web 与本地缓存；主微信登录失效不会阻断后两者。
 
 ```yaml
+auth:
+  auto_recovery_enabled: false
+
+weread:
+  auto_relogin_enabled: false
+
 adb:
-  enabled: true
+  enabled: false
   poll_interval_ms: 15000
+
+rss:
+  enabled: false
 ```
 
-当前恢复模式可通过以下接口查看：
+需要恢复凭证时使用服务端扫码登录接口和机器人通知。默认也关闭启动后的自动扫码，避免 Worker 重启时打扰账号。将来确实需要设备自动恢复，再显式设置 `adb.enabled: true`。ADB 状态仍可通过以下接口查看：
 
 ```bash
 curl http://localhost:5000/api/adb/status
 ```
 
-当至少有一台 ADB 设备在线时模式为 `AUTO_RECOVERABLE`；没有在线设备时为
-`MANUAL_ONLY`。设备接入、断开或授权状态变化会在下一次探查后自动切换。当前
-恢复调度器使用返回的 `serial + user_ids` 槽位路由到主空间或分身空间，并通过
-`/api/weread/account/bind` 保存账号与设备用户空间绑定。
-
-失效账号可通过 `/api/weread/account/recover` 入队恢复。目标设备离线时，固定绑定账号
-保持挂起并等待热插拔；只有明确设置 `ELASTIC_DEVICE` 才允许借用其他在线设备。没有在线
-设备时不会执行任何 ADB 命令，只走机器人通知降级。
-
-AAOS 登录责任链位于 `archive-system-crawling-android-master/crawlingservice`，部署前先构建
-`app-debug.apk`，再运行 `./deploy_hyperos_phones.sh [/path/to/app-debug.apk]`。脚本会动态解析
-每台设备的 Android 用户 ID，不假定 XSpace 为 999。
+关闭 ADB 时 `/api/weread/account/recover` 会明确拒绝设备恢复请求，可使用 `/api/weread/login` 发起微信读书手动扫码。
 
 ### 1. 配置
 
@@ -84,6 +81,7 @@ store:
   db_path: data/rss.db
 
 rss:
+  enabled: false
   poll_interval: 3600
   articles_per_poll: 10
 
@@ -99,16 +97,41 @@ adapter:
 ### 2. 构建
 
 ```bash
-./gradlew build
+./gradlew clean test installDist
 ```
 
 ### 3. 运行
 
 ```bash
-./gradlew run
-# 或
-java -jar build/libs/wechat-download-kt-1.0.0.jar
+./build/install/wechat-download-kt/bin/wechat-download-kt
 ```
+
+普通 Gradle jar 不包含全部运行时依赖，生产环境请使用 `installDist` 生成的目录整体部署。
+
+## MQ 任务与降级语义
+
+任务路径如下：
+
+```text
+BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众号身份
+  → E-Ink（默认关闭）→ appmsgpublish → WeRead Web → SQLite 合并
+  → 覆盖度决策 → 发布一条 ATD → Inbox COMPLETED → ACK
+```
+
+- `SUCCEEDED`：窗口内至少采集到一个去重 URL。
+- `EMPTY`：远端通道已经翻到窗口起点以前或明确到底，并确认窗口内没有文章。
+- `FAILED`：输入非法、账号无法解析，或所有通道都不能证明窗口已覆盖；不会把“不确定”误报成空。
+- ATD 发布使用 publisher confirm；发布失败会抛出，由原 BTA 走 broker 重试。重试复用 Inbox 中的 `resultEventId`，下游可按事件 ID 幂等。
+- 任务执行期间每分钟续租；broker redelivery 可立即接管因进程崩溃遗留的 `PROCESSING` 记录。
+- 重试耗尽或消息格式非法会进入当前 vhost 的 `dead-message-queue`，不再静默丢弃。
+
+当前 Web 通道采用 `createTime` 游标翻页，识别 `-2012`（凭证失效）、`-2014`（频控）、`-2041`（人工验证）、HTTP 429 与 5xx。单账号限流状态在进程内全局共享，冷却到期无需重启即可恢复。
+
+## 开源项目调研后的取舍
+
+- 借鉴 `weread-omni`：E-Ink `/mp/chapters`、synckey 增量、`-2014/-2041` 明确错误语义和 refresh token 会话模型。E-Ink 当前保留为实验通道，默认关闭，不作为上线前置条件。
+- 借鉴 `weread-mp`：Web `/web/mp/articles` 使用最老文章 `createTime` 作为下一页游标，短页表示到底。
+- 结合 `we-mp-rss` 的频控反馈：按账号冷却、全局串行与最小请求间隔，避免多个入口各自限流造成叠加请求。
 
 ### 4. 发起登录
 
@@ -225,7 +248,14 @@ src/main/kotlin/com/wamp/download/
 ├── store/
 │   ├── Database.kt           # SQLite + Exposed 表定义
 │   ├── SubscriptionStore.kt  # 订阅管理 CRUD
-│   └── ArticleStore.kt       # 文章存储 + feed 查询
+│   ├── ArticleStore.kt       # 文章存储 + feed 查询
+│   └── InboxStore.kt         # MQ 幂等、稳定结果事件 ID 与执行租约
+├── task/
+│   ├── TaskProcessor.kt      # 覆盖度驱动的采集编排与终态发布
+│   └── CollectionCoverage.kt # 覆盖范围和 EMPTY 判定纯函数
+├── rabbitmq/                 # 多 vhost、confirm、重试、ATD 与 DLQ
+├── weread/                   # Web 多账号池、全局限流、错误分类与翻页
+│   └── eink/                 # 可选 E-Ink 增量实验通道
 ├── feed/FeedRoutes.kt        # /api/feed/articles.json 增量接口
 ├── adapter/WxAdapterRoutes.kt# /api/v1/wx/* 适配壳
 ├── notify/
@@ -233,6 +263,12 @@ src/main/kotlin/com/wamp/download/
 │   └── LoginReminder.kt      # 登录过期提醒
 └── poller/RssPoller.kt       # 后台轮询器
 ```
+
+`bin/` 是历史镜像目录，Gradle 构建只使用 `src/`；发布和修改均以 `src/` 为准。
+
+## 上线前安全检查
+
+不要把 `config.yaml`、账号 cookie、RabbitMQ 密码、Webhook URL 或适配壳密钥提交到仓库。若这些值曾出现在受版本控制的文档或历史提交中，应先轮换凭证，再清理仓库历史。
 
 ## 与 Worker 对接
 

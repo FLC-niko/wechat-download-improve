@@ -8,10 +8,12 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.client.j2se.MatrixToImageWriter
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Disabled
 import java.io.File
 import java.nio.file.FileSystems
 import kotlin.test.assertTrue
 
+@Disabled("需要真实 ADB 设备，仅供人工验收")
 class FullAutoAdbScanTest {
 
     private val deviceId = "192.168.124.13:38711"

@@ -149,6 +149,8 @@ class RabbitMqClientManager(
         ch.queueBind(GZH_TASK_QUEUE, EXCHANGE_NEW_MEDIA, GZH_TASK_ROUTING)
         ch.queueDeclare(GZH_RESULT_QUEUE, true, false, false, null)
         ch.queueBind(GZH_RESULT_QUEUE, EXCHANGE_NEW_MEDIA, GZH_RESULT_ROUTING)
+        ch.queueDeclare(GZH_DEAD_QUEUE, true, false, false, null)
+        ch.queueBind(GZH_DEAD_QUEUE, EXCHANGE_NEW_MEDIA, GZH_DEAD_ROUTING)
         ch.queueDeclare(SERVER_STATUS_QUEUE, true, false, false, null)
     }
 
@@ -252,12 +254,14 @@ class RabbitMqClientManager(
     private fun queueRouting(queue: String): String = when (queue) {
         GZH_TASK_QUEUE -> GZH_TASK_ROUTING
         GZH_RESULT_QUEUE -> GZH_RESULT_ROUTING
+        GZH_DEAD_QUEUE -> GZH_DEAD_ROUTING
         else -> queue
     }
 
     private fun queueForRoutingKey(routingKey: String): String = when (routingKey) {
         GZH_TASK_ROUTING -> GZH_TASK_QUEUE
         GZH_RESULT_ROUTING -> GZH_RESULT_QUEUE
+        GZH_DEAD_ROUTING -> GZH_DEAD_QUEUE
         else -> routingKey
     }
 
@@ -301,10 +305,10 @@ class RabbitMqClientManager(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: RabbitTaskFormatException) {
-                    logger.warn("【RabbitMQ】消息格式非法，拒绝且不重新入队: ${e.message}")
+                    logger.warn("【RabbitMQ】消息格式非法，转入死信队列: ${e.message}")
                     if (!autoAck) {
-                        runCatching { rejectWithoutRequeue(ch, ctx) }
-                            .onFailure { logger.error("【RabbitMQ】拒绝格式非法消息失败", it) }
+                        runCatching { moveToDeadLetter(ch, ctx, e) }
+                            .onFailure { logger.error("【RabbitMQ】格式非法消息转死信失败", it) }
                     }
                 } catch (e: Exception) {
                     logger.error("【RabbitMQ】消费处理异常", e)
@@ -331,20 +335,28 @@ class RabbitMqClientManager(
         }
     }
 
-    private suspend fun rejectWithoutRequeue(ch: Channel, ctx: DeliveryContext) {
+    private suspend fun moveToDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
         channelOperationMutex.withLock {
             if (!ch.isOpen) {
-                logger.warn("【RabbitMQ】拒绝格式非法消息时 channel 已关闭；消息将由 broker 重新投递")
+                logger.warn("【RabbitMQ】转死信时 channel 已关闭；消息将由 broker 重新投递")
                 return
             }
-            ch.basicNack(ctx.delivery.envelope.deliveryTag, false, false)
+            val headers = ctx.headers.toMutableMap().apply {
+                put("x-last-error", error.javaClass.simpleName)
+                put("x-original-queue", ctx.queue)
+            }
+            publishAndConfirm(
+                ch = ch,
+                exchange = EXCHANGE_NEW_MEDIA,
+                routingKey = GZH_DEAD_ROUTING,
+                properties = ctx.delivery.properties.builder().headers(headers).build(),
+                body = ctx.body,
+            )
+            ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
         }
     }
 
-    /**
-     * 将失败消息重新发布并增加重试次数；超过上限后拒绝且不重新入队。
-     * 当前 RabbitMQ 队列清单没有配置 DLQ，不能把失败消息转发到不存在的队列。
-     */
+    /** 将失败消息重新发布并增加重试次数；超过上限后可靠转入死信队列。 */
     private suspend fun retryOrDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
         try {
             if (shouldRequeue(ctx) && TASK_RETRY_DELAY_MS > 0) {
@@ -373,8 +385,17 @@ class RabbitMqClientManager(
                     ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
                     logger.warn("【RabbitMQ】任务处理失败，已安排第 $nextRetry 次重试")
                 } else {
-                    ch.basicNack(ctx.delivery.envelope.deliveryTag, false, false)
-                    logger.error("【RabbitMQ】任务重试次数耗尽；当前 vhost 未配置 DLQ，消息已拒绝且不重新入队", error)
+                    headers["x-original-queue"] = ctx.queue
+                    val deadProperties = ctx.delivery.properties.builder().headers(headers).build()
+                    publishAndConfirm(
+                        ch = ch,
+                        exchange = EXCHANGE_NEW_MEDIA,
+                        routingKey = GZH_DEAD_ROUTING,
+                        properties = deadProperties,
+                        body = ctx.body,
+                    )
+                    ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
+                    logger.error("【RabbitMQ】任务重试次数耗尽，已转入 $GZH_DEAD_QUEUE", error)
                 }
             }
         } catch (e: CancellationException) {

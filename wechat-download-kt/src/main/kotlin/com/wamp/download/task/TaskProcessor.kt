@@ -20,6 +20,7 @@ import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.weread.WeReadWebClient
+import com.wamp.download.weread.eink.WeReadEinkSyncService
 import com.wamp.download.wx.WxApiClient
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
@@ -48,6 +49,7 @@ class TaskProcessor(
     private val weReadWebClient: WeReadWebClient = WeReadWebClient(),
     private val loginChecker: LoginChecker = LoginChecker(),
     private val resultPublisher: ResultQueuePublisher? = null,
+    private val einkSyncService: WeReadEinkSyncService? = null,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(TaskProcessor::class.java)
@@ -89,83 +91,69 @@ class TaskProcessor(
     private suspend fun processTask(task: ProcessingTask) {
         logger.info("【任务处理】开始: gzh=${task.gzhName}, 日期=${task.dateRange}, jobId=${task.jobId}")
 
-        // 1. 等待登录恢复（如果正在恢复）
-        loginChecker.waitForRecoveryComplete()
-
-        // 2. 检查 token 状态；频控不是登录失效，不能触发公众号扫码
-        when (val tokenStatus = loginChecker.checkTokenStatus()) {
-            WxApiClient.TokenStatus.VALID -> Unit
-            WxApiClient.TokenStatus.RATE_LIMITED -> {
-                logger.warn("【任务处理】token 探测触发频控，降级到 L2: gzh=${task.gzhName}")
-                ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
-            }
-            WxApiClient.TokenStatus.UNAVAILABLE -> {
-                logger.warn("【任务处理】token 探测暂不可用，跳过扫码并继续尝试回退: gzh=${task.gzhName}")
-            }
-            WxApiClient.TokenStatus.EXPIRED -> {
-                logger.warn("【任务处理】token 已失效，触发登录恢复: gzh=${task.gzhName}")
-                loginChecker.startRecoveryAndWait()
-                // 恢复后再次检查；频控/暂不可用都不应再次触发扫码
-                if (loginChecker.checkTokenStatus(forceRefresh = true) == WxApiClient.TokenStatus.EXPIRED) {
-                    logger.error("【任务处理】登录恢复失败，发布失败结果: gzh=${task.gzhName}")
-                    publishFailed(task, "AUTH_RECOVERY_FAILED", "登录恢复失败")
-                    return
-                }
-            }
-        }
-
-        // 3. 搜索公众号 → 获取 fakeid
-        val fakeid = try {
-            findOrCreateSubscription(task.gzhName)
-        } catch (e: Exception) {
-            logger.error("【任务处理】搜索公众号失败: gzh=${task.gzhName}, error=${e.message}")
-            // 只有明确的登录失效才触发恢复；频控继续保持 L2 降级语义
-            if (e is WxApiClient.WxApiException && e.isRateLimited) {
-                ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
-            } else if ((e is WxApiClient.WxApiException && e.isAuthExpired) ||
-                e.message?.contains("未登录") == true
-            ) {
-                loginChecker.startRecoveryAndWait()
-            }
-            publishFailed(task, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败")
-            return
-        }
-
-        if (fakeid.isNullOrEmpty()) {
-            logger.warn("【任务处理】公众号不存在: gzh=${task.gzhName}，发布失败结果")
-            publishFailed(task, "ACCOUNT_NOT_FOUND", "公众号不存在")
-            return
-        }
-
-        val subscription = SubscriptionStore.get(fakeid)
         val (startTs, endTs) = parseDateRange(task.dateRange)
-
-        // --- 工业级回退链路 L1 → L2 → L3 ---
-        val (articles, sourceName) =
-            // L1: 主通道（带频控降级检查 + 重试 + 退避）
-            fetchViaMainChannel(fakeid)?.takeIf { it.isNotEmpty() }?.let { it to "main" }
-                // L2: 微信读书官方直连
-                ?: fetchFromWeRead(task.gzhName, fakeid, subscription, startTs).takeIf { it.isNotEmpty() }?.let { it to "weread-web" }
-                // L3: 本地缓存兜底
-                ?: fetchFromLocalCache(fakeid, startTs, endTs).takeIf { it.isNotEmpty() }?.let { it to "cache" }
-                ?: run {
-                    // 全链路失败：告警 + FAILED
-                    logger.error("【任务处理】L1/L2/L3 全部失败，发布失败结果: gzh=${task.gzhName}")
-                    publishFailed(task, "ARTICLE_FETCH_FAILED", "L1/L2/L3 全部采集失败")
-                    return
-                }
-
-        logger.info("【任务处理】获取到 ${articles.size} 篇文章: gzh=${task.gzhName} (source=$sourceName)")
-
-        // 按日期范围过滤
-        val filtered = if (startTs != null && endTs != null) {
-            articles.filter { it.publishTime in startTs..endTs }
-        } else {
-            articles
+        if (startTs == null || endTs == null) {
+            publishFailed(task, "INVALID_CAPTURE_WINDOW", "采集时间窗口格式非法或起止时间反向", retryable = false)
+            return
         }
 
-        // 保存到数据库
-        val articlesToSave = filtered.map { article ->
+        // 本地订阅是所有回退通道共享的身份，不应因主微信登录失效而被挡住。
+        var subscription = SubscriptionStore.findByNickname(task.gzhName)
+        if (subscription == null) {
+            if (!ensureMainLoginForLookup(task)) return
+            subscription = try {
+                findOrCreateSubscription(task.gzhName)?.let { SubscriptionStore.get(it) }
+            } catch (e: Exception) {
+                logger.error("【任务处理】搜索公众号失败: gzh=${task.gzhName}, error=${e.message}")
+                if (e is WxApiClient.WxApiException && e.isRateLimited) {
+                    ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+                }
+                publishFailed(task, "ACCOUNT_LOOKUP_FAILED", e.message ?: "公众号搜索失败", retryable = false)
+                return
+            }
+        }
+
+        if (subscription == null) {
+            logger.warn("【任务处理】公众号不存在: gzh=${task.gzhName}，发布失败结果")
+            publishFailed(task, "ACCOUNT_NOT_FOUND", "公众号不存在", retryable = false)
+            return
+        }
+
+        val fakeid = subscription.fakeid
+        val canUseEink = AppConfig.wereadEinkEnabled &&
+            einkSyncService != null &&
+            einkSyncService.canSync(subscription)
+
+        val sourceResults = mutableListOf<SourceFetchResult>()
+        if (canUseEink) {
+            fetchFromEink(subscription, startTs, endTs)?.let(sourceResults::add)
+        }
+        if (sourceResults.none { it.coverageComplete }) {
+            sourceResults += fetchViaMainChannel(fakeid, startTs)
+        }
+        if (sourceResults.none { it.coverageComplete }) {
+            sourceResults += fetchFromWeRead(task.gzhName, fakeid, subscription, startTs)
+        }
+
+        // 缓存永远参与合并，可补远端部分失败时已经采集过的数据；但缓存本身不能证明空窗口。
+        val cached = fetchFromLocalCache(fakeid, startTs, endTs)
+        val articles = (sourceResults.flatMap { it.articles } + cached)
+            .filter { it.link.isNotBlank() }
+            .distinctBy { it.link }
+        val coverageComplete = sourceResults.any { it.coverageComplete }
+        val sourceName = sourceResults.filter { it.articles.isNotEmpty() || it.coverageComplete }
+            .joinToString("+") { it.source }
+            .ifBlank { if (cached.isNotEmpty()) "cache" else "none" }
+
+        logger.info(
+            "【任务处理】采集汇总: gzh=${task.gzhName}, source=$sourceName, " +
+                "articles=${articles.size}, coverageComplete=$coverageComplete",
+        )
+
+        val filtered = articles.filter { it.publishTime in startTs..endTs }
+
+        // 保存所有本轮有效文章，避免仅保存窗口内数据导致后续缓存断层。
+        val articlesToSave = articles.filter { it.publishTime > 0 }.map { article ->
             Article(
                 fakeid = fakeid,
                 aid = article.aid,
@@ -181,20 +169,64 @@ class TaskProcessor(
             ArticleStore.saveAll(fakeid, articlesToSave, source = "task")
         }
 
-        // 发布结果
-        val urls = filtered.map { it.link }
-        task.publisher?.let { publisher ->
-            if (task.v2Task != null) {
-                publisher.publish(
-                    input = task.v2Task,
-                    status = if (urls.isEmpty()) "EMPTY" else "SUCCEEDED",
-                    seedArticles = urls.distinct().map { SeedArticle(url = it) },
-                )
-            } else {
-                publisher.publishArticles(task.gzhName, task.jobId, task.correlationId, task.dateRange, urls)
+        val urls = filtered.map { it.link }.distinct()
+        if (CollectionCoverage.terminalDecision(urls.size, coverageComplete) ==
+            CollectionTerminalDecision.FAILED_INCOMPLETE
+        ) {
+            val details = sourceResults.joinToString("; ") { "${it.source}:${it.detail}" }
+            logger.error("【任务处理】采集范围未覆盖，不能误报 EMPTY: gzh=${task.gzhName}, $details")
+            publishFailed(
+                task,
+                "COVERAGE_INCOMPLETE",
+                "采集通道未能覆盖请求时间窗口，无法确认该窗口为空",
+                retryable = false,
+            )
+            return
+        }
+
+        publishTerminal(task, urls)
+        logger.info("【任务处理】完成: gzh=${task.gzhName}, 匹配 ${filtered.size}/${articles.size} 篇, 发布 ${urls.size} 条结果")
+    }
+
+    private suspend fun ensureMainLoginForLookup(task: ProcessingTask): Boolean {
+        loginChecker.waitForRecoveryComplete()
+        return when (loginChecker.checkTokenStatus()) {
+            WxApiClient.TokenStatus.VALID -> true
+            WxApiClient.TokenStatus.RATE_LIMITED -> {
+                ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
+                publishFailed(task, "ACCOUNT_LOOKUP_RATE_LIMITED", "公众号尚未入库，主通道频控，暂时无法解析账号", false)
+                false
+            }
+            WxApiClient.TokenStatus.UNAVAILABLE -> {
+                publishFailed(task, "ACCOUNT_LOOKUP_UNAVAILABLE", "公众号尚未入库，主通道暂不可用", false)
+                false
+            }
+            WxApiClient.TokenStatus.EXPIRED -> {
+                // 当前上线模式不依赖 ADB；无自动恢复能力时快速返回明确终态，避免任务阻塞数十分钟。
+                if (!AppConfig.adbEnabled) {
+                    publishFailed(task, "ACCOUNT_LOOKUP_AUTH_REQUIRED", "公众号尚未入库，需要人工恢复主微信登录", false)
+                    false
+                } else {
+                    loginChecker.startRecoveryAndWait()
+                    val recovered = loginChecker.checkTokenStatus(forceRefresh = true) == WxApiClient.TokenStatus.VALID
+                    if (!recovered) publishFailed(task, "AUTH_RECOVERY_FAILED", "登录恢复失败", false)
+                    recovered
+                }
             }
         }
-        logger.info("【任务处理】完成: gzh=${task.gzhName}, 匹配 ${filtered.size}/${articles.size} 篇, 发布 ${urls.size} 条结果")
+    }
+
+    private suspend fun publishTerminal(task: ProcessingTask, urls: List<String>) {
+        val publisher = task.publisher ?: return
+        if (task.v2Task != null) {
+            publisher.publish(
+                input = task.v2Task,
+                status = if (urls.isEmpty()) "EMPTY" else "SUCCEEDED",
+                seedArticles = urls.map { SeedArticle(url = it) },
+            )
+        } else {
+            publisher.publishArticles(task.gzhName, task.jobId, task.correlationId, task.dateRange, urls)
+        }
     }
 
     private data class ProcessingTask(
@@ -206,6 +238,58 @@ class TaskProcessor(
         val v2Task: GzhAutoBta?,
     )
 
+    private data class SourceFetchResult(
+        val source: String,
+        val articles: List<WxApiClient.WxArticle>,
+        val coverageComplete: Boolean,
+        val detail: String,
+    )
+
+    private fun fetchFromEink(
+        subscription: Subscription,
+        startTs: Long,
+        endTs: Long,
+    ): SourceFetchResult? {
+        val service = einkSyncService ?: return null
+        return try {
+            service.syncIfNeeded(subscription, startTs, endTs)
+
+            val (articles, total) = ArticleStore.getByFakeidAndRange(
+                subscription.fakeid,
+                startTime = startTs,
+                endTime = endTs,
+                limit = 5_000,
+            )
+            logger.info(
+                "【E-Ink】同步结果已从缓存读取: fakeid=${subscription.fakeid.take(8)}..., " +
+                    "matched=${articles.size}/$total",
+            )
+            val covered = service.isRangeCovered(subscription, startTs, endTs)
+            SourceFetchResult(
+                source = "eink",
+                articles = articles.map { it.toWxArticle() },
+                coverageComplete = covered,
+                detail = if (covered) "range-covered" else "sync-finished-without-range-coverage",
+            )
+        } catch (error: Exception) {
+            logger.warn(
+                "【E-Ink】同步失败，转 Web 回退: fakeid=${subscription.fakeid.take(8)}..., ${error.message}",
+                error,
+            )
+            null
+        }
+    }
+
+    private fun Article.toWxArticle() = WxApiClient.WxArticle(
+        aid = aid,
+        title = title,
+        link = link,
+        digest = digest,
+        cover = cover,
+        author = author,
+        publishTime = publishTime,
+    )
+
     /**
      * L1 主通道：appmsgpublish 获取文章列表（带降级检查 + 重试 + 退避）
      *
@@ -213,19 +297,30 @@ class TaskProcessor(
      * - 触发频控（ret=200013）→ 标记降级，立即返回 null
      * - 其他异常/空结果 → 按退避策略重试（retry_max 次）
      */
-    private suspend fun fetchViaMainChannel(fakeid: String): List<WxApiClient.WxArticle>? {
+    private suspend fun fetchViaMainChannel(fakeid: String, targetStartTs: Long): SourceFetchResult {
         if (!ChannelStateManager.isMainChannelAvailable()) {
             logger.info("【L1 主通道】处于频控降级期（剩余 ${ChannelStateManager.remainingDegradedSeconds()}s），直接走回退")
-            return null
+            return SourceFetchResult("main", emptyList(), false, "channel-degraded")
         }
 
+        val pageSize = 20
         var backoffMs = AppConfig.mainBackoffBase * 1000
-        repeat(AppConfig.mainRetryMax) { attempt ->
+        for (attempt in 0 until AppConfig.mainRetryMax) {
             val round = attempt + 1
             try {
-                val articles = wxClient.fetchArticles(fakeid, begin = 0, count = 20)
+                val articles = wxClient.fetchArticles(fakeid, begin = 0, count = pageSize)
                 if (articles.isNotEmpty()) {
-                    return articles
+                    val covered = CollectionCoverage.pageCoversWindowStart(
+                        publishTimes = articles.map { it.publishTime },
+                        requestedPageSize = pageSize,
+                        windowStart = targetStartTs,
+                    )
+                    return SourceFetchResult(
+                        source = "main",
+                        articles = articles,
+                        coverageComplete = covered,
+                        detail = if (covered) "range-covered" else "newest-page-only",
+                    )
                 }
                 logger.warn("【L1 主通道】返回空列表 (第 $round/${AppConfig.mainRetryMax} 次)")
             } catch (e: Exception) {
@@ -236,7 +331,11 @@ class TaskProcessor(
                     // 频控：标记降级，直接走回退（不继续重试，避免加剧风控）
                     logger.warn("【L1 主通道】触发频控(ret=200013)，标记降级 ${AppConfig.mainDegradedDuration}s")
                     ChannelStateManager.markMainChannelFreqControl(AppConfig.mainDegradedDuration * 1000)
-                    return null
+                    return SourceFetchResult("main", emptyList(), false, "rate-limited")
+                }
+                if (e is WxApiClient.WxApiException && e.isAuthExpired) {
+                    logger.warn("【L1 主通道】登录已失效，不阻塞任务，立即转回退通道")
+                    return SourceFetchResult("main", emptyList(), false, "auth-expired")
                 }
                 logger.warn("【L1 主通道】异常 (第 $round/${AppConfig.mainRetryMax} 次): ${e.message}")
             }
@@ -248,7 +347,7 @@ class TaskProcessor(
                 backoffMs = (backoffMs * 2).coerceAtMost(AppConfig.mainBackoffMax * 1000)
             }
         }
-        return null
+        return SourceFetchResult("main", emptyList(), false, "retry-exhausted-or-empty")
     }
 
     /**
@@ -263,10 +362,10 @@ class TaskProcessor(
         fakeid: String,
         subscription: Subscription?,
         targetStartTs: Long?,
-    ): List<WxApiClient.WxArticle> {
+    ): SourceFetchResult {
         if (com.wamp.download.weread.WeReadAccountPool.size() == 0) {
             logger.warn("【L2 微信读书】账号池为空，跳过回退通道")
-            return emptyList()
+            return SourceFetchResult("weread-web", emptyList(), false, "account-pool-empty")
         }
 
         // 1. 已缓存 mpId
@@ -283,18 +382,18 @@ class TaskProcessor(
 
         if (mpId.isBlank()) {
             logger.warn("【L2 微信读书】无法定位公众号 mpId: $gzhName（可通过 /api/weread/bind 用 fakeid 预绑定）")
-            return emptyList()
+            return SourceFetchResult("weread-web", emptyList(), false, "mpid-unresolved")
         }
 
         // 翻页抓取（空页重试 + 退避 + 翻页抖动在 fetchAllArticles 内部实现）
-        val articles = try {
-            weReadWebClient.fetchAllArticles(mpId, targetStartTs)
+        val result = try {
+            weReadWebClient.fetchAllArticlesResult(mpId, targetStartTs)
         } catch (e: Exception) {
             logger.warn("【L2 微信读书】抓取失败: ${e.message}")
-            return emptyList()
+            return SourceFetchResult("weread-web", emptyList(), false, "exception:${e.javaClass.simpleName}")
         }
 
-        return articles.map {
+        val articles = result.articles.map {
             WxApiClient.WxArticle(
                 aid = it.id,
                 title = it.title,
@@ -305,6 +404,12 @@ class TaskProcessor(
                 publishTime = it.publishTime,
             )
         }
+        return SourceFetchResult(
+            source = "weread-web",
+            articles = articles,
+            coverageComplete = result.coverageComplete,
+            detail = "outcome=${result.lastOutcome},pages=${result.pagesFetched}",
+        )
     }
 
     /**
@@ -316,7 +421,7 @@ class TaskProcessor(
         endTs: Long?,
     ): List<WxApiClient.WxArticle> {
         val (cached, total) = try {
-            ArticleStore.getByFakeidAndRange(fakeid, startTs, endTs, limit = 200)
+            ArticleStore.getByFakeidAndRange(fakeid, startTs, endTs, limit = 5_000)
         } catch (e: Exception) {
             logger.warn("【L3 本地缓存】查询失败: ${e.message}")
             return emptyList()
@@ -372,21 +477,13 @@ class TaskProcessor(
         return fakeid
     }
 
-    private suspend fun publishEmpty(task: GzhAutoFromBackend, publisher: ResultQueuePublisher? = resultPublisher) {
-        publisher?.publishEmptyResult(
-            gzhName = task.gzhName,
-            jobId = task.jobId,
-            correlationId = task.correlationId,
-            tempTimeStamp = task.tempTimeStamp,
-        )
-    }
-
     private suspend fun publishFailed(
         task: ProcessingTask,
         code: String,
         message: String,
+        retryable: Boolean,
     ) {
-        val error = AtdError(code = code, message = message, retryable = code != "ACCOUNT_NOT_FOUND")
+        val error = AtdError(code = code, message = message, retryable = retryable)
         val publisher = task.publisher ?: return
         if (task.v2Task != null) {
             publisher.publish(input = task.v2Task, status = "FAILED", error = error)

@@ -19,11 +19,13 @@ object AppConfig {
 
     // 微信凭证文件
     val credentialsFile: String get() = getString("auth.credentials_file", "data/.credentials.json")
+    val authAutoRecoveryEnabled: Boolean get() = getBool("auth.auto_recovery_enabled", false)
 
     // 数据库
     val dbPath: String get() = getString("store.db_path", "data/rss.db")
 
     // RSS 轮询
+    val rssEnabled: Boolean get() = getBool("rss.enabled", false)
     val rssPollInterval: Long get() = getLong("rss.poll_interval", 3600L)
     val articlesPerPoll: Int get() = getInt("rss.articles_per_poll", 10)
 
@@ -58,6 +60,18 @@ object AppConfig {
     val wereadWebBaseUrl: String get() = getString("weread.web_base_url", "https://weread.qq.com")
     val wereadCredentialsFile: String get() = getString("weread.credentials_file", "data/.weread_web_credentials.json")
 
+    // 微信读书 E-Ink 增量通道
+    val wereadEinkEnabled: Boolean get() = getBool("weread.eink.enabled", false)
+    val wereadEinkBaseUrl: String get() = getString("weread.eink.base_url", "https://i.weread.qq.com")
+    val wereadEinkCredentialsFile: String
+        get() = getString("weread.eink.credentials_file", "data/.weread_eink_credentials.json")
+    val wereadEinkSyncInterval: Long
+        get() = getLong("weread.eink.sync_interval", 86_400L).coerceAtLeast(60L)
+    val wereadEinkPageSize: Int
+        get() = getInt("weread.eink.page_size", 50).coerceIn(1, 100)
+    val wereadEinkMaxPages: Int
+        get() = getInt("weread.eink.max_pages", 1000).coerceAtLeast(1)
+
     // 多账号池：账号凭证存储目录 + 频控冷却时长
     val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")
     val wereadFreqControlCooldown: Long get() = getLong("weread.freq_control_cooldown", 300L)
@@ -65,6 +79,7 @@ object AppConfig {
     // wr_skey 双层刷新保活（wr_skey 有效期 5400s，刷新间隔必须 < 5400s）
     val wereadRefreshInterval: Long get() = getLong("weread.refresh_interval", 3000L)   // 50 分钟
     val wereadRefreshFailThreshold: Int get() = getInt("weread.refresh_fail_threshold", 3)
+    val wereadAutoReloginEnabled: Boolean get() = getBool("weread.auto_relogin_enabled", false)
 
     // 翻页控制
     val wereadContentInterval: Long get() = getLong("weread.content_interval", 5L)      // 翻页基础间隔（秒）
@@ -83,7 +98,7 @@ object AppConfig {
     // ADB 自动恢复设备探查
     val adbPollIntervalMs: Long
         get() = getLong("adb.poll_interval_ms", 15_000L).coerceAtLeast(1_000L)
-    val adbEnabled: Boolean get() = getBool("adb.enabled", true)
+    val adbEnabled: Boolean get() = getBool("adb.enabled", false)
 
     // 预热（拉文章前先调公众号信息接口触发关联）
     val wereadWarmupEnabled: Boolean get() = getBool("weread.warmup_enabled", true)

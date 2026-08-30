@@ -44,6 +44,23 @@ object Articles : IntIdTable("articles") {
     }
 }
 
+object WeReadEinkSyncStates : Table("weread_eink_sync_states") {
+    val accountVid = varchar("account_vid", 255)
+    val fakeid = varchar("fakeid", 64)
+    val mpId = text("mp_id")
+    val synckey = long("synckey").nullable()
+    val lastSyncAt = long("last_sync_at").default(0L)
+    val lastSuccessAt = long("last_success_at").default(0L)
+    val coverageStart = long("coverage_start").nullable()
+    val coverageEnd = long("coverage_end").nullable()
+    val historyComplete = bool("history_complete").default(false)
+    val status = varchar("status", 32).default("NEVER_SYNCED")
+    val errorType = varchar("error_type", 64).default("")
+    val errorMessage = text("error_message").default("")
+
+    override val primaryKey = PrimaryKey(accountVid, mpId)
+}
+
 object RabbitInbox : Table("rabbit_inbox") {
     val idempotencyKey = varchar("idempotency_key", 255)
     val eventId = varchar("event_id", 255)
@@ -79,11 +96,12 @@ object Database {
                 st.execute("PRAGMA busy_timeout=5000")
             }
             migrateRabbitInbox(conn)
+            migrateWeReadEinkSyncStates(conn)
         }
 
         // 建表单独一个事务（createMissingTablesAndColumns 可为旧表补齐新增列）
         transaction {
-            SchemaUtils.createMissingTablesAndColumns(Subscriptions, Articles, RabbitInbox)
+            SchemaUtils.createMissingTablesAndColumns(Subscriptions, Articles, RabbitInbox, WeReadEinkSyncStates)
             logger.info("数据库初始化完成: $dbPath")
         }
     }
@@ -129,5 +147,58 @@ object Database {
             }
         }
         logger.info("已迁移 rabbit_inbox.result_event_id，保留历史幂等记录")
+    }
+
+    private fun migrateWeReadEinkSyncStates(conn: Connection) {
+        val tableExists = conn.prepareStatement(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'weread_eink_sync_states' LIMIT 1"
+        ).use { statement ->
+            statement.executeQuery().use { rows -> rows.next() }
+        }
+        if (!tableExists) return
+
+        val columns = conn.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA table_info(weread_eink_sync_states)").use { rows ->
+                generateSequence {
+                    if (rows.next()) rows.getString("name") else null
+                }.toSet()
+            }
+        }
+        if ("account_vid" in columns) return
+
+        conn.createStatement().use { statement ->
+            statement.execute("ALTER TABLE weread_eink_sync_states RENAME TO weread_eink_sync_states_legacy")
+            statement.execute(
+                """
+                CREATE TABLE weread_eink_sync_states (
+                    account_vid VARCHAR(255) NOT NULL,
+                    fakeid VARCHAR(64) NOT NULL,
+                    mp_id TEXT NOT NULL,
+                    synckey INTEGER,
+                    last_sync_at INTEGER NOT NULL DEFAULT 0,
+                    last_success_at INTEGER NOT NULL DEFAULT 0,
+                    coverage_start INTEGER,
+                    coverage_end INTEGER,
+                    history_complete BOOLEAN NOT NULL DEFAULT 0,
+                    status VARCHAR(32) NOT NULL DEFAULT 'NEVER_SYNCED',
+                    error_type VARCHAR(64) NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (account_vid, mp_id)
+                )
+                """.trimIndent(),
+            )
+            statement.execute(
+                """
+                INSERT INTO weread_eink_sync_states
+                    (account_vid, fakeid, mp_id, synckey, last_sync_at, last_success_at,
+                     coverage_start, coverage_end, history_complete, status, error_type, error_message)
+                SELECT 'legacy', fakeid, mp_id, synckey, last_sync_at, last_success_at,
+                       coverage_start, coverage_end, history_complete, status, error_type, error_message
+                FROM weread_eink_sync_states_legacy
+                """.trimIndent(),
+            )
+            statement.execute("DROP TABLE weread_eink_sync_states_legacy")
+        }
+        logger.info("已迁移 weread_eink_sync_states，游标按 E-Ink 账号与 mpId 隔离")
     }
 }

@@ -6,11 +6,13 @@ import com.wamp.download.store.Database
 import com.wamp.download.weread.WeReadAccountPool
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Disabled
 import java.io.File
 
 class TaskProcessorStressTest {
 
     @Test
+    @Disabled("真实外部服务压测，不属于可重复的单元测试套件")
     fun `测试单条真实消息处理流程与异常观测`() = runBlocking {
         println("===== [1] 初始化数据库与配置 =====")
         AppConfig.load()

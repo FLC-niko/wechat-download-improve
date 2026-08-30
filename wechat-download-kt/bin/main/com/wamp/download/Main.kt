@@ -14,6 +14,7 @@ import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.store.Database
 import com.wamp.download.task.TaskProcessor
 import com.wamp.download.wx.WxApiClient
+import com.wamp.download.weread.eink.WeReadEinkRuntime
 import io.ktor.serialization.gson.gson
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
@@ -39,6 +40,8 @@ fun main() {
 
     val logger = LoggerFactory.getLogger("Main")
     val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    val einkSyncService = WeReadEinkRuntime.createSyncService()
 
     // 动态发现 adb devices；不写死 USB 序列号或无线 ADB 地址。
     val adbDeviceSupervisor = AdbDeviceSupervisor()
@@ -66,6 +69,7 @@ fun main() {
     val taskProcessor = TaskProcessor(
         wxClient = wxClient,
         loginChecker = loginChecker,
+        einkSyncService = einkSyncService,
     )
 
     // JVM shutdown hook：Ctrl+C / kill 时清理资源，避免残留进程
@@ -109,9 +113,13 @@ fun main() {
         }
 
         // 启动后台任务
-        scope.launch { RssPoller.start() }
+        if (AppConfig.rssEnabled) {
+            scope.launch { RssPoller.start() }
+        }
         scope.launch { LoginReminder.start() }
-        scope.launch { loginChecker.start() }
+        if (AppConfig.authAutoRecoveryEnabled) {
+            scope.launch { loginChecker.start() }
+        }
         // 微信读书凭证主动刷新保活（wr_skey 双层刷新的"主动"层，多账号遍历）
         scope.launch {
             val auth = com.wamp.download.weread.WeReadWebAuth
@@ -122,7 +130,7 @@ fun main() {
                         val vid = account.vid
                         when {
                             // 连续刷新失败达到阈值 → 凭证真失效，推送二维码重新扫码（按账号防重入）
-                            auth.shouldRelogin(vid) -> {
+                            auth.shouldRelogin(vid) && (AppConfig.adbEnabled || AppConfig.wereadAutoReloginEnabled) -> {
                                 if (AppConfig.adbEnabled) {
                                     recoveryManager.request(vid)
                                 } else {
@@ -147,7 +155,11 @@ fun main() {
                 }
             })
         }
-        logger.info("后台任务已启动: RSS轮询器 + 登录提醒 + 登录检查 + RabbitMQ + 任务处理 + 微信读书刷新保活")
+        logger.info(
+            "后台任务已启动: RabbitMQ + 任务处理 + 登录提醒 + 微信读书刷新保活" +
+                (if (AppConfig.authAutoRecoveryEnabled) " + 主微信自动恢复" else "（主微信自动恢复已关闭）") +
+                (if (AppConfig.rssEnabled) " + RSS轮询器" else "（RSS轮询已关闭）"),
+        )
 
         routing {
             get("/") { call.respondText("wechat-download-kt is running") }
@@ -186,7 +198,7 @@ fun main() {
                         "exchange" to "new-media-backend",
                         "task_queue" to "gzh-auto-BTA-queue",
                         "result_queue" to "gzh-auto-ATD-queue",
-                        "dead_letter_queue" to "dead-message-queue",
+                        "dead_letter_queue" to com.wamp.download.rabbitmq.GZH_DEAD_QUEUE,
                         "vhosts" to states.mapValues { it.value.name }
                     )
                 ))
@@ -282,8 +294,14 @@ fun main() {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
                 val exists = com.wamp.download.weread.WeReadAccountPool.get(vid) != null
-                if (exists) recoveryManager.request(vid)
-                call.respond(mapOf("ok" to exists, "vid" to vid, "message" to if (exists) "恢复任务已排队" else "账号不存在"))
+                val accepted = exists && AppConfig.adbEnabled
+                if (accepted) recoveryManager.request(vid)
+                val message = when {
+                    !exists -> "账号不存在"
+                    !AppConfig.adbEnabled -> "ADB 已关闭，请使用微信读书手动登录接口恢复"
+                    else -> "恢复任务已排队"
+                }
+                call.respond(mapOf("ok" to accepted, "vid" to vid, "message" to message))
             }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()

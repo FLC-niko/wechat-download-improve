@@ -7,12 +7,14 @@ import com.wamp.download.store.Database
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Disabled
 import java.awt.Color
 import java.awt.image.BufferedImage
 import java.io.File
 import javax.imageio.ImageIO
 import kotlin.test.assertTrue
 
+@Disabled("会操作本机 GUI，仅供人工验收")
 class DirectScreenQrScanTest {
 
     @Test

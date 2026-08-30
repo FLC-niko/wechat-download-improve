@@ -76,7 +76,15 @@ data class WeReadAccount(
     var cooldownUntil: Long = 0L,
     var disabledReason: String = "",
 ) {
-    /** 是否可被调度：ACTIVE 且未在冷却（并发占用由账号池 inUse 单独控制） */
+    /** 是否拥有足够的 Web 凭证发起请求。 */
+    fun hasWebCredentials(): Boolean =
+        credentials.wrVid.isNotBlank() && credentials.wrSkey.isNotBlank()
+
+    /** 是否可被调度：冷却到期后无需重启进程即可重新参与调度。 */
     fun isAvailable(now: Long = System.currentTimeMillis()): Boolean =
-        status == AccountStatus.ACTIVE && now >= cooldownUntil
+        hasWebCredentials() && when (status) {
+            AccountStatus.ACTIVE -> now >= cooldownUntil
+            AccountStatus.COOLDOWN -> now >= cooldownUntil
+            AccountStatus.EXPIRED, AccountStatus.DISABLED -> false
+        }
 }

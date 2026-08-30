@@ -36,6 +36,8 @@ const val GZH_TASK_QUEUE = "gzh-auto-BTA-queue"
 const val GZH_TASK_ROUTING = "gzh-auto-BTA-routing"
 const val GZH_RESULT_QUEUE = "gzh-auto-ATD-queue"
 const val GZH_RESULT_ROUTING = "gzh-auto-ATD-routing"
+const val GZH_DEAD_QUEUE = "dead-message-queue"
+const val GZH_DEAD_ROUTING = "dead-message-routing"
 const val SERVER_STATUS_QUEUE = "server.queue.provideLog"
 
 // --- 任务策略（从 AppConfig 读取）---

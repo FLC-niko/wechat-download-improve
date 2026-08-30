@@ -103,17 +103,17 @@ class ArticleFetcher {
 
             val publishList = publishPage["publish_list"] as? List<*> ?: return emptyList()
 
-            return publishList.mapNotNull { item ->
+            return publishList.mapNotNull outer@{ item ->
                 val publishInfo = (item as? Map<*, *>)?.get("publish_info")
                 val info = when (publishInfo) {
                     is String -> gson.fromJson(publishInfo, Map::class.java)
                     is Map<*, *> -> publishInfo
                     else -> null
-                } ?: return@mapNotNull null
+                } ?: return@outer null
 
-                val appmsgex = info["appmsgex"] as? List<*> ?: return@mapNotNull null
-                appmsgex.mapNotNull { article ->
-                    val a = article as? Map<*, *> ?: return@mapNotNull null
+                val appmsgex = info["appmsgex"] as? List<*> ?: return@outer null
+                appmsgex.mapNotNull inner@{ article ->
+                    val a = article as? Map<*, *> ?: return@inner null
                     Article(
                         fakeid = fakeid,
                         aid = a["aid"] as? String ?: "",
@@ -176,7 +176,7 @@ class ArticleFetcher {
      */
     private fun fetchFromWeRead(fakeid: String): List<Article> {
         if (!weReadWebClient.isLoggedIn()) {
-            logger.warn("回退跳过: 微信读书未登录, fakeid=${fakeid.take(8)}...")
+            logger.warn("回退跳过: 没有可用的微信读书账号, fakeid=${fakeid.take(8)}...")
             return emptyList()
         }
 

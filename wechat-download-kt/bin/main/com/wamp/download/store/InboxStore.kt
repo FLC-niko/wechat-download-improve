@@ -3,6 +3,7 @@ package com.wamp.download.store
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.update
 import java.util.UUID
 
@@ -17,7 +18,7 @@ object InboxStore {
             val isStale = existing[RabbitInbox.status] == "PROCESSING" &&
                 message.now - existing[RabbitInbox.updatedAt] >= PROCESSING_TIMEOUT_MS
             if (existing[RabbitInbox.status] == "COMPLETED" ||
-                (existing[RabbitInbox.status] == "PROCESSING" && !isStale)
+                (existing[RabbitInbox.status] == "PROCESSING" && !isStale && !message.allowProcessingTakeover)
             ) {
                 return@query ClaimResult(claimed = false, resultEventId = existing[RabbitInbox.resultEventId])
             }
@@ -60,6 +61,18 @@ object InboxStore {
         }
     }
 
+    /** 延长正在执行任务的租约，避免长分页任务被另一个消费者误接管。 */
+    fun touch(idempotencyKey: String, now: Long = System.currentTimeMillis()) {
+        Database.query {
+            RabbitInbox.update({
+                (RabbitInbox.idempotencyKey eq idempotencyKey) and
+                    (RabbitInbox.status eq "PROCESSING")
+            }) {
+                it[updatedAt] = now
+            }
+        }
+    }
+
     fun markFailed(idempotencyKey: String) {
         Database.query {
             RabbitInbox.update({ RabbitInbox.idempotencyKey eq idempotencyKey }) {
@@ -74,6 +87,8 @@ object InboxStore {
         val eventId: String,
         val workflowId: String,
         val now: Long = System.currentTimeMillis(),
+        /** broker redelivery 表示上一个消费者已经消失，可立即接管未完成租约。 */
+        val allowProcessingTakeover: Boolean = false,
     )
 
     data class ClaimResult(

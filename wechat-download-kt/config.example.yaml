@@ -11,8 +11,10 @@ store:
 
 auth:
   credentials_file: data/.credentials.json
+  auto_recovery_enabled: false # Worker 默认不在启动后自动发起扫码；使用 API 手动恢复
 
 rss:
+  enabled: false             # MQ 采集服务默认关闭后台轮询，避免与任务争抢账号配额
   poll_interval: 3600        # 轮询间隔（秒）
   articles_per_poll: 10      # 每次轮询拉取文章数
 
@@ -43,7 +45,15 @@ weread:
   account_dir: "data/weread_accounts"
   refresh_interval: 3000
   refresh_fail_threshold: 3
+  auto_relogin_enabled: false  # 失效时仅告警/手动登录，避免服务自行弹出二维码
+  eink:
+    enabled: false
+    base_url: "https://i.weread.qq.com"
+    credentials_file: "data/.weread_eink_credentials.json"
+    sync_interval: 86400       # E-Ink 增量同步最小间隔（秒）
+    page_size: 50
+    max_pages: 1000
 
 adb:
-  enabled: true
+  enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启
   poll_interval_ms: 15000

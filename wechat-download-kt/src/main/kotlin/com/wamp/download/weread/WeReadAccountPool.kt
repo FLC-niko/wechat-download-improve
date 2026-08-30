@@ -5,6 +5,8 @@ import com.google.gson.GsonBuilder
 import com.wamp.download.config.AppConfig
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -22,6 +24,8 @@ object WeReadAccountPool {
 
     private val accounts = ConcurrentHashMap<String, WeReadAccount>()  // vid -> account
     private val inUse = ConcurrentHashMap<String, Boolean>()           // vid -> 占用标记
+    private val saveLock = Any()
+    private val scheduleLock = Any()
 
     private fun accountDir(): File = File(AppConfig.wereadAccountDir).apply { mkdirs() }
 
@@ -81,8 +85,13 @@ object WeReadAccountPool {
     fun size(): Int = accounts.size
 
     /** 是否存在可用账号（只读探测，不占用） */
-    fun hasAvailableAccount(now: Long = System.currentTimeMillis()): Boolean =
+    fun hasAvailableAccount(now: Long = System.currentTimeMillis()): Boolean = synchronized(scheduleLock) {
         accounts.values.any { !inUse.getOrDefault(it.vid, false) && it.isAvailable(now) }
+    }
+
+    /** 是否存在登录有效的账号，不受当前请求占用状态影响。 */
+    fun hasLoggedInAccount(now: Long = System.currentTimeMillis()): Boolean =
+        accounts.values.any { it.hasWebCredentials() && it.isAvailable(now) }
 
     /** 兼容层：主账号（最早登录），供旧单账号逻辑使用 */
     fun primaryAccount(): WeReadAccount? =
@@ -107,6 +116,11 @@ object WeReadAccountPool {
         val existing = accounts[creds.wrVid]
         return if (existing != null) {
             existing.credentials = creds
+            if (existing.status == AccountStatus.EXPIRED || existing.status == AccountStatus.COOLDOWN) {
+                existing.status = AccountStatus.ACTIVE
+                existing.cooldownUntil = 0L
+                existing.disabledReason = ""
+            }
             save(existing)
             true
         } else {
@@ -206,11 +220,30 @@ object WeReadAccountPool {
 
     /** 持久化单个账号 */
     private fun save(account: WeReadAccount) {
-        try {
-            val file = File(accountDir(), "${account.vid}.json")
-            file.writeText(gson.toJson(account))
-        } catch (e: Exception) {
-            logger.error("微信读书账号保存失败: vid=${account.vid}, ${e.message}")
+        synchronized(saveLock) {
+            val dir = accountDir()
+            val file = File(dir, "${account.vid}.json")
+            val temp = File.createTempFile(".${account.vid}.", ".json.tmp", dir)
+            try {
+                temp.writeText(gson.toJson(account))
+                try {
+                    Files.move(
+                        temp.toPath(),
+                        file.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                    Files.move(
+                        temp.toPath(),
+                        file.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }
+            } catch (e: Exception) {
+                temp.delete()
+                logger.error("微信读书账号保存失败: vid=${account.vid}, ${e.message}")
+            }
         }
     }
 
@@ -224,20 +257,27 @@ object WeReadAccountPool {
      *
      * @return 可用账号；无可用账号返回 null
      */
-    fun acquire(): WeReadAccount? {
+    fun acquire(): WeReadAccount? = synchronized(scheduleLock) {
         val now = System.currentTimeMillis()
         val chosen = accounts.values
             .filter { !inUse.getOrDefault(it.vid, false) && it.isAvailable(now) }
             .minWithOrNull(compareBy<WeReadAccount> { it.lastUsedTime }.thenBy { it.freqControlCount })
         if (chosen != null) {
+            if (chosen.status == AccountStatus.COOLDOWN) {
+                chosen.status = AccountStatus.ACTIVE
+                chosen.cooldownUntil = 0L
+                chosen.disabledReason = ""
+                save(chosen)
+                logger.info("微信读书账号冷却到期，已自动恢复: vid=${chosen.vid}")
+            }
             inUse[chosen.vid] = true
         }
-        return chosen
+        chosen
     }
 
     /** 释放占用（请求结束无论成败都调用） */
     fun release(vid: String) {
-        inUse.remove(vid)
+        synchronized(scheduleLock) { inUse.remove(vid) }
     }
 
     // ── 状态标记 ────────────────────────────────

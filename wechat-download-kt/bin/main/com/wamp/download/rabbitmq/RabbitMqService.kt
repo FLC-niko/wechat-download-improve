@@ -1,6 +1,10 @@
 package com.wamp.download.rabbitmq
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import com.wamp.download.config.AppConfig
@@ -87,7 +91,7 @@ class RabbitMqService(
     }
 
     private suspend fun startConsumer(manager: RabbitMqClientManager, env: String) {
-        manager.startConsumer(GZH_TASK_QUEUE, autoAck = false, prefetch = 1) { _, ctx ->
+        manager.startConsumer(GZH_TASK_QUEUE, autoAck = false, prefetch = 1) consumer@{ _, ctx ->
             var taskMessage: RabbitTaskMessage? = null
             try {
                 taskMessage = RabbitTaskDecoder.decode(ctx.body)
@@ -96,11 +100,12 @@ class RabbitMqService(
                         idempotencyKey = taskMessage.idempotencyKey,
                         eventId = taskMessage.eventId,
                         workflowId = taskMessage.workflowId,
+                        allowProcessingTakeover = ctx.delivery.envelope.isRedeliver,
                     )
                 )
                 if (!claim.claimed) {
                     logger.info("【$env】跳过重复任务 idempotencyKey=${taskMessage.idempotencyKey}")
-                    return@startConsumer
+                    return@consumer
                 }
                 when (taskMessage) {
                     is RabbitTaskMessage.V2 -> logger.info(
@@ -113,7 +118,20 @@ class RabbitMqService(
                             "gzh=${taskMessage.task.gzhName}, 日期范围=${taskMessage.task.tempTimeStamp}"
                     )
                 }
-                onTaskReceived(taskMessage, ResultQueuePublisher(manager, claim.resultEventId))
+                coroutineScope {
+                    val heartbeat = launch {
+                        while (isActive) {
+                            delay(60_000)
+                            runCatching { InboxStore.touch(taskMessage.idempotencyKey) }
+                                .onFailure { logger.warn("【$env】Inbox 续租失败: ${it.message}") }
+                        }
+                    }
+                    try {
+                        onTaskReceived(taskMessage, ResultQueuePublisher(manager, claim.resultEventId))
+                    } finally {
+                        heartbeat.cancelAndJoin()
+                    }
+                }
                 InboxStore.markCompleted(taskMessage.idempotencyKey)
             } catch (e: Exception) {
                 taskMessage?.let { runCatching { InboxStore.markFailed(it.idempotencyKey) } }

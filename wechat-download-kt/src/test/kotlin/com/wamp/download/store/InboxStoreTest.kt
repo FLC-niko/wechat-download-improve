@@ -46,6 +46,19 @@ class InboxStoreTest {
         }
     }
 
+    @Test
+    fun `broker重投可立即接管未完成任务并复用结果事件`() {
+        withTemporaryDatabase {
+            val first = InboxStore.claim(message("wf-4:BTA", now = 4_000L))
+            val takeover = InboxStore.claim(
+                message("wf-4:BTA", now = 4_001L).copy(allowProcessingTakeover = true),
+            )
+
+            assertTrue(takeover.claimed)
+            assertEquals(first.resultEventId, takeover.resultEventId)
+        }
+    }
+
     private fun message(idempotencyKey: String, now: Long): InboxStore.InboxMessage =
         InboxStore.InboxMessage(
             idempotencyKey = idempotencyKey,

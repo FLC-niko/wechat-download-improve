@@ -23,7 +23,7 @@ object WeReadCookieStore {
 
     fun get(): WeReadWebCredentials = WeReadAccountPool.primaryCredentials()
 
-    fun isLoggedIn(): Boolean = get().wrSkey.isNotEmpty() && get().wrVid.isNotEmpty()
+    fun isLoggedIn(): Boolean = WeReadAccountPool.hasLoggedInAccount()
 
     fun save(creds: WeReadWebCredentials) {
         WeReadAccountPool.upsertCredentials(creds)
