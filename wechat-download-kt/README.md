@@ -51,6 +51,7 @@ weread:
   eink:
     enabled: true
     auto_qr_notification_enabled: true
+    human_verify_probe_interval: 3600
 
 adb:
   enabled: false
@@ -64,7 +65,9 @@ wx:
     enabled: false
 ```
 
-Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。ADB 设备代扫仍需显式设置 `adb.enabled: true`。E-Ink 返回 `-2041` 时属于官方风控人工验证，服务不会用重新登录二维码冒充恢复，需先在微信读书官方客户端完成验证。ADB 状态仍可通过以下接口查看：
+Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。ADB 设备代扫仍需显式设置 `adb.enabled: true`。E-Ink 返回 `-2041` 时属于官方风控人工验证，服务不会用重新登录二维码冒充恢复，需先在微信读书官方客户端完成验证。人工验证期间任务不会继续撞 E-Ink，真实健康探测默认退避到每小时一次。
+
+任务返回采用缓存优先：SQLite 中已有可用文章时直接返回，不调用任何远端通道；缓存为空时，只有已验证的时间覆盖区间才能直接确认 `EMPTY`，否则只从最早缺口向最新文章翻页一次，成功落库后再提交覆盖记录。旧版 E-Ink 覆盖记录不会直接沿用，避免把无法解析的返回误判为空历史。ADB 状态仍可通过以下接口查看：
 
 ```bash
 curl http://localhost:5000/api/adb/status

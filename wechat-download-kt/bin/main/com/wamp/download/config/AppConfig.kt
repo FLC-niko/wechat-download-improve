@@ -75,6 +75,9 @@ object AppConfig {
         get() = getLong("weread.eink.refresh_check_interval", 60L).coerceAtLeast(10L)
     val wereadEinkHealthCheckInterval: Long
         get() = getLong("weread.eink.health_check_interval", 300L).coerceAtLeast(30L)
+    val wereadEinkHumanVerifyProbeInterval: Long
+        get() = getLong("weread.eink.human_verify_probe_interval", 3_600L)
+            .coerceAtLeast(wereadEinkHealthCheckInterval)
     val wereadEinkRefreshSkew: Long
         get() = getLong("weread.eink.refresh_skew", 300L).coerceAtLeast(0L)
     val wereadEinkRefreshRetryInitial: Long

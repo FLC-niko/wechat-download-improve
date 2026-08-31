@@ -7,6 +7,54 @@ import kotlin.test.assertTrue
 
 class CollectionCoverageTest {
     @Test
+    fun `完整缓存覆盖时不产生远端缺口`() {
+        assertEquals(
+            emptyList(),
+            CollectionCoverage.missingRanges(1_000L, 2_000L, listOf(500L..2_500L)),
+        )
+    }
+
+    @Test
+    fun `合并缓存覆盖后只返回真正缺失区间`() {
+        assertEquals(
+            listOf(1_201L..1_499L, 1_801L..2_000L),
+            CollectionCoverage.missingRanges(
+                requestedStart = 1_000L,
+                requestedEnd = 2_000L,
+                coveredIntervals = listOf(1_500L..1_700L, 900L..1_200L, 1_701L..1_800L),
+            ),
+        )
+    }
+
+    @Test
+    fun `没有覆盖记录时整个窗口都需要远端补齐`() {
+        assertEquals(
+            listOf(1_000L..2_000L),
+            CollectionCoverage.missingRanges(1_000L, 2_000L, emptyList()),
+        )
+    }
+
+    @Test
+    fun `多个离散缺口只规划一次从最早缺口开始的远端翻页`() {
+        assertEquals(
+            1_000L..2_000L,
+            CollectionCoverage.remoteFetchEnvelope(
+                requestedEnd = 2_000L,
+                now = 2_500L,
+                missingRanges = listOf(1_000L..1_100L, 1_500L..1_600L),
+            ),
+        )
+        assertEquals(
+            1_000L..1_800L,
+            CollectionCoverage.remoteFetchEnvelope(
+                requestedEnd = 2_000L,
+                now = 1_800L,
+                missingRanges = listOf(1_000L..1_100L, 1_900L..2_000L),
+            ),
+        )
+    }
+
+    @Test
     fun `满页且全部晚于窗口起点时必须继续降级`() {
         val times = (1..20).map { 2_000L + it }
 

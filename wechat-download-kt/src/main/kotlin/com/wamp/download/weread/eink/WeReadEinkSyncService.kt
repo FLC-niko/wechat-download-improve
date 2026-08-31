@@ -56,7 +56,8 @@ class WeReadEinkSyncService(
         val mpId = resolveMpId(subscription)
         if (mpId.isBlank()) return false
         val state = WeReadEinkSyncStateStore.get(session.credentials().vid, mpId) ?: return false
-        return state.historyComplete &&
+        return state.coverageVersion == WeReadEinkSyncStateStore.CURRENT_COVERAGE_VERSION &&
+            state.historyComplete &&
             state.coverageStart != null &&
             state.coverageEnd != null &&
             state.coverageStart <= startTime &&
@@ -137,7 +138,12 @@ class WeReadEinkSyncService(
 
         val fakeid = subscription.fakeid
         val accountVid = session.credentials().vid
-        val previousState = WeReadEinkSyncStateStore.get(accountVid, mpId)
+        val storedState = WeReadEinkSyncStateStore.get(accountVid, mpId)
+        // Version 0 includes historical rows that could be marked complete even when every
+        // returned record failed mapping. Re-baseline those rows from synckey=0.
+        val previousState = storedState?.takeIf {
+            it.coverageVersion == WeReadEinkSyncStateStore.CURRENT_COVERAGE_VERSION
+        }
         val initialSynckey = previousState?.synckey ?: 0L
         val client = clientFactory(session, baseUrl)
         val collected = mutableListOf<WeReadEinkArticle>()
@@ -185,6 +191,12 @@ class WeReadEinkSyncService(
             }
             val skippedArticles = collected.size - mapped.size
             val savedArticles = ArticleStore.saveAll(fakeid, mapped, source = "eink")
+            if (skippedArticles > 0) {
+                throw WeReadEinkSyncException(
+                    "E-Ink returned $skippedArticles invalid article payloads out of ${collected.size}; " +
+                        "cursor and coverage were not advanced",
+                )
+            }
             val historyComplete = previousState?.historyComplete == true || initialSynckey == 0L
             val coverageStart = if (historyComplete) 0L else previousState?.coverageStart
             val coverageEnd = max(

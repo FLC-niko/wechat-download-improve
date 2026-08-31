@@ -18,6 +18,7 @@ data class WeReadEinkSyncState(
     val coverageStart: Long? = null,
     val coverageEnd: Long? = null,
     val historyComplete: Boolean = false,
+    val coverageVersion: Int = 0,
     val status: String = "NEVER_SYNCED",
     val errorType: String = "",
     val errorMessage: String = "",
@@ -61,6 +62,7 @@ object WeReadEinkSyncStateStore {
                 it[WeReadEinkSyncStates.coverageStart] = coverageStart
                 it[WeReadEinkSyncStates.coverageEnd] = coverageEnd
                 it[WeReadEinkSyncStates.historyComplete] = historyComplete
+                it[WeReadEinkSyncStates.coverageVersion] = CURRENT_COVERAGE_VERSION
                 it[WeReadEinkSyncStates.status] = "ACTIVE"
                 it[WeReadEinkSyncStates.errorType] = ""
                 it[WeReadEinkSyncStates.errorMessage] = ""
@@ -77,6 +79,7 @@ object WeReadEinkSyncStateStore {
                 it[WeReadEinkSyncStates.coverageStart] = coverageStart ?: existing[WeReadEinkSyncStates.coverageStart]
                 it[WeReadEinkSyncStates.coverageEnd] = coverageEnd ?: existing[WeReadEinkSyncStates.coverageEnd]
                 it[WeReadEinkSyncStates.historyComplete] = historyComplete || existing[WeReadEinkSyncStates.historyComplete]
+                it[WeReadEinkSyncStates.coverageVersion] = CURRENT_COVERAGE_VERSION
                 it[WeReadEinkSyncStates.status] = "ACTIVE"
                 it[WeReadEinkSyncStates.errorType] = ""
                 it[WeReadEinkSyncStates.errorMessage] = ""
@@ -132,8 +135,11 @@ object WeReadEinkSyncStateStore {
         coverageStart = this[WeReadEinkSyncStates.coverageStart],
         coverageEnd = this[WeReadEinkSyncStates.coverageEnd],
         historyComplete = this[WeReadEinkSyncStates.historyComplete],
+        coverageVersion = this[WeReadEinkSyncStates.coverageVersion],
         status = this[WeReadEinkSyncStates.status],
         errorType = this[WeReadEinkSyncStates.errorType],
         errorMessage = this[WeReadEinkSyncStates.errorMessage],
     )
+
+    const val CURRENT_COVERAGE_VERSION = 1
 }

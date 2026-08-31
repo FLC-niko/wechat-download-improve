@@ -42,6 +42,10 @@ object CredentialHealthChecker {
             WeReadEinkRuntime.ensureAutoRecovery()
             return
         }
+        if (!WeReadEinkRuntime.shouldRunHealthProbe()) {
+            logger.debug("凭证检测: E-Ink 等待人工验证，按长退避跳过本轮真实请求")
+            return
+        }
 
         WeReadEinkRuntime.refreshIfExpiryDue()
         if (session.refreshStatus().authExpired) {

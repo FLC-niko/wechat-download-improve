@@ -16,11 +16,13 @@ import com.wamp.download.rabbitmq.ResultQueuePublisher
 import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.rabbitmq.SeedArticle
 import com.wamp.download.store.Article
+import com.wamp.download.store.ArticleCoverageStore
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.weread.WeReadWebClient
 import com.wamp.download.weread.eink.WeReadEinkSyncService
+import com.wamp.download.weread.eink.WeReadEinkRuntime
 import com.wamp.download.wx.WxApiClient
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
@@ -29,14 +31,8 @@ import kotlin.random.Random
 /**
  * 公众号任务处理器
  *
- * 处理流程（三阶段执行计划：阶段一官方直连 + 工业级回退）：
- * 1. 等待登录恢复（如果正在恢复）
- * 2. 检查 token 有效性，无效则触发登录恢复
- * 3. 搜索公众号名称 → 获取 fakeid
- * 4. L1 主通道：appmsgpublish（默认关闭；200013 永久失效）
- * 5. L2 微信读书官方直连（weread.qq.com，空页重试 + 翻页抖动）
- * 6. L3 本地缓存兜底 + 告警
- * 7. 按日期范围过滤 → 保存到数据库 → 发布结果到 RabbitMQ
+ * 处理流程：本地身份与缓存优先，只对没有可信覆盖记录的时间缺口请求远端；远端结果
+ * 先写缓存与覆盖记录，再从统一缓存视图发布结果。
  *
  * 与 Worker 的区别：
  * - 直接调微信 API，不经过适配壳 HTTP 中转
@@ -51,6 +47,9 @@ class TaskProcessor(
     private val resultPublisher: ResultQueuePublisher? = null,
     private val einkSyncService: WeReadEinkSyncService? = null,
     private val einkSyncServiceProvider: (() -> WeReadEinkSyncService?)? = null,
+    private val einkRequestAllowed: () -> Boolean = WeReadEinkRuntime::canAttemptTaskSync,
+    private val einkRequestSucceeded: () -> Unit = WeReadEinkRuntime::recordTaskRequestSuccess,
+    private val einkRequestFailed: (Throwable) -> Unit = WeReadEinkRuntime::recordTaskRequestFailure,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(TaskProcessor::class.java)
@@ -125,37 +124,53 @@ class TaskProcessor(
 
         val fakeid = subscription.fakeid
         val currentEinkService = einkSyncServiceProvider?.invoke() ?: einkSyncService
-        val canUseEink = AppConfig.wereadEinkEnabled &&
-            currentEinkService != null &&
-            currentEinkService.canSync(subscription)
-
-        val sourceResults = mutableListOf<SourceFetchResult>()
-        if (canUseEink) {
-            fetchFromEink(currentEinkService, subscription, startTs, endTs)?.let(sourceResults::add)
-        }
-        if (sourceResults.none { it.coverageComplete }) {
-            sourceResults += fetchViaMainChannel(fakeid, startTs)
-        }
-        if (sourceResults.none { it.coverageComplete }) {
-            sourceResults += fetchFromWeRead(task.gzhName, fakeid, subscription, startTs)
-        }
-
-        // 缓存永远参与合并，可补远端部分失败时已经采集过的数据；但缓存本身不能证明空窗口。
         val cached = fetchFromLocalCache(fakeid, startTs, endTs)
-        val articles = (sourceResults.flatMap { it.articles } + cached)
+        val cacheHasUsableArticles = cached.any { it.link.isNotBlank() }
+        val verifiedIntervals = if (cacheHasUsableArticles) {
+            emptyList()
+        } else {
+            loadVerifiedCoverage(fakeid, startTs, endTs)
+        }
+        val missingRanges = if (cacheHasUsableArticles) {
+            emptyList()
+        } else {
+            CollectionCoverage.missingRanges(startTs, endTs, verifiedIntervals)
+        }
+        if (cacheHasUsableArticles) {
+            logger.info(
+                "【缓存优先】命中 ${cached.size} 篇可用文章，直接返回并跳过全部远端通道: " +
+                    "fakeid=${fakeid.take(8)}...",
+            )
+        } else if (missingRanges.isEmpty()) {
+            logger.info("【缓存优先】请求范围已有可信覆盖，跳过全部远端通道: fakeid=${fakeid.take(8)}...")
+        } else {
+            logger.info(
+                "【缓存优先】需要补齐 ${missingRanges.size} 个时间缺口: fakeid=${fakeid.take(8)}..., " +
+                    missingRanges.joinToString { "${it.first}..${it.last}" },
+            )
+        }
+
+        // 当前远端接口只能“从最新文章向目标起点翻页”，不能指定结束时间。因此从最早缺口
+        // 查询一次即可覆盖其后的全部缺口，不能为每个离散缺口重复消耗一次翻页机会。
+        val requestStartedAt = System.currentTimeMillis() / 1000L
+        val remoteRange = CollectionCoverage.remoteFetchEnvelope(endTs, requestStartedAt, missingRanges)
+        val rangeFetches = remoteRange?.let { range ->
+            listOf(
+                MissingRangeFetch(
+                    range = range,
+                    results = fetchMissingRange(
+                        task = task,
+                        subscription = subscription,
+                        einkService = currentEinkService,
+                        range = range,
+                    ),
+                ),
+            )
+        }.orEmpty()
+        val sourceResults = rangeFetches.flatMap(MissingRangeFetch::results)
+        val articles = (cached + sourceResults.flatMap { it.articles })
             .filter { it.link.isNotBlank() }
             .distinctBy { it.link }
-        val coverageComplete = sourceResults.any { it.coverageComplete }
-        val sourceName = sourceResults.filter { it.articles.isNotEmpty() || it.coverageComplete }
-            .joinToString("+") { it.source }
-            .ifBlank { if (cached.isNotEmpty()) "cache" else "none" }
-
-        logger.info(
-            "【任务处理】采集汇总: gzh=${task.gzhName}, source=$sourceName, " +
-                "articles=${articles.size}, coverageComplete=$coverageComplete",
-        )
-
-        val filtered = articles.filter { it.publishTime in startTs..endTs }
 
         // 保存所有本轮有效文章，避免仅保存窗口内数据导致后续缓存断层。
         val articlesToSave = articles.filter { it.publishTime > 0 }.map { article ->
@@ -173,6 +188,36 @@ class TaskProcessor(
         if (articlesToSave.isNotEmpty()) {
             ArticleStore.saveAll(fakeid, articlesToSave, source = "task")
         }
+
+        // 文章必须先成功落库，之后才能声明对应远端时间范围已完整覆盖。
+        rangeFetches.forEach { fetch ->
+            val completedBy = fetch.results.firstOrNull { it.coverageComplete } ?: return@forEach
+            if (fetch.range.first <= fetch.range.last) {
+                runCatching {
+                    ArticleCoverageStore.saveVerified(
+                        fakeid = fakeid,
+                        startTime = fetch.range.first,
+                        endTime = fetch.range.last,
+                        source = completedBy.source,
+                    )
+                }.onFailure { error ->
+                    logger.warn("【缓存覆盖】保存失败，不把本轮视为完整覆盖: ${error.message}")
+                }
+            }
+        }
+
+        val finalCoverage = loadVerifiedCoverage(fakeid, startTs, endTs)
+        val coverageComplete = CollectionCoverage.missingRanges(startTs, endTs, finalCoverage).isEmpty()
+        val sourceName = buildList {
+            if (cacheHasUsableArticles || missingRanges.isEmpty()) add("cache")
+            addAll(sourceResults.filter { it.articles.isNotEmpty() || it.coverageComplete }.map { it.source })
+        }.distinct().joinToString("+").ifBlank { "none" }
+        logger.info(
+            "【任务处理】采集汇总: gzh=${task.gzhName}, source=$sourceName, " +
+                "articles=${articles.size}, coverageComplete=$coverageComplete",
+        )
+
+        val filtered = articles.filter { it.publishTime in startTs..endTs }
 
         val urls = filtered.map { it.link }.distinct()
         if (CollectionCoverage.terminalDecision(urls.size, coverageComplete) ==
@@ -265,6 +310,44 @@ class TaskProcessor(
         val detail: String,
     )
 
+    private data class MissingRangeFetch(
+        val range: LongRange,
+        val results: List<SourceFetchResult>,
+    )
+
+    private suspend fun fetchMissingRange(
+        task: ProcessingTask,
+        subscription: Subscription,
+        einkService: WeReadEinkSyncService?,
+        range: LongRange,
+    ): List<SourceFetchResult> {
+        val results = mutableListOf<SourceFetchResult>()
+        val canUseEink = AppConfig.wereadEinkEnabled &&
+            einkRequestAllowed() &&
+            einkService != null &&
+            einkService.canSync(subscription)
+        if (canUseEink) {
+            fetchFromEink(einkService, subscription, range.first, range.last)?.let(results::add)
+        } else if (AppConfig.wereadEinkEnabled && einkService != null) {
+            logger.info("【E-Ink】运行状态不允许请求，直接使用 Web/缓存回退")
+        }
+        if (results.none { it.coverageComplete }) {
+            results += fetchViaMainChannel(subscription.fakeid, range.first)
+        }
+        if (results.none { it.coverageComplete }) {
+            results += fetchFromWeRead(task.gzhName, subscription.fakeid, subscription, range.first)
+        }
+        return results
+    }
+
+    private fun loadVerifiedCoverage(fakeid: String, startTs: Long, endTs: Long): List<LongRange> =
+        try {
+            ArticleCoverageStore.intervals(fakeid, startTs, endTs)
+        } catch (error: Exception) {
+            logger.warn("【缓存覆盖】查询失败，按未覆盖处理: ${error.message}")
+            emptyList()
+        }
+
     private fun fetchFromEink(
         service: WeReadEinkSyncService?,
         subscription: Subscription,
@@ -273,7 +356,8 @@ class TaskProcessor(
     ): SourceFetchResult? {
         service ?: return null
         return try {
-            service.syncIfNeeded(subscription, startTs, endTs)
+            val syncResult = service.syncIfNeeded(subscription, startTs, endTs)
+            if (!syncResult.cacheCovered) einkRequestSucceeded()
 
             val (articles, total) = ArticleStore.getByFakeidAndRange(
                 subscription.fakeid,
@@ -293,6 +377,7 @@ class TaskProcessor(
                 detail = if (covered) "range-covered" else "sync-finished-without-range-coverage",
             )
         } catch (error: Exception) {
+            einkRequestFailed(error)
             logger.warn(
                 "【E-Ink】同步失败，转 Web 回退: fakeid=${subscription.fakeid.take(8)}..., ${error.message}",
                 error,

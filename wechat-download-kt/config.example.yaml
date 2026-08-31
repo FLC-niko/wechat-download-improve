@@ -58,6 +58,7 @@ weread:
     max_pages: 1000
     refresh_check_interval: 60  # 只检查服务端明确返回的过期时间
     health_check_interval: 300  # 未知过期时间时，使用轻量文章请求主动探活
+    human_verify_probe_interval: 3600 # -2041 后真实探测退避；期间任务直接走 Web/可信缓存
     refresh_skew: 300           # 已知到期时间前 5 分钟续签；未知时按 401/-2012 续签
     refresh_retry_initial: 30   # 临时刷新失败的首次退避（秒）
     refresh_retry_max: 900      # 临时刷新失败的最大退避（秒）

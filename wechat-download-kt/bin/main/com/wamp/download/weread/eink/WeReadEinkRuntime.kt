@@ -70,6 +70,42 @@ object WeReadEinkRuntime {
 
     fun session(): WeReadEinkSession? = activeSession
 
+    /** Task requests must not keep replaying an account-side challenge or an active re-login. */
+    fun canAttemptTaskSync(): Boolean = synchronized(runtimeLock) {
+        !taskSyncSuppressed(authState)
+    }
+
+    /** Keeps automatic recovery detection, but backs off aggressively while human action is required. */
+    fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = synchronized(runtimeLock) {
+        !healthProbeSuppressed(
+            state = authState,
+            lastProbeAt = lastProbeAt,
+            now = now,
+            humanVerifyProbeIntervalMs = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L,
+        )
+    }
+
+    /** Feeds task-path outcomes back into the shared circuit breaker. */
+    fun recordTaskRequestSuccess() {
+        val snapshot = currentSnapshot() ?: return
+        if (updateIfCurrent(snapshot) { authState = "HEALTHY" }) {
+            humanVerificationReported.set(false)
+        }
+    }
+
+    fun recordTaskRequestFailure(error: Throwable) {
+        val snapshot = currentSnapshot() ?: return
+        val updated = updateIfCurrent(snapshot) {
+            authState = authStateAfterFailure(snapshot.session.refreshStatus().authExpired, error)
+        }
+        if (!updated) return
+        if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
+            notifyHumanVerification(error)
+        } else {
+            ensureAutoRecovery()
+        }
+    }
+
     fun installCredentials(credentials: WeReadEinkCredentials) {
         // Invalidate the old session before writing the QR result. This closes the race where a
         // task holding the old session could persist its rotated snapshot after QR login.
@@ -390,6 +426,21 @@ object WeReadEinkRuntime {
     internal fun scheduledSyncSuppressed(state: String): Boolean =
         state == "HUMAN_VERIFY_REQUIRED" || state == "REAUTH_IN_PROGRESS"
 
+    internal fun taskSyncSuppressed(state: String): Boolean =
+        state == "HUMAN_VERIFY_REQUIRED" ||
+            state == "REAUTH_REQUIRED" ||
+            state == "REAUTH_IN_PROGRESS"
+
+    internal fun healthProbeSuppressed(
+        state: String,
+        lastProbeAt: Long,
+        now: Long,
+        humanVerifyProbeIntervalMs: Long,
+    ): Boolean = state == "HUMAN_VERIFY_REQUIRED" &&
+        lastProbeAt > 0L &&
+        now >= lastProbeAt &&
+        now - lastProbeAt < humanVerifyProbeIntervalMs
+
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
         val snapshot = currentSnapshot()
         val credentials = snapshot?.session?.credentials()
@@ -401,6 +452,13 @@ object WeReadEinkRuntime {
             authState
         }
         val runtimeReady = snapshot != null
+        val humanVerifyProbeIntervalMs = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L
+        val probeSuppressed = healthProbeSuppressed(
+            state = currentAuthState,
+            lastProbeAt = lastProbeAt,
+            now = now,
+            humanVerifyProbeIntervalMs = humanVerifyProbeIntervalMs,
+        )
         return mapOf(
             "enabled" to AppConfig.wereadEinkEnabled,
             "auto_qr_notification_enabled" to AppConfig.wereadEinkAutoQrNotificationEnabled,
@@ -408,6 +466,10 @@ object WeReadEinkRuntime {
             "runtime_ready" to runtimeReady,
             "operational" to (runtimeReady && currentAuthState == "HEALTHY"),
             "auth_state" to currentAuthState,
+            "task_sync_suppressed" to taskSyncSuppressed(currentAuthState),
+            "health_probe_suppressed" to probeSuppressed,
+            "human_verify_probe_interval_seconds" to AppConfig.wereadEinkHumanVerifyProbeInterval,
+            "next_health_probe_at" to if (probeSuppressed) lastProbeAt + humanVerifyProbeIntervalMs else null,
             "vid" to credentials?.vid,
             "has_access_token" to credentials?.hasAccessToken(),
             "has_refresh_token" to (credentials?.refreshToken?.isNotBlank() == true),

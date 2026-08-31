@@ -54,11 +54,31 @@ object WeReadEinkSyncStates : Table("weread_eink_sync_states") {
     val coverageStart = long("coverage_start").nullable()
     val coverageEnd = long("coverage_end").nullable()
     val historyComplete = bool("history_complete").default(false)
+    val coverageVersion = integer("coverage_version").default(0)
     val status = varchar("status", 32).default("NEVER_SYNCED")
     val errorType = varchar("error_type", 64).default("")
     val errorMessage = text("error_message").default("")
 
     override val primaryKey = PrimaryKey(accountVid, mpId)
+}
+
+/**
+ * 已由远端完整核验过的文章时间区间。
+ *
+ * 文章表只能证明“缓存里有什么”，不能证明某个空窗口确实没有文章；因此覆盖信息必须
+ * 独立持久化。任务处理器只有在这些区间完整覆盖请求窗口时，才允许完全跳过远端请求。
+ */
+object ArticleCoverageIntervals : IntIdTable("article_coverage_intervals") {
+    val fakeid = varchar("fakeid", 64).references(Subscriptions.fakeid, onDelete = ReferenceOption.CASCADE)
+    val coverageStart = long("coverage_start")
+    val coverageEnd = long("coverage_end")
+    val coverageSource = varchar("source", 32)
+    val verifiedAt = long("verified_at")
+
+    init {
+        uniqueIndex("idx_article_coverage_unique", fakeid, coverageStart, coverageEnd, coverageSource)
+        index("idx_article_coverage_lookup", isUnique = false, fakeid, coverageStart, coverageEnd)
+    }
 }
 
 object RabbitInbox : Table("rabbit_inbox") {
@@ -101,7 +121,13 @@ object Database {
 
         // 建表单独一个事务（createMissingTablesAndColumns 可为旧表补齐新增列）
         transaction {
-            SchemaUtils.createMissingTablesAndColumns(Subscriptions, Articles, RabbitInbox, WeReadEinkSyncStates)
+            SchemaUtils.createMissingTablesAndColumns(
+                Subscriptions,
+                Articles,
+                RabbitInbox,
+                WeReadEinkSyncStates,
+                ArticleCoverageIntervals,
+            )
             logger.info("数据库初始化完成: $dbPath")
         }
     }
