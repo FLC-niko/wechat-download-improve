@@ -92,9 +92,14 @@ object AppConfig {
     val wereadEinkMinRequestInterval: Long
         get() = getLong("weread.eink.min_request_interval", 1L).coerceAtLeast(0L)
     val wereadEinkAutoReloginEnabled: Boolean
-        get() = getBool("weread.eink.auto_relogin_enabled", wereadAutoReloginEnabled)
+        get() = getBool("weread.eink.auto_relogin_enabled", false)
     val wereadEinkReloginRetryBackoff: Long
         get() = getLong("weread.eink.relogin_retry_backoff", 300L).coerceAtLeast(30L)
+    val wereadWebHealthCheckInterval: Long
+        get() = getLong("weread.health_check_interval", 300L).coerceAtLeast(30L)
+    val wereadWebProbeFreshness: Long
+        get() = getLong("weread.web_probe_freshness", wereadWebHealthCheckInterval * 2L)
+            .coerceAtLeast(wereadWebHealthCheckInterval)
 
     // 多账号池：账号凭证存储目录 + 频控冷却时长
     val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")

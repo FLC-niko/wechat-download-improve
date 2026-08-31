@@ -37,6 +37,8 @@ class WeReadEinkSession(
     baseUrl: String = DEFAULT_BASE_URL,
     profile: WeReadEinkProfile = DefaultWeReadEinkProfile,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    private val isCurrentSession: () -> Boolean = { true },
+    private val persistenceLock: Any? = null,
     private val refreshRetryInitialDelayMs: Long = DEFAULT_REFRESH_RETRY_INITIAL_DELAY_MS,
     private val refreshRetryMaxDelayMs: Long = DEFAULT_REFRESH_RETRY_MAX_DELAY_MS,
     private val refreshRequest: (String, () -> WeReadEinkCredentials) -> WeReadEinkCredentials = { _, block -> block() },
@@ -111,8 +113,15 @@ class WeReadEinkSession(
     /** Uses an explicit server expiry when present; unknown expiry remains server-rejection driven. */
     fun credentialsForRequest(): WeReadEinkCredentials {
         retryPendingPersistence()
+        val now = clock()
+        if (refreshAuthExpired) {
+            throw WeReadEinkRefreshBackoffException(retryAt = null, cause = lastRefreshFailure)
+        }
+        if (nextRefreshAttemptAt > now) {
+            throw WeReadEinkRefreshBackoffException(nextRefreshAttemptAt, lastRefreshFailure)
+        }
         val snapshot = currentCredentials
-        if (!snapshot.accessTokenNeedsRefresh(clock())) return snapshot
+        if (!snapshot.accessTokenNeedsRefresh(now)) return snapshot
         return refreshIfAccessTokenWas(snapshot.accessToken)
     }
 
@@ -238,11 +247,21 @@ class WeReadEinkSession(
             return true
         }
         return try {
-            store.save(pending)
-            if (credentialsPendingPersistence == pending) {
-                credentialsPendingPersistence = null
-                persistenceError = null
-                nextPersistenceAttemptAt = 0L
+            synchronized(persistenceLock ?: this) {
+                // A QR login may have replaced this session while an old task is still winding
+                // down. The old snapshot must never be written over the newly installed one.
+                if (!isCurrentSession()) {
+                    credentialsPendingPersistence = null
+                    persistenceError = null
+                    nextPersistenceAttemptAt = 0L
+                } else {
+                    store.save(pending)
+                    if (credentialsPendingPersistence == pending) {
+                        credentialsPendingPersistence = null
+                        persistenceError = null
+                        nextPersistenceAttemptAt = 0L
+                    }
+                }
             }
             true
         } catch (error: Exception) {

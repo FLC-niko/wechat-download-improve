@@ -135,7 +135,12 @@ fun main() {
                 } catch (e: Exception) {
                     logger.warn("周期凭证健康检查异常: ${e.message}")
                 }
-                kotlinx.coroutines.delay(AppConfig.wereadEinkHealthCheckInterval * 1000L)
+                kotlinx.coroutines.delay(
+                    minOf(
+                        AppConfig.wereadEinkHealthCheckInterval,
+                        AppConfig.wereadWebHealthCheckInterval,
+                    ) * 1000L,
+                )
             }
         }
         // E-Ink 只按服务端明确过期时间提前续签；未提供日期时由 401/-2012 触发真实 /login 续签。
@@ -312,6 +317,9 @@ fun main() {
                 val vid = body["vid"] ?: ""
                 val account = com.wamp.download.weread.WeReadAccountPool.get(vid)
                 val probe = account?.let { com.wamp.download.weread.WeReadWebClient().probeAccount(it) }
+                if (probe == com.wamp.download.weread.WeReadWebResponseKind.SUCCESS) {
+                    com.wamp.download.weread.WeReadAccountPool.markProbeSuccess(vid)
+                }
                 val ok = probe == com.wamp.download.weread.WeReadWebResponseKind.SUCCESS &&
                     com.wamp.download.weread.WeReadAccountPool.setEnabled(vid, true)
                 if (probe == com.wamp.download.weread.WeReadWebResponseKind.AUTH_EXPIRED) {
@@ -393,7 +401,7 @@ private fun healthSnapshot(rabbitMqService: RabbitMqService): Map<String, Any?> 
     }
     val eink = WeReadEinkRuntime.status()
     val einkReady = eink["operational"] == true
-    val webReady = com.wamp.download.weread.WeReadAccountPool.hasLoggedInAccount()
+    val webReady = com.wamp.download.weread.WeReadAccountPool.hasOperationalAccount()
     val mainReady = AppConfig.mainEnabled &&
         com.wamp.download.auth.AuthManager.isLoggedIn() &&
         !com.wamp.download.auth.AuthManager.isExpired() &&

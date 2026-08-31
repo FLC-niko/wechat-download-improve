@@ -25,6 +25,7 @@ object WeReadAccountPool {
     private val accounts = ConcurrentHashMap<String, WeReadAccount>()  // vid -> account
     private val inUse = ConcurrentHashMap<String, Boolean>()           // vid -> 占用标记
     private val persistenceErrors = ConcurrentHashMap<String, String>()
+    private val probeSuccessAt = ConcurrentHashMap<String, Long>()
     private val registryLock = Any()
     private val saveLock = Any()
     private val scheduleLock = Any()
@@ -41,6 +42,7 @@ object WeReadAccountPool {
         accounts.clear()
         inUse.clear()
         persistenceErrors.clear()
+        probeSuccessAt.clear()
         migrateLegacy()
         accountDir().listFiles()
             ?.filter { it.isFile && it.name.endsWith(".json") }
@@ -96,9 +98,20 @@ object WeReadAccountPool {
         accounts.values.any { !inUse.getOrDefault(it.vid, false) && it.isAvailable(now) }
     }
 
-    /** 是否存在登录有效的账号，不受当前请求占用状态影响。 */
+    /** 是否存在登录有效的账号，不受健康探测新鲜度影响。 */
     fun hasLoggedInAccount(now: Long = System.currentTimeMillis()): Boolean =
-        accounts.values.any { it.hasWebCredentials() && it.isAvailable(now) }
+        accounts.values.any { account -> account.hasWebCredentials() && account.isAvailable(now) }
+
+    /** 是否存在近期真实探测成功、可用于声明服务 ready 的账号。 */
+    fun hasOperationalAccount(now: Long = System.currentTimeMillis()): Boolean =
+        accounts.values.any { account ->
+            val lastProbe = probeSuccessAt[account.vid]
+            account.hasWebCredentials() &&
+                account.isAvailable(now) &&
+                lastProbe != null &&
+                now >= lastProbe &&
+                now - lastProbe <= AppConfig.wereadWebProbeFreshness * 1000L
+        }
 
     /** 兼容层：主账号（最早登录），供旧单账号逻辑使用 */
     fun primaryAccount(): WeReadAccount? =
@@ -178,6 +191,9 @@ object WeReadAccountPool {
 
     /** A successful authenticated probe clears stale failures without pretending a token was renewed. */
     fun markProbeSuccess(vid: String) {
+        if (accounts.containsKey(vid)) {
+            probeSuccessAt[vid] = System.currentTimeMillis()
+        }
         mutateIf(vid) { account ->
             if (account.credentials.refreshFailCount == 0) return@mutateIf false
             account.credentials = account.credentials.copy(refreshFailCount = 0)
@@ -251,6 +267,7 @@ object WeReadAccountPool {
                         removed = accounts.remove(vid, account)
                         if (removed) {
                             inUse.remove(vid)
+                            probeSuccessAt.remove(vid)
                             persistenceErrors.remove(vid)
                         }
                     }
@@ -387,6 +404,7 @@ object WeReadAccountPool {
 
     /** 凭证失效：标记 EXPIRED（需重新扫码） */
     fun markExpired(vid: String, reason: String = "凭证失效"): Boolean {
+        probeSuccessAt.remove(vid)
         val updated = mutate(vid) {
             it.status = AccountStatus.EXPIRED
             it.disabledReason = reason
@@ -397,6 +415,7 @@ object WeReadAccountPool {
 
     /** Decisive 401/-2012 transition: expire and increment recovery attempts in one durable write. */
     fun markAuthExpired(vid: String, reason: String = "凭证失效"): Int {
+        probeSuccessAt.remove(vid)
         var count = 0
         val updated = mutate(vid) { account ->
             // Health checks can observe the same expired account repeatedly. Count the
@@ -419,6 +438,7 @@ object WeReadAccountPool {
 
     /** 手动启用 / 禁用 */
     fun setEnabled(vid: String, enabled: Boolean): Boolean {
+        if (!enabled) probeSuccessAt.remove(vid)
         val updated = mutate(vid) { account ->
             account.status = if (enabled) AccountStatus.ACTIVE else AccountStatus.DISABLED
             account.disabledReason = if (enabled) "" else "手动禁用"

@@ -13,12 +13,17 @@ import java.time.Instant
 object WeReadEinkRuntime {
     private val logger = LoggerFactory.getLogger(WeReadEinkRuntime::class.java)
     private val runtimeLock = Any()
+    private val credentialWriteLock = Any()
 
     @Volatile
     private var activeSession: WeReadEinkSession? = null
 
     @Volatile
     private var activeSyncService: WeReadEinkSyncService? = null
+
+    /** Monotonically changes whenever the live session is replaced or invalidated. */
+    @Volatile
+    private var sessionGeneration: Long = 0L
 
     @Volatile
     private var recoveryScope: CoroutineScope? = null
@@ -57,7 +62,12 @@ object WeReadEinkRuntime {
     fun session(): WeReadEinkSession? = activeSession
 
     fun installCredentials(credentials: WeReadEinkCredentials) {
-        credentialStore().save(credentials)
+        // Invalidate the old session before writing the QR result. This closes the race where a
+        // task holding the old session could persist its rotated snapshot after QR login.
+        synchronized(runtimeLock) { sessionGeneration++ }
+        synchronized(credentialWriteLock) {
+            credentialStore().save(credentials)
+        }
         checkNotNull(reload()) { "E-Ink credentials were saved but the runtime could not be reloaded" }
         authState = "HEALTHY"
         lastProbeAt = System.currentTimeMillis()
@@ -66,13 +76,20 @@ object WeReadEinkRuntime {
     }
 
     fun reload(): WeReadEinkSyncService? = synchronized(runtimeLock) {
+        val generation = ++sessionGeneration
+        synchronized(credentialWriteLock) {
+            reloadLocked(generation)
+        }
+    }
+
+    private fun reloadLocked(generation: Long): WeReadEinkSyncService? {
         resetRuntimeHistory()
         if (!AppConfig.wereadEinkEnabled) {
             activeSession = null
             activeSyncService = null
             authState = "DISABLED"
             logger.info("E-Ink 同步通道未启用")
-            return@synchronized null
+            return null
         }
 
         val credentials = try {
@@ -82,26 +99,32 @@ object WeReadEinkRuntime {
             activeSyncService = null
             authState = "CREDENTIAL_LOAD_FAILED"
             logger.warn("E-Ink 凭证读取失败，仅使用本地缓存: ${error.message}")
-            return@synchronized null
+            return null
         }
         if (credentials == null) {
             activeSession = null
             activeSyncService = null
             authState = "UNCONFIGURED"
             logger.warn("未找到 E-Ink 凭证文件；可调用 /api/weread/eink/login/start 扫码登录")
-            return@synchronized null
+            return null
         }
 
-        return@synchronized try {
+        return try {
             val session = WeReadEinkSession(
                 initialCredentials = credentials,
                 credentialStore = credentialStore(),
                 baseUrl = AppConfig.wereadEinkBaseUrl,
+                isCurrentSession = { sessionGeneration == generation },
+                persistenceLock = credentialWriteLock,
                 refreshRetryInitialDelayMs = AppConfig.wereadEinkRefreshRetryInitial * 1000L,
                 refreshRetryMaxDelayMs = AppConfig.wereadEinkRefreshRetryMax * 1000L,
                 refreshRequest = { vid, block -> WeReadEinkRequestGate.execute(vid, block) },
-                onRefreshFailure = ::handleRefreshFailure,
-                onRefreshSuccess = { authState = "HEALTHY" },
+                onRefreshFailure = { error ->
+                    if (sessionGeneration == generation) handleRefreshFailure(error)
+                },
+                onRefreshSuccess = {
+                    if (sessionGeneration == generation) authState = "HEALTHY"
+                },
             )
             val service = WeReadEinkSyncService(
                 session = session,

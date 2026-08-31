@@ -46,6 +46,8 @@ auth:
 
 weread:
   auto_relogin_enabled: false
+  health_check_interval: 300
+  web_probe_freshness: 600
   eink:
     enabled: true
     auto_relogin_enabled: false

@@ -47,6 +47,8 @@ weread:
   refresh_fail_threshold: 3
   auto_relogin_enabled: false  # 仅探测并告警；设为 true 才自动推送二维码或交给 ADB 恢复
   relogin_retry_backoff: 300   # Web 自动恢复失败后的最小重试间隔（秒）
+  health_check_interval: 300   # Web 凭证健康检查间隔（秒）
+  web_probe_freshness: 600     # /api/ready 认可最近一次成功探测的最长时间（秒）
   eink:
     enabled: true               # 真实 accessToken/refreshToken 续签通道，不依赖 ADB
     base_url: "https://i.weread.qq.com"

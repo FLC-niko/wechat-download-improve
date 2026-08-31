@@ -173,6 +173,53 @@ class WeReadEinkSessionTest {
         }
     }
 
+    @Test
+    fun `request credentials honor refresh backoff before making another API request`() {
+        var refreshRequests = 0
+        val session = WeReadEinkSession(
+            initialCredentials = credentials().copy(accessTokenExpiresAt = 900L),
+            transport = WeReadEinkTransport {
+                refreshRequests++
+                WeReadEinkResponse(503, "service unavailable")
+            },
+            baseUrl = "https://eink.example.test",
+            clock = { 1_000L },
+            refreshRetryInitialDelayMs = 100L,
+            refreshRetryMaxDelayMs = 1_000L,
+        )
+
+        assertFailsWith<WeReadEinkApiException> { session.refresh() }
+        assertFailsWith<WeReadEinkRefreshBackoffException> { session.credentialsForRequest() }
+        assertEquals(1, refreshRequests)
+    }
+
+    @Test
+    fun `retired session drops pending persistence instead of writing old credentials`() {
+        val root = Files.createTempDirectory("weread-eink-retired-session-").toFile()
+        val credentialFile = File(root, "credentials.json")
+        val store = WeReadEinkCredentialStore(credentialFile)
+        val current = credentials().copy(accessToken = "new-access", refreshToken = "new-refresh")
+        store.save(current)
+        val retired = WeReadEinkSession(
+            initialCredentials = credentials(),
+            transport = WeReadEinkTransport {
+                WeReadEinkResponse(200, "{\"accessToken\":\"old-access\",\"refreshToken\":\"old-refresh\"}")
+            },
+            credentialStore = store,
+            baseUrl = "https://eink.example.test",
+            isCurrentSession = { false },
+        )
+
+        try {
+            retired.refresh()
+
+            assertEquals(current, store.load())
+            assertFalse(retired.hasPendingPersistence())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     private fun credentials() = WeReadEinkCredentials(
         vid = "vid-1",
         accessToken = "access-1",
