@@ -11,7 +11,7 @@ store:
 
 auth:
   credentials_file: data/.credentials.json
-  auto_recovery_enabled: false # Worker 默认不在启动后自动发起扫码；使用 API 手动恢复
+  auto_recovery_enabled: false # 仅探测并告警；设为 true 才自动推送二维码恢复
 
 rss:
   enabled: false             # MQ 采集服务默认关闭后台轮询，避免与任务争抢账号配额
@@ -45,7 +45,8 @@ weread:
   account_dir: "data/weread_accounts"
   refresh_interval: 3000
   refresh_fail_threshold: 3
-  auto_relogin_enabled: false  # 失效时仅告警/手动登录，避免服务自行弹出二维码
+  auto_relogin_enabled: false  # 仅探测并告警；设为 true 才自动推送二维码或交给 ADB 恢复
+  relogin_retry_backoff: 300   # Web 自动恢复失败后的最小重试间隔（秒）
   eink:
     enabled: true               # 真实 accessToken/refreshToken 续签通道，不依赖 ADB
     base_url: "https://i.weread.qq.com"
@@ -54,12 +55,22 @@ weread:
     page_size: 50
     max_pages: 1000
     refresh_check_interval: 60  # 只检查服务端明确返回的过期时间
+    health_check_interval: 300  # 未知过期时间时，使用轻量文章请求主动探活
     refresh_skew: 300           # 已知到期时间前 5 分钟续签；未知时按 401/-2012 续签
-    auto_relogin_enabled: false # E-Ink refreshToken 失效后是否自动推送新二维码
+    refresh_retry_initial: 30   # 临时刷新失败的首次退避（秒）
+    refresh_retry_max: 900      # 临时刷新失败的最大退避（秒）
+    sync_retry_backoff: 300     # 后台增量同步失败后的退避（秒）
+    max_transient_retries: 2    # 单个 E-Ink 请求的临时错误重试次数
+    retry_base_delay: 2         # 临时错误重试基础延迟（秒）
+    max_concurrent_per_account: 1
+    min_request_interval: 1     # 同一 E-Ink 账号请求最小间隔（秒）
+    auto_relogin_enabled: false # 仅探测并告警；设为 true 才自动推送新二维码
+    relogin_retry_backoff: 300  # 自动二维码流程失败后的最小重试间隔（秒）
 
 adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启
   poll_interval_ms: 15000
+  recovery_max_delay_ms: 900000
 
 # 主微信接口返回 200013 后不会因降低频率而恢复，默认禁用。
 wx:

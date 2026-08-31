@@ -50,6 +50,10 @@ object WebhookNotifier {
         "verification_required" to "触发验证",
         "qr_code_pushed" to "二维码已推送",
         "weread_eink_persistence_failed" to "微信读书 E-Ink 凭证落盘失败",
+        "weread_eink_expired" to "微信读书 E-Ink 登录失效",
+        "weread_eink_recovered" to "微信读书 E-Ink 登录恢复",
+        "weread_accounts_expired" to "微信读书 Web 账号失效",
+        "weread_account_recovered" to "微信读书 Web 账号恢复",
     )
 
     private fun enabled(): Boolean =
@@ -63,11 +67,13 @@ object WebhookNotifier {
 
         // 防重复：同一事件在间隔内只通知一次
         val now = System.currentTimeMillis() / 1000
-        val last = lastNotification[event] ?: 0
+        val dedupKey = data["vid"]?.toString()?.takeIf { it.isNotBlank() }
+            ?.let { "$event:$it" }
+            ?: event
+        val last = lastNotification[dedupKey] ?: 0
         if (now - last < AppConfig.webhookNotificationInterval) {
             return false
         }
-        lastNotification[event] = now
 
         val label = eventLabels[event] ?: event
         val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
@@ -82,21 +88,24 @@ object WebhookNotifier {
             }
         }
 
-        var success = true
+        var success = false
 
         // 企业微信
         val wecomUrl = AppConfig.wecomWebhookUrl
         if (wecomUrl.isNotEmpty()) {
-            success = sendWecomMarkdown(wecomUrl, lines) && success
+            success = sendWecomMarkdown(wecomUrl, lines) || success
         }
 
         // 飞书
         val feishuUrl = AppConfig.feishuWebhookUrl
         if (feishuUrl.isNotEmpty()) {
-            success = sendFeishuCard(feishuUrl, label, lines) && success
+            success = sendFeishuCard(feishuUrl, label, lines) || success
         }
 
-        if (success) logger.info("通知已发送: $event")
+        if (success) {
+            lastNotification[dedupKey] = now
+            logger.info("通知已发送: $event")
+        }
         return success
     }
 
@@ -113,6 +122,7 @@ object WebhookNotifier {
         imageBytes: ByteArray,
         message: String = "",
         fileName: String = "wx_qrcode.png",
+        localFileAvailable: Boolean = true,
     ): QrPushResult {
         val wecomUrl = AppConfig.wecomWebhookUrl
         val feishuUrl = AppConfig.feishuWebhookUrl
@@ -139,7 +149,7 @@ object WebhookNotifier {
         } else false
 
         // 飞书：推卡片消息（含二维码访问链接）
-        val feishuSuccess = if (feishuUrl.isNotEmpty()) {
+        val feishuSuccess = if (feishuUrl.isNotEmpty() && localFileAvailable) {
             try {
                 val safeFileName = fileName.substringAfterLast('/').substringAfterLast('\\')
                 val qrUrl = "${AppConfig.siteUrl}/qrcode/$safeFileName?v=${System.currentTimeMillis()}"
@@ -163,7 +173,12 @@ object WebhookNotifier {
                 logger.error("飞书推送二维码失败: ${e.message}")
                 false
             }
-        } else false
+        } else {
+            if (feishuUrl.isNotEmpty() && !localFileAvailable) {
+                logger.error("飞书二维码推送跳过：本地二维码文件不可访问")
+            }
+            false
+        }
 
         val result = QrPushResult(wecomSuccess, feishuSuccess)
         if (result.anySuccess) {

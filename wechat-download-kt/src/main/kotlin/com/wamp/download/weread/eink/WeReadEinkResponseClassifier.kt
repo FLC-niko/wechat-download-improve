@@ -8,6 +8,7 @@ enum class WeReadEinkResponseKind {
     RATE_LIMITED,
     HUMAN_VERIFY,
     RETRYABLE_HTTP_ERROR,
+    APPLICATION_ERROR,
     HTTP_ERROR,
 }
 
@@ -27,17 +28,22 @@ internal object WeReadEinkResponseClassifier {
             response.statusCode == 429 -> WeReadEinkResponseKind.RATE_LIMITED
             response.statusCode in 500..599 -> WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
             response.statusCode !in 200..299 -> WeReadEinkResponseKind.HTTP_ERROR
+            error.kind == WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR -> WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
+            error.errCode != null && error.errCode != 0 -> WeReadEinkResponseKind.APPLICATION_ERROR
             else -> WeReadEinkResponseKind.SUCCESS
         }
         return error.copy(kind = kind)
     }
 
     private fun parseError(raw: String): WeReadEinkResponseClassification {
-        if (raw.isBlank()) return WeReadEinkResponseClassification(WeReadEinkResponseKind.SUCCESS)
+        // A gateway/WAF can return HTTP 200 with an HTML page, an empty body, or an array.
+        // None of those is a valid E-Ink API response; keep it retryable instead of allowing
+        // the caller to interpret it as an authentication failure or an empty article page.
+        if (raw.isBlank()) return WeReadEinkResponseClassification(WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR)
         return try {
             val root = JsonParser.parseString(raw)
             if (!root.isJsonObject) {
-                WeReadEinkResponseClassification(WeReadEinkResponseKind.SUCCESS)
+                WeReadEinkResponseClassification(WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR)
             } else {
                 val obj = root.asJsonObject
                 val codeElement = obj.get("errCode") ?: obj.get("errcode")
@@ -51,7 +57,7 @@ internal object WeReadEinkResponseClassifier {
                 )
             }
         } catch (_: Exception) {
-            WeReadEinkResponseClassification(WeReadEinkResponseKind.SUCCESS)
+            WeReadEinkResponseClassification(WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR)
         }
     }
 }

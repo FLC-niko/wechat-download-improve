@@ -24,6 +24,8 @@ object WeReadAccountPool {
 
     private val accounts = ConcurrentHashMap<String, WeReadAccount>()  // vid -> account
     private val inUse = ConcurrentHashMap<String, Boolean>()           // vid -> 占用标记
+    private val persistenceErrors = ConcurrentHashMap<String, String>()
+    private val registryLock = Any()
     private val saveLock = Any()
     private val scheduleLock = Any()
 
@@ -36,6 +38,9 @@ object WeReadAccountPool {
     // ── 加载 / 迁移 ──────────────────────────────
 
     fun loadAll() {
+        accounts.clear()
+        inUse.clear()
+        persistenceErrors.clear()
         migrateLegacy()
         accountDir().listFiles()
             ?.filter { it.isFile && it.name.endsWith(".json") }
@@ -66,7 +71,7 @@ object WeReadAccountPool {
             if (creds.wrVid.isNotBlank() && !accounts.containsKey(creds.wrVid)) {
                 val acc = WeReadAccount(vid = creds.wrVid, credentials = creds)
                 accounts[creds.wrVid] = acc
-                save(acc)
+                check(save(acc)) { "failed to persist migrated account ${creds.wrVid}" }
                 logger.info("已从旧单账号文件迁移: vid=${creds.wrVid}, username=${creds.username}")
             }
             legacy.delete()
@@ -81,6 +86,8 @@ object WeReadAccountPool {
     fun list(): List<WeReadAccount> = accounts.values.sortedBy { it.vid }
 
     fun get(vid: String): WeReadAccount? = accounts[vid]
+
+    fun persistenceError(vid: String): String? = persistenceErrors[vid]
 
     fun size(): Int = accounts.size
 
@@ -104,9 +111,14 @@ object WeReadAccountPool {
 
     /** 新增账号（vid 已存在则返回 false） */
     fun addAccount(account: WeReadAccount): Boolean {
-        if (account.vid.isBlank() || accounts.containsKey(account.vid)) return false
-        accounts[account.vid] = account
-        save(account)
+        if (account.vid.isBlank()) return false
+        synchronized(registryLock) {
+            if (accounts.containsKey(account.vid)) return false
+            synchronized(account) {
+                if (!save(account)) return false
+                accounts[account.vid] = account
+            }
+        }
         logger.info("微信读书账号已添加: vid=${account.vid}, username=${account.credentials.username}")
         return true
     }
@@ -115,14 +127,14 @@ object WeReadAccountPool {
     fun upsertCredentials(creds: WeReadWebCredentials): Boolean {
         val existing = accounts[creds.wrVid]
         return if (existing != null) {
-            existing.credentials = creds
-            if (existing.status == AccountStatus.EXPIRED || existing.status == AccountStatus.COOLDOWN) {
-                existing.status = AccountStatus.ACTIVE
-                existing.cooldownUntil = 0L
-                existing.disabledReason = ""
+            mutate(existing.vid) { account ->
+                account.credentials = creds
+                if (account.status == AccountStatus.EXPIRED || account.status == AccountStatus.COOLDOWN) {
+                    account.status = AccountStatus.ACTIVE
+                    account.cooldownUntil = 0L
+                    account.disabledReason = ""
+                }
             }
-            save(existing)
-            true
         } else {
             addAccount(WeReadAccount(vid = creds.wrVid, credentials = creds))
         }
@@ -130,35 +142,57 @@ object WeReadAccountPool {
 
     /** 更新指定账号的凭证 */
     fun updateCredentials(vid: String, creds: WeReadWebCredentials): Boolean {
-        val acc = accounts[vid] ?: return false
-        acc.credentials = creds
-        save(acc)
-        return true
+        return mutate(vid) { it.credentials = creds }
     }
 
-    /** 持久化恢复流程更新过的账号元数据。 */
-    fun saveForRecovery(account: WeReadAccount) {
-        if (accounts[account.vid] === account) save(account)
+    fun completeRecovery(
+        vid: String,
+        credentials: WeReadWebCredentials,
+        boundSerial: String,
+        boundUserId: Int,
+    ): Boolean = mutate(vid) { account ->
+        account.credentials = credentials
+        account.status = AccountStatus.ACTIVE
+        account.disabledReason = ""
+        account.cooldownUntil = 0L
+        account.boundSerial = boundSerial
+        account.boundUserId = boundUserId
     }
+
+    fun bindRecoveryDevice(vid: String, serial: String, userId: Int, strategy: String): Boolean =
+        mutate(vid) { account ->
+            account.boundSerial = serial
+            account.boundUserId = userId
+            account.bindingStrategy = strategy
+        }
 
     /** 主动刷新成功后调用：更新时间戳、清零失败计数 */
     fun markRefreshed(vid: String) {
-        val acc = accounts[vid] ?: return
-        updateCredentials(
-            vid,
-            acc.credentials.copy(
+        mutate(vid) { account ->
+            account.credentials = account.credentials.copy(
                 lastRefreshTime = System.currentTimeMillis(),
                 refreshFailCount = 0,
-            ),
-        )
+            )
+        }
+    }
+
+    /** A successful authenticated probe clears stale failures without pretending a token was renewed. */
+    fun markProbeSuccess(vid: String) {
+        mutateIf(vid) { account ->
+            if (account.credentials.refreshFailCount == 0) return@mutateIf false
+            account.credentials = account.credentials.copy(refreshFailCount = 0)
+            true
+        }
     }
 
     /** 刷新失败时调用：递增连续失败计数 */
     fun markRefreshFailed(vid: String): Int {
-        val acc = accounts[vid] ?: return 0
-        val count = acc.credentials.refreshFailCount + 1
-        updateCredentials(vid, acc.credentials.copy(refreshFailCount = count))
-        return count
+        var count = 0
+        val updated = mutate(vid) { account ->
+            count = account.credentials.refreshFailCount + 1
+            account.credentials = account.credentials.copy(refreshFailCount = count)
+        }
+        return if (updated) count else 0
     }
 
     /**
@@ -170,61 +204,71 @@ object WeReadAccountPool {
      */
     fun updateFromSetCookie(vid: String, setCookies: List<String>, username: String? = null): Boolean {
         if (setCookies.isEmpty()) return false
-        val acc = accounts[vid] ?: return false
-        val creds = acc.credentials
-        if (creds.wrVid.isBlank()) return false
 
-        var newSkey = creds.wrSkey
-        var newVid = creds.wrVid
-        var newRt = creds.wrRt
-        var changed = false
-
-        for (header in setCookies) {
+        val parsed = setCookies.mapNotNull { header ->
             val pair = header.substringBefore(';').trim()
             val idx = pair.indexOf('=')
-            if (idx <= 0) continue
+            if (idx <= 0) return@mapNotNull null
             val name = pair.substring(0, idx).trim()
             val value = pair.substring(idx + 1).trim()
-            when (name) {
-                "wr_skey" -> if (value.isNotEmpty()) { newSkey = value; changed = true }
-                "wr_vid" -> if (value.isNotEmpty()) { newVid = value; changed = true }
-                "wr_rt" -> if (value.isNotEmpty()) { newRt = value; changed = true }
-            }
-        }
+            if (value.isEmpty()) return@mapNotNull null
+            name to value
+        }.toMap()
+        if (parsed.keys.none { it == "wr_skey" || it == "wr_vid" || it == "wr_rt" }) return false
 
-        if (!changed) return false
-
-        updateCredentials(
-            vid,
-            creds.copy(
-                wrSkey = newSkey,
-                wrVid = newVid,
-                wrRt = newRt,
+        return mutateIf(vid) { account ->
+            val creds = account.credentials
+            if (creds.wrVid.isBlank()) return@mutateIf false
+            account.credentials = creds.copy(
+                wrSkey = parsed["wr_skey"] ?: creds.wrSkey,
+                wrVid = parsed["wr_vid"] ?: creds.wrVid,
+                wrRt = parsed["wr_rt"] ?: creds.wrRt,
                 username = username ?: creds.username,
                 lastRefreshTime = System.currentTimeMillis(),
                 refreshFailCount = 0,
-            ),
-        )
-        return true
+            )
+            true
+        }
     }
 
     /** 删除账号 */
     fun delete(vid: String): Boolean {
-        val removed = accounts.remove(vid) != null
-        inUse.remove(vid)
-        val file = File(accountDir(), "$vid.json")
-        if (file.exists()) file.delete()
+        var removed = false
+        synchronized(registryLock) {
+            val account = accounts[vid]
+            if (account != null) {
+                synchronized(account) {
+                    val file = File(accountDir(), "$vid.json")
+                    val persisted = try {
+                        Files.deleteIfExists(file.toPath())
+                        true
+                    } catch (error: Exception) {
+                        persistenceErrors[vid] = error.message ?: error.javaClass.simpleName
+                        logger.error("微信读书账号删除失败: vid=$vid, ${error.message}")
+                        false
+                    }
+                    if (persisted) {
+                        removed = accounts.remove(vid, account)
+                        if (removed) {
+                            inUse.remove(vid)
+                            persistenceErrors.remove(vid)
+                        }
+                    }
+                }
+            }
+        }
         if (removed) logger.info("微信读书账号已删除: vid=$vid")
         return removed
     }
 
     /** 持久化单个账号 */
-    private fun save(account: WeReadAccount) {
+    private fun save(account: WeReadAccount): Boolean {
         synchronized(saveLock) {
             val dir = accountDir()
             val file = File(dir, "${account.vid}.json")
-            val temp = File.createTempFile(".${account.vid}.", ".json.tmp", dir)
+            var temp: File? = null
             try {
+                temp = File.createTempFile(".${account.vid}.", ".json.tmp", dir)
                 temp.writeText(gson.toJson(account))
                 try {
                     Files.move(
@@ -240,11 +284,46 @@ object WeReadAccountPool {
                         StandardCopyOption.REPLACE_EXISTING,
                     )
                 }
+                persistenceErrors.remove(account.vid)
+                return true
             } catch (e: Exception) {
-                temp.delete()
+                temp?.delete()
+                persistenceErrors[account.vid] = e.message ?: e.javaClass.simpleName
                 logger.error("微信读书账号保存失败: vid=${account.vid}, ${e.message}")
+                return false
             }
         }
+    }
+
+    private fun mutate(vid: String, change: (WeReadAccount) -> Unit): Boolean {
+        return mutateIf(vid) {
+            change(it)
+            true
+        }
+    }
+
+    private fun mutateIf(vid: String, change: (WeReadAccount) -> Boolean): Boolean {
+        val account = accounts[vid] ?: return false
+        synchronized(account) {
+            val before = account.copy()
+            if (!change(account)) return false
+            if (save(account)) return true
+            restore(account, before)
+            return false
+        }
+    }
+
+    private fun restore(target: WeReadAccount, source: WeReadAccount) {
+        target.credentials = source.credentials
+        target.boundSerial = source.boundSerial
+        target.boundUserId = source.boundUserId
+        target.bindingStrategy = source.bindingStrategy
+        target.status = source.status
+        target.totalRequests = source.totalRequests
+        target.freqControlCount = source.freqControlCount
+        target.lastUsedTime = source.lastUsedTime
+        target.cooldownUntil = source.cooldownUntil
+        target.disabledReason = source.disabledReason
     }
 
     // ── 调度：取号 / 释放 ────────────────────────
@@ -264,10 +343,12 @@ object WeReadAccountPool {
             .minWithOrNull(compareBy<WeReadAccount> { it.lastUsedTime }.thenBy { it.freqControlCount })
         if (chosen != null) {
             if (chosen.status == AccountStatus.COOLDOWN) {
-                chosen.status = AccountStatus.ACTIVE
-                chosen.cooldownUntil = 0L
-                chosen.disabledReason = ""
-                save(chosen)
+                val restored = mutate(chosen.vid) {
+                    it.status = AccountStatus.ACTIVE
+                    it.cooldownUntil = 0L
+                    it.disabledReason = ""
+                }
+                if (!restored) return@synchronized null
                 logger.info("微信读书账号冷却到期，已自动恢复: vid=${chosen.vid}")
             }
             inUse[chosen.vid] = true
@@ -284,41 +365,66 @@ object WeReadAccountPool {
 
     /** 请求成功：累计次数 + 更新最后使用时间 */
     fun markSuccess(vid: String) {
-        val acc = accounts[vid] ?: return
-        acc.totalRequests++
-        acc.lastUsedTime = System.currentTimeMillis()
-        save(acc)
+        mutate(vid) {
+            it.totalRequests++
+            it.lastUsedTime = System.currentTimeMillis()
+        }
     }
 
     /** 疑似频控：累计频控次数 + 进入冷却（到期自动恢复 ACTIVE） */
     fun markFreqControl(vid: String, cooldownSec: Long = AppConfig.wereadFreqControlCooldown) {
-        val acc = accounts[vid] ?: return
-        acc.freqControlCount++
-        acc.lastUsedTime = System.currentTimeMillis()
-        acc.cooldownUntil = System.currentTimeMillis() + cooldownSec * 1000
-        acc.status = AccountStatus.COOLDOWN
-        acc.disabledReason = "频控冷却 ${cooldownSec}s"
-        save(acc)
-        logger.warn("微信读书账号频控冷却: vid=$vid, 累计 ${acc.freqControlCount} 次, 冷却 ${cooldownSec}s")
+        val updated = mutate(vid) { account ->
+            account.freqControlCount++
+            account.lastUsedTime = System.currentTimeMillis()
+            account.cooldownUntil = System.currentTimeMillis() + cooldownSec * 1000
+            account.status = AccountStatus.COOLDOWN
+            account.disabledReason = "频控冷却 ${cooldownSec}s"
+        }
+        if (updated) {
+            logger.warn("微信读书账号频控冷却: vid=$vid, 累计 ${accounts[vid]?.freqControlCount} 次, 冷却 ${cooldownSec}s")
+        }
     }
 
     /** 凭证失效：标记 EXPIRED（需重新扫码） */
-    fun markExpired(vid: String, reason: String = "凭证失效") {
-        val acc = accounts[vid] ?: return
-        acc.status = AccountStatus.EXPIRED
-        acc.disabledReason = reason
-        save(acc)
-        logger.warn("微信读书账号标记失效: vid=$vid, reason=$reason")
+    fun markExpired(vid: String, reason: String = "凭证失效"): Boolean {
+        val updated = mutate(vid) {
+            it.status = AccountStatus.EXPIRED
+            it.disabledReason = reason
+        }
+        if (updated) logger.warn("微信读书账号标记失效: vid=$vid, reason=$reason")
+        return updated
+    }
+
+    /** Decisive 401/-2012 transition: expire and increment recovery attempts in one durable write. */
+    fun markAuthExpired(vid: String, reason: String = "凭证失效"): Int {
+        var count = 0
+        val updated = mutate(vid) { account ->
+            // Health checks can observe the same expired account repeatedly. Count the
+            // transition once; otherwise a long outage eventually overflows the counter and
+            // makes the metric look like repeated refresh attempts.
+            count = if (account.status == AccountStatus.EXPIRED) {
+                account.credentials.refreshFailCount
+            } else {
+                account.credentials.refreshFailCount + 1
+            }
+            if (account.status != AccountStatus.EXPIRED) {
+                account.credentials = account.credentials.copy(refreshFailCount = count)
+            }
+            account.status = AccountStatus.EXPIRED
+            account.disabledReason = reason
+        }
+        if (updated) logger.warn("微信读书账号鉴权失效: vid=$vid, count=$count, reason=$reason")
+        return if (updated) count else 0
     }
 
     /** 手动启用 / 禁用 */
     fun setEnabled(vid: String, enabled: Boolean): Boolean {
-        val acc = accounts[vid] ?: return false
-        acc.status = if (enabled) AccountStatus.ACTIVE else AccountStatus.DISABLED
-        acc.disabledReason = if (enabled) "" else "手动禁用"
-        acc.cooldownUntil = 0L
-        save(acc)
-        logger.info("微信读书账号已${if (enabled) "启用" else "禁用"}: vid=$vid")
-        return true
+        val updated = mutate(vid) { account ->
+            account.status = if (enabled) AccountStatus.ACTIVE else AccountStatus.DISABLED
+            account.disabledReason = if (enabled) "" else "手动禁用"
+            account.cooldownUntil = 0L
+        }
+        if (updated) logger.info("微信读书账号已${if (enabled) "启用" else "禁用"}: vid=$vid")
+        return updated
     }
 }

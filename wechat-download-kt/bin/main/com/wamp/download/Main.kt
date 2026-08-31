@@ -30,6 +30,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -43,7 +44,7 @@ fun main() {
     val logger = LoggerFactory.getLogger("Main")
     val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    WeReadEinkRuntime.initialize()
+    WeReadEinkRuntime.initialize(scope)
 
     // 动态发现 adb devices；不写死 USB 序列号或无线 ADB 地址。
     val adbDeviceSupervisor = AdbDeviceSupervisor()
@@ -52,17 +53,19 @@ fun main() {
         scope = scope,
     )
     if (AppConfig.adbEnabled) {
-        com.wamp.download.weread.WeReadWebAuth.deviceRecoveryHandler = recoveryManager::request
+        com.wamp.download.weread.WeReadWebAuth.configureRecovery(scope, recoveryManager::request)
         adbDeviceSupervisor.refresh()
         adbDeviceSupervisor.start(scope)
         recoveryManager.start()
+    } else {
+        com.wamp.download.weread.WeReadWebAuth.configureRecovery(scope)
     }
 
     // 微信 API 客户端（搜索公众号 + 获取文章）
     val wxClient = WxApiClient()
 
     // 登录状态检查器（定时探测 + 恢复流程）
-    val loginChecker = LoginChecker(wxClient = wxClient)
+    val loginChecker = LoginChecker(wxClient = wxClient, scope = scope)
 
     // RabbitMQ 服务（消费任务队列）
     val rabbitMqService = RabbitMqService()
@@ -79,6 +82,8 @@ fun main() {
         logger.info("收到关闭信号，正在清理资源...")
         // 先取消后台协程，让轮询/消费/保活立即停止
         scope.cancel()
+        loginChecker.stop()
+        LoginReminder.stop()
         adbDeviceSupervisor.stop()
         try {
             // RabbitMQ 关闭是阻塞网络调用，断网/自动恢复时可能长时间不返回；
@@ -119,28 +124,41 @@ fun main() {
             scope.launch { RssPoller.start() }
         }
         scope.launch { LoginReminder.start() }
-        if (AppConfig.authAutoRecoveryEnabled) {
-            scope.launch { loginChecker.start() }
-        }
-        // 启动凭证健康检查：按明确到期时间续签 E-Ink，并探测 Web 账号，
-        // 避免失效凭证躺到第一个任务失败才发现。
+        // 主微信始终周期探测；开关只决定失效后是否自动发起二维码恢复。
+        loginChecker.start()
+        // 周期凭证健康检查：E-Ink 未知过期时间也会真实探活，EXPIRED Web 账号会恢复排队。
         scope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(10_000)
-            try {
-                CredentialHealthChecker.checkAll(scope)
-            } catch (e: Exception) {
-                logger.warn("启动凭证健康检查异常: ${e.message}")
+            while (isActive) {
+                try {
+                    CredentialHealthChecker.checkAll()
+                } catch (e: Exception) {
+                    logger.warn("周期凭证健康检查异常: ${e.message}")
+                }
+                kotlinx.coroutines.delay(AppConfig.wereadEinkHealthCheckInterval * 1000L)
             }
         }
         // E-Ink 只按服务端明确过期时间提前续签；未提供日期时由 401/-2012 触发真实 /login 续签。
         scope.launch {
-            while (true) {
+            while (isActive) {
                 try {
                     WeReadEinkRuntime.refreshIfExpiryDue()
                 } catch (e: Exception) {
                     logger.warn("E-Ink token 续签检查异常: ${e.message}")
                 }
                 kotlinx.coroutines.delay(AppConfig.wereadEinkRefreshCheckInterval * 1000)
+            }
+        }
+        // 每个调度周期最多同步一个到期订阅，避免重启后并发打满 E-Ink 接口。
+        scope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(30_000)
+            while (isActive) {
+                try {
+                    WeReadEinkRuntime.syncNextDueSubscription()
+                } catch (e: Exception) {
+                    logger.warn("E-Ink 后台增量同步调度异常: ${e.message}")
+                }
+                kotlinx.coroutines.delay(AppConfig.wereadEinkRefreshCheckInterval * 1000L)
             }
         }
         scope.launch {
@@ -159,7 +177,18 @@ fun main() {
 
         routing {
             get("/") { call.respondText("wechat-download-kt is running") }
-            get("/api/health") { call.respondText("""{"status":"ok"}""") }
+            get("/api/health") { call.respond(healthSnapshot(rabbitMqService)) }
+            get("/api/ready") {
+                val health = healthSnapshot(rabbitMqService)
+                call.respond(
+                    if (health["ready"] == true) {
+                        io.ktor.http.HttpStatusCode.OK
+                    } else {
+                        io.ktor.http.HttpStatusCode.ServiceUnavailable
+                    },
+                    health,
+                )
+            }
 
             get("/api/adb/status") {
                 val snapshot = adbDeviceSupervisor.snapshot()
@@ -169,6 +198,7 @@ fun main() {
                         mapOf("serial" to device.serial, "user_ids" to device.userIds)
                     },
                     "pending_recovery_vids" to recoveryManager.pendingVids(),
+                    "recovery" to recoveryManager.status(),
                 ))
             }
 
@@ -210,6 +240,7 @@ fun main() {
                     "nickname" to com.wamp.download.auth.AuthManager.get().nickname,
                     "expire_time" to com.wamp.download.auth.AuthManager.get().expireTime,
                     "channel" to channelState,
+                    "recovery" to loginChecker.recoveryStatus(),
                 ))
             }
 
@@ -279,8 +310,15 @@ fun main() {
             post("/api/weread/account/enable") {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
-                val ok = com.wamp.download.weread.WeReadAccountPool.setEnabled(vid, true)
-                call.respond(mapOf("ok" to ok, "vid" to vid))
+                val account = com.wamp.download.weread.WeReadAccountPool.get(vid)
+                val probe = account?.let { com.wamp.download.weread.WeReadWebClient().probeAccount(it) }
+                val ok = probe == com.wamp.download.weread.WeReadWebResponseKind.SUCCESS &&
+                    com.wamp.download.weread.WeReadAccountPool.setEnabled(vid, true)
+                if (probe == com.wamp.download.weread.WeReadWebResponseKind.AUTH_EXPIRED) {
+                    com.wamp.download.weread.WeReadAccountPool.markAuthExpired(vid, "手动启用前探测仍失效")
+                    com.wamp.download.weread.WeReadWebAuth.requestReloginIfNeeded(vid, force = true)
+                }
+                call.respond(mapOf("ok" to ok, "vid" to vid, "probe" to probe?.name))
             }
             post("/api/weread/account/disable") {
                 val body = call.receive<Map<String, String>>()
@@ -295,13 +333,13 @@ fun main() {
                 val userId = body["user_id"]?.toIntOrNull() ?: 0
                 val strategy = body["strategy"] ?: "FIXED_DEVICE"
                 val account = com.wamp.download.weread.WeReadAccountPool.get(vid)
-                val ok = account != null && serial.isNotBlank() && strategy in setOf("FIXED_DEVICE", "ELASTIC_DEVICE")
-                if (ok) {
-                    account!!.boundSerial = serial
-                    account.boundUserId = userId
-                    account.bindingStrategy = strategy
-                    com.wamp.download.weread.WeReadAccountPool.saveForRecovery(account)
-                }
+                val valid = account != null && serial.isNotBlank() && strategy in setOf("FIXED_DEVICE", "ELASTIC_DEVICE")
+                val ok = valid && com.wamp.download.weread.WeReadAccountPool.bindRecoveryDevice(
+                    vid,
+                    serial,
+                    userId,
+                    strategy,
+                )
                 call.respond(mapOf("ok" to ok, "vid" to vid, "serial" to serial, "user_id" to userId, "strategy" to strategy))
             }
             post("/api/weread/account/recover") {
@@ -328,7 +366,7 @@ fun main() {
 }
 
 /** 账号列表序列化为路由返回结构 */
-private fun accountMap(accounts: List<com.wamp.download.weread.WeReadAccount>): List<Map<String, Any>> =
+private fun accountMap(accounts: List<com.wamp.download.weread.WeReadAccount>): List<Map<String, Any?>> =
     accounts.map { acc ->
         mapOf(
             "vid" to acc.vid,
@@ -343,5 +381,35 @@ private fun accountMap(accounts: List<com.wamp.download.weread.WeReadAccount>): 
             "cooldown_until" to acc.cooldownUntil,
             "disabled_reason" to acc.disabledReason,
             "refresh_fail_count" to acc.credentials.refreshFailCount,
+            "persistence_error" to com.wamp.download.weread.WeReadAccountPool.persistenceError(acc.vid),
+            "recovery" to com.wamp.download.weread.WeReadWebAuth.recoveryStatus(acc.vid),
         )
     }
+
+private fun healthSnapshot(rabbitMqService: RabbitMqService): Map<String, Any?> {
+    val rabbitStates = rabbitMqService.snapshot()
+    val rabbitReady = rabbitStates.values.any {
+        it == com.wamp.download.rabbitmq.VhostConnectionState.ACTIVE
+    }
+    val eink = WeReadEinkRuntime.status()
+    val einkReady = eink["operational"] == true
+    val webReady = com.wamp.download.weread.WeReadAccountPool.hasLoggedInAccount()
+    val mainReady = AppConfig.mainEnabled &&
+        com.wamp.download.auth.AuthManager.isLoggedIn() &&
+        !com.wamp.download.auth.AuthManager.isExpired() &&
+        com.wamp.download.task.ChannelStateManager.isMainChannelAvailable()
+    val collectionReady = einkReady || webReady || mainReady
+    val ready = rabbitReady && collectionReady
+    return mapOf(
+        "status" to if (ready) "ok" else "degraded",
+        "live" to true,
+        "ready" to ready,
+        "rabbitmq_ready" to rabbitReady,
+        "collection_ready" to collectionReady,
+        "channels" to mapOf(
+            "eink" to einkReady,
+            "web" to webReady,
+            "main" to mainReady,
+        ),
+    )
+}

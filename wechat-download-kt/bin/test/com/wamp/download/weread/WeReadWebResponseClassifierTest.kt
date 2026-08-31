@@ -50,4 +50,11 @@ class WeReadWebResponseClassifierTest {
 
         assertEquals(WeReadWebResponseKind.SUCCESS, result.kind)
     }
+
+    @Test
+    fun `未知非零业务错误不能当作成功`() {
+        val result = WeReadWebResponseClassifier.classify(200, "{\"errCode\":-2999}")
+
+        assertEquals(WeReadWebResponseKind.APPLICATION_ERROR, result.kind)
+    }
 }

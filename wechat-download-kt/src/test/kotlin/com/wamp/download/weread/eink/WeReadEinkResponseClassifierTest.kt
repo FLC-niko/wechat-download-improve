@@ -19,4 +19,24 @@ class WeReadEinkResponseClassifierTest {
             WeReadEinkResponseClassifier.classify(WeReadEinkResponse(200, "{\"errCode\":-2041}")).kind,
         )
     }
+
+    @Test
+    fun `unknown nonzero application error is never treated as success`() {
+        val result = WeReadEinkResponseClassifier.classify(
+            WeReadEinkResponse(200, "{\"errCode\":-2999,\"errMsg\":\"new error\"}"),
+        )
+
+        assertEquals(WeReadEinkResponseKind.APPLICATION_ERROR, result.kind)
+        assertEquals(-2999, result.errCode)
+    }
+
+    @Test
+    fun `200 non-json body is retryable`() {
+        assertEquals(
+            WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR,
+            WeReadEinkResponseClassifier.classify(
+                WeReadEinkResponse(200, "<html>upstream gateway</html>"),
+            ).kind,
+        )
+    }
 }

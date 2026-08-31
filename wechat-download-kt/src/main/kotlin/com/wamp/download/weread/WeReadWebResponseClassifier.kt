@@ -8,6 +8,7 @@ internal enum class WeReadWebResponseKind {
     RATE_LIMITED,
     HUMAN_VERIFY,
     RETRYABLE_HTTP_ERROR,
+    APPLICATION_ERROR,
     HTTP_ERROR,
 }
 
@@ -26,6 +27,7 @@ internal object WeReadWebResponseClassifier {
             httpCode == 429 || error.errCode == -2014 -> WeReadWebResponseKind.RATE_LIMITED
             httpCode in 500..599 -> WeReadWebResponseKind.RETRYABLE_HTTP_ERROR
             httpCode !in 200..299 -> WeReadWebResponseKind.HTTP_ERROR
+            error.errCode != null && error.errCode != 0 -> WeReadWebResponseKind.APPLICATION_ERROR
             else -> WeReadWebResponseKind.SUCCESS
         }
         return error.copy(kind = kind)

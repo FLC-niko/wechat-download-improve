@@ -5,6 +5,11 @@ import com.google.gson.JsonParser
 import com.google.gson.JsonObject
 import com.wamp.download.config.AppConfig
 import com.wamp.download.notify.WebhookNotifier
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -44,15 +49,25 @@ object WeReadWebAuth {
 
     /** 重新扫码进行中标志（防重入：按账号隔离，每账号同时只发起一次） */
     private val reloginInProgress = ConcurrentHashMap<String, Boolean>()
+    private val reloginFailureCount = ConcurrentHashMap<String, Int>()
+    private val nextReloginAttemptAt = ConcurrentHashMap<String, Long>()
+
+    @Volatile
+    private var recoveryScope: CoroutineScope? = null
 
     /** Worker 启用 ADB 恢复时由启动入口注入；未注入则保留机器人二维码兼容路径。 */
     @Volatile
     var deviceRecoveryHandler: ((String) -> Unit)? = null
 
+    fun configureRecovery(scope: CoroutineScope, handler: ((String) -> Unit)? = null) {
+        recoveryScope = scope
+        deviceRecoveryHandler = handler
+    }
+
     /** 达到重新扫码阈值时异步发起登录（操作主账号，兼容入口） */
-    fun requestReloginIfNeeded() {
-        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return
-        requestReloginIfNeeded(vid)
+    fun requestReloginIfNeeded(): Boolean {
+        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return false
+        return requestReloginIfNeeded(vid)
     }
 
     /**
@@ -61,23 +76,59 @@ object WeReadWebAuth {
      * 在抓取链路（被动刷新失败）中调用，不阻塞当前协程。
      * 由独立线程执行扫码登录流程，结束自动复位标志。
      */
-    fun requestReloginIfNeeded(vid: String) {
-        if (!shouldRelogin(vid)) return
+    fun requestReloginIfNeeded(vid: String, force: Boolean = false): Boolean {
+        val account = WeReadAccountPool.get(vid) ?: return false
+        if (!reloginEligible(
+                status = account.status,
+                refreshFailCount = account.credentials.refreshFailCount,
+                threshold = AppConfig.wereadRefreshFailThreshold,
+                enabled = AppConfig.wereadAutoReloginEnabled,
+                force = force,
+            )
+        ) return false
+        val now = System.currentTimeMillis()
+        if (now < nextReloginAttemptAt.getOrDefault(vid, 0L)) return false
         deviceRecoveryHandler?.let {
             it(vid)
-            return
+            return true
         }
-        if (reloginInProgress.getOrDefault(vid, false)) return
-        if (!shouldRelogin(vid)) return
-        reloginInProgress[vid] = true
-        Thread {
+        if (reloginInProgress.putIfAbsent(vid, true) != null) return false
+        val scope = recoveryScope
+        if (scope == null) {
+            reloginInProgress.remove(vid)
+            logger.error("微信读书自动恢复未配置应用协程，无法启动: vid=$vid")
+            return false
+        }
+        if (!scope.isActive) {
+            reloginInProgress.remove(vid)
+            logger.error("微信读书自动恢复协程已关闭，无法启动: vid=$vid")
+            return false
+        }
+        val job = scope.launch(Dispatchers.IO) {
             try {
-                logger.warn("微信读书连续刷新失败达到阈值，异步触发重新扫码: vid=$vid")
-                startLogin(targetVid = vid)
+                logger.warn("微信读书凭证失效，异步触发重新扫码: vid=$vid")
+                if (startLogin(targetVid = vid, requireNotification = true)) {
+                    reloginFailureCount.remove(vid)
+                    nextReloginAttemptAt.remove(vid)
+                    WebhookNotifier.notify(
+                        "weread_account_recovered",
+                        mapOf("message" to "微信读书 Web 账号已恢复", "vid" to vid),
+                    )
+                } else {
+                    recordReloginFailure(vid)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                logger.error("微信读书自动恢复异常: vid=$vid, ${error.message}", error)
+                recordReloginFailure(vid)
             } finally {
                 reloginInProgress.remove(vid)
             }
-        }.start()
+        }
+        // A cancelled scope can prevent the coroutine body from running at all.
+        job.invokeOnCompletion { reloginInProgress.remove(vid) }
+        return true
     }
 
     /**
@@ -110,12 +161,6 @@ object WeReadWebAuth {
         }
     }
 
-    /** 交由 ADB/AAOS 恢复管理器处理，保留人工通知作为无设备降级。 */
-    fun requestDeviceRecovery(vid: String, manager: DeviceRecoveryManager) {
-        if (!reloginInProgress.putIfAbsent(vid, true).let { it == null }) return
-        manager.request(vid)
-    }
-
     /**
      * 轮询扫码结果（getLoginInfo 长轮询）
      *
@@ -125,12 +170,11 @@ object WeReadWebAuth {
      */
     fun pollLogin(uid: String, timeoutSeconds: Long = 120): Boolean {
         val credentials = pollLoginCredentials(uid, timeoutSeconds) ?: return false
-        saveLoginCredentials(credentials)
-        return true
+        return saveLoginCredentials(credentials)
     }
 
-    private fun saveLoginCredentials(credentials: WeReadWebCredentials) {
-        WeReadCookieStore.setLoggedIn(
+    private fun saveLoginCredentials(credentials: WeReadWebCredentials): Boolean {
+        return WeReadCookieStore.setLoggedIn(
             wrSkey = credentials.wrSkey,
             wrVid = credentials.wrVid,
             wrRt = credentials.wrRt,
@@ -164,6 +208,7 @@ object WeReadWebAuth {
                         val webLoginVid = obj.get("webLoginVid")?.asString
                         if (!accessToken.isNullOrEmpty() && !webLoginVid.isNullOrEmpty()) {
                             val username = fetchUsername(webLoginVid)
+                            logger.info("微信读书登录成功: username=$username, vid=$webLoginVid")
                             return WeReadWebCredentials(
                                 wrSkey = accessToken,
                                 wrVid = webLoginVid,
@@ -172,7 +217,6 @@ object WeReadWebAuth {
                                 loginTime = System.currentTimeMillis(),
                                 lastRefreshTime = System.currentTimeMillis(),
                             )
-                            logger.info("微信读书登录成功: username=$username, vid=$webLoginVid")
                         }
                     } else {
                         val logicCode = obj.get("logicCode")?.asString ?: ""
@@ -227,44 +271,56 @@ object WeReadWebAuth {
      *
      * @return true=登录成功
      */
-    fun startLogin(targetVid: String? = null): Boolean {
+    fun startLogin(targetVid: String? = null, requireNotification: Boolean = false): Boolean {
         val (uid, scanUrl) = createLogin() ?: return false
+        val qrFileName = targetVid?.let { "weread_web_${it}.png" } ?: "weread_web_qrcode.png"
         // 将扫码链接生成二维码图片并推送到通知机器人
         val qrPng = generateQrPng(scanUrl)
         if (qrPng != null) {
             // 保存到 qrcode 目录供飞书卡片引用
-            try {
+            val localFileAvailable = try {
                 val dir = java.io.File("qrcode").apply { mkdirs() }
-                java.io.File(dir, "wx_qrcode.png").writeBytes(qrPng)
+                java.io.File(dir, qrFileName).writeBytes(qrPng)
+                true
             } catch (e: Exception) {
                 logger.warn("保存二维码图片失败: ${e.message}")
+                false
             }
-            kotlinx.coroutines.runBlocking {
-                val result = WebhookNotifier.pushQrcode(qrPng, "请使用微信扫码登录微信读书（公众号采集回退通道）")
-                if (!result.anySuccess) {
-                    logger.error("微信读书二维码已生成，但未成功推送到任何通知机器人")
-                }
+            val delivery = kotlinx.coroutines.runBlocking {
+                WebhookNotifier.pushQrcode(
+                    qrPng,
+                    "请使用微信扫码登录微信读书（公众号采集回退通道）",
+                    fileName = qrFileName,
+                    localFileAvailable = localFileAvailable,
+                )
             }
+            if (!delivery.anySuccess) {
+                logger.error("微信读书二维码已生成，但未成功推送到任何通知机器人")
+            }
+            if (requireNotification && !delivery.anySuccess) return false
+            if (!localFileAvailable && !delivery.anySuccess) return false
         } else {
-            kotlinx.coroutines.runBlocking {
+            val notified = kotlinx.coroutines.runBlocking {
                 WebhookNotifier.notify("weread_login_qr", mapOf(
                     "message" to "微信读书需要重新登录，请打开链接扫码",
                     "scan_url" to scanUrl,
+                    "vid" to targetVid,
                 ))
             }
+            if (requireNotification && !notified) return false
         }
         val credentials = pollLoginCredentials(uid) ?: return false
         if (targetVid != null && credentials.wrVid != targetVid) {
             logger.warn("扫码账号与目标账号不一致，拒绝覆盖凭证: expected=$targetVid, actual=${credentials.wrVid}")
             return false
         }
-        saveLoginCredentials(credentials)
-        return true
+        return saveLoginCredentials(credentials)
     }
 
     /**
      * 主动刷新保活（操作主账号，兼容入口）
      */
+    @Deprecated("Web accessToken cannot be renewed; use E-Ink credentials")
     fun proactiveRefresh(): Boolean {
         val vid = WeReadAccountPool.primaryAccount()?.vid ?: return false
         return proactiveRefresh(vid)
@@ -293,7 +349,33 @@ object WeReadWebAuth {
 
     /** 连续刷新失败是否达到需重新扫码的阈值（按账号） */
     fun shouldRelogin(vid: String): Boolean =
-        (WeReadAccountPool.get(vid)?.credentials?.refreshFailCount ?: 0) >= AppConfig.wereadRefreshFailThreshold
+        WeReadAccountPool.get(vid)?.let { account ->
+            account.status == AccountStatus.EXPIRED ||
+                account.credentials.refreshFailCount >= AppConfig.wereadRefreshFailThreshold
+        } == true
+
+    fun recoveryStatus(vid: String): Map<String, Any?> = mapOf(
+        "in_progress" to reloginInProgress.getOrDefault(vid, false),
+        "failure_count" to reloginFailureCount.getOrDefault(vid, 0),
+        "next_retry_at" to nextReloginAttemptAt[vid],
+    )
+
+    private fun recordReloginFailure(vid: String) {
+        val count = reloginFailureCount.merge(vid, 1) { previous, increment -> previous + increment } ?: 1
+        val exponent = (count - 1).coerceIn(0, 10)
+        val baseDelayMs = AppConfig.wereadReloginRetryBackoff * 1000L
+        val maxDelayMs = AppConfig.wereadEinkRefreshRetryMax * 1000L
+        val delayMs = (baseDelayMs * (1L shl exponent)).coerceAtMost(maxDelayMs)
+        nextReloginAttemptAt[vid] = System.currentTimeMillis() + delayMs
+    }
+
+    internal fun reloginEligible(
+        status: AccountStatus,
+        refreshFailCount: Int,
+        threshold: Int,
+        enabled: Boolean,
+        force: Boolean,
+    ): Boolean = enabled && (force || status == AccountStatus.EXPIRED || refreshFailCount >= threshold)
 
     /**
      * 清除登录状态

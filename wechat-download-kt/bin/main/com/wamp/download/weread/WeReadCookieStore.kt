@@ -25,9 +25,7 @@ object WeReadCookieStore {
 
     fun isLoggedIn(): Boolean = WeReadAccountPool.hasLoggedInAccount()
 
-    fun save(creds: WeReadWebCredentials) {
-        WeReadAccountPool.upsertCredentials(creds)
-    }
+    fun save(creds: WeReadWebCredentials): Boolean = WeReadAccountPool.upsertCredentials(creds)
 
     /** 清除主账号（单账号语义保留） */
     fun clear() {
@@ -65,7 +63,7 @@ object WeReadCookieStore {
 
         if (!changed) return false
 
-        WeReadAccountPool.updateCredentials(
+        return WeReadAccountPool.updateCredentials(
             creds.wrVid,
             creds.copy(
                 wrSkey = newSkey,
@@ -76,7 +74,6 @@ object WeReadCookieStore {
                 refreshFailCount = 0,
             ),
         )
-        return true
     }
 
     /** 主动刷新成功后调用（操作主账号） */
@@ -103,8 +100,8 @@ object WeReadCookieStore {
     }
 
     /** 登录成功后设置完整凭证（以 webLoginVid 写入账号池） */
-    fun setLoggedIn(wrSkey: String, wrVid: String, wrRt: String, username: String) {
-        WeReadAccountPool.upsertCredentials(
+    fun setLoggedIn(wrSkey: String, wrVid: String, wrRt: String, username: String): Boolean {
+        return WeReadAccountPool.upsertCredentials(
             WeReadWebCredentials(
                 wrSkey = wrSkey,
                 wrVid = wrVid,

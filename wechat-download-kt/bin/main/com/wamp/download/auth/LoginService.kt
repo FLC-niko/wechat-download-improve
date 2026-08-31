@@ -2,12 +2,14 @@ package com.wamp.download.auth
 
 import com.google.gson.Gson
 import com.wamp.download.notify.WebhookNotifier
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 微信公众号登录服务 — 服务端主动扫码登录
@@ -34,8 +36,7 @@ class LoginService(
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    @Volatile
-    private var loginInProgress = false
+    private val loginInProgress = AtomicBoolean(false)
 
     /**
      * 发起一次完整的登录流程（阻塞直到成功或超时）
@@ -44,12 +45,15 @@ class LoginService(
      * @param maxWaitSeconds 最大等待扫码时间
      * @return 登录是否成功
      */
-    suspend fun startLogin(qrcodeDir: String = "qrcode", maxWaitSeconds: Int = 600): Boolean {
-        if (loginInProgress) {
+    suspend fun startLogin(
+        qrcodeDir: String = "qrcode",
+        maxWaitSeconds: Int = 600,
+        requireNotification: Boolean = false,
+    ): Boolean {
+        if (!loginInProgress.compareAndSet(false, true)) {
             logger.warn("登录流程已在进行中，跳过")
             return false
         }
-        loginInProgress = true
 
         try {
             // 每次登录用独立的 cookie jar，避免旧会话干扰
@@ -83,7 +87,11 @@ class LoginService(
             logger.info("【登录】二维码已保存: ${qrFile.absolutePath}")
 
             // 3. 推送二维码到通知机器人
-            webhookNotifier.pushQrcode(qrBytes, "请使用微信扫码登录公众号后台")
+            val delivery = webhookNotifier.pushQrcode(qrBytes, "请使用微信扫码登录公众号后台")
+            if (requireNotification && !delivery.anySuccess) {
+                logger.error("【登录】自动恢复二维码未成功投递，终止本次等待")
+                return false
+            }
 
             // 4. 轮询扫码状态
             logger.info("【登录】等待扫码（超时: ${maxWaitSeconds}秒）...")
@@ -115,11 +123,13 @@ class LoginService(
 
             logger.warn("【登录】${maxWaitSeconds}秒内未完成扫码")
             return false
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.error("【登录】登录流程异常: ${e.message}", e)
             return false
         } finally {
-            loginInProgress = false
+            loginInProgress.set(false)
         }
     }
 

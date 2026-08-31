@@ -5,9 +5,13 @@ import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.store.WeReadEinkSyncStateStore
+import com.wamp.download.config.AppConfig
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.slf4j.LoggerFactory
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.max
 
 class WeReadEinkSyncException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
@@ -59,8 +63,8 @@ class WeReadEinkSyncService(
             state.coverageEnd >= endTime
     }
 
-            /** Returns whether this subscription has enough local identity to use E-Ink sync. */
-            fun canSync(subscription: Subscription): Boolean = resolveMpId(subscription).isNotBlank()
+    /** Returns whether this subscription has enough local identity to use E-Ink sync. */
+    fun canSync(subscription: Subscription): Boolean = resolveMpId(subscription).isNotBlank()
 
     fun isSyncDue(
         subscription: Subscription,
@@ -71,7 +75,20 @@ class WeReadEinkSyncService(
         val mpId = resolveMpId(subscription)
         if (mpId.isBlank()) return false
         val state = WeReadEinkSyncStateStore.get(session.credentials().vid, mpId) ?: return true
+        if (state.status == "FAILED" && state.lastSyncAt > 0L) {
+            return now - state.lastSyncAt >= AppConfig.wereadEinkSyncRetryBackoff
+        }
         return state.lastSuccessAt <= 0L || now - state.lastSuccessAt >= intervalSeconds
+    }
+
+    /** Performs one authenticated request without advancing the persisted cursor. */
+    fun probe(subscription: Subscription): Boolean {
+        val mpId = resolveMpId(subscription)
+        if (mpId.isBlank()) return false
+        val accountVid = session.credentials().vid
+        val synckey = WeReadEinkSyncStateStore.get(accountVid, mpId)?.synckey ?: 0L
+        clientFactory(session, baseUrl).fetchArticles(mpId, count = 1, synckey = synckey)
+        return true
     }
 
     /** Uses cache when the requested range is already covered, otherwise performs one complete sync cycle. */
@@ -80,34 +97,45 @@ class WeReadEinkSyncService(
         startTime: Long,
         endTime: Long,
     ): WeReadEinkSyncResult {
-        if (isRangeCovered(subscription, startTime, endTime)) {
-            val mpId = resolveMpId(subscription)
-            return WeReadEinkSyncResult(
-                fakeid = subscription.fakeid,
-                accountVid = session.credentials().vid,
-                mpId = mpId,
-                pages = 0,
-                fetchedArticles = 0,
-                skippedArticles = 0,
-                savedArticles = 0,
-                synckey = WeReadEinkSyncStateStore.get(session.credentials().vid, mpId)?.synckey,
-                historyComplete = true,
-                cacheCovered = true,
-            )
+        require(startTime <= endTime) { "startTime must not be after endTime" }
+        val mpId = resolveMpId(subscription)
+        if (mpId.isBlank()) {
+            throw WeReadEinkSyncException("cannot derive E-Ink mpId for fakeid=${subscription.fakeid.take(8)}...")
         }
-        return sync(subscription)
+        return withSyncLock(session.credentials().vid, mpId) {
+            if (isRangeCovered(subscription, startTime, endTime)) {
+                return@withSyncLock WeReadEinkSyncResult(
+                    fakeid = subscription.fakeid,
+                    accountVid = session.credentials().vid,
+                    mpId = mpId,
+                    pages = 0,
+                    fetchedArticles = 0,
+                    skippedArticles = 0,
+                    savedArticles = 0,
+                    synckey = WeReadEinkSyncStateStore.get(session.credentials().vid, mpId)?.synckey,
+                    historyComplete = true,
+                    cacheCovered = true,
+                )
+            }
+            syncUnlocked(subscription, mpId)
+        }
     }
 
     /** Fetches all pages and commits the new cursor only after the entire cycle succeeds. */
     fun sync(subscription: Subscription): WeReadEinkSyncResult {
+        val mpId = resolveMpId(subscription)
+        if (mpId.isBlank()) {
+            throw WeReadEinkSyncException("cannot derive E-Ink mpId for fakeid=${subscription.fakeid.take(8)}...")
+        }
+        return withSyncLock(session.credentials().vid, mpId) {
+            syncUnlocked(subscription, mpId)
+        }
+    }
+
+    private fun syncUnlocked(subscription: Subscription, mpId: String): WeReadEinkSyncResult {
         require(subscription.fakeid.isNotBlank()) { "subscription fakeid must not be blank" }
 
         val fakeid = subscription.fakeid
-        val mpId = resolveMpId(subscription)
-        if (mpId.isBlank()) {
-            throw WeReadEinkSyncException("cannot derive E-Ink mpId for fakeid=${fakeid.take(8)}...")
-        }
-
         val accountVid = session.credentials().vid
         val previousState = WeReadEinkSyncStateStore.get(accountVid, mpId)
         val initialSynckey = previousState?.synckey ?: 0L
@@ -193,6 +221,7 @@ class WeReadEinkSyncService(
         } catch (error: Exception) {
             val errorType = when (error) {
                 is WeReadEinkApiException -> error.kind.name
+                is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
                 is WeReadEinkParseException -> "PARSE_ERROR"
                 is WeReadEinkSyncException -> "SYNC_ERROR"
                 else -> "ERROR"
@@ -210,6 +239,12 @@ class WeReadEinkSyncService(
             }
             throw error
         }
+    }
+
+    private fun <T> withSyncLock(accountVid: String, mpId: String, block: () -> T): T {
+        val key = "$accountVid:$mpId"
+        val lock = SYNC_LOCKS.computeIfAbsent(key) { ReentrantLock() }
+        return lock.withLock(block)
     }
 
     private fun nextOffset(page: WeReadEinkArticlesPage): Long? = when (page.hasMore) {
@@ -257,5 +292,6 @@ class WeReadEinkSyncService(
         const val DEFAULT_BASE_URL = "https://i.weread.qq.com"
         const val DEFAULT_PAGE_SIZE = 50
         const val DEFAULT_MAX_PAGES = 1000
+        val SYNC_LOCKS = ConcurrentHashMap<String, ReentrantLock>()
     }
 }

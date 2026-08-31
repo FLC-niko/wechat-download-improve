@@ -3,8 +3,11 @@ package com.wamp.download.weread.eink
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.wamp.download.config.AppConfig
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import java.io.IOException
+import kotlin.random.Random
 
 class WeReadEinkApiException(
     val kind: WeReadEinkResponseKind,
@@ -53,6 +56,12 @@ class WeReadEinkChaptersClient(
     private val baseUrl: String = DEFAULT_BASE_URL,
     private val profile: WeReadEinkProfile = DefaultWeReadEinkProfile,
     private val session: WeReadEinkSession? = null,
+    private val requestGate: (String, () -> WeReadEinkArticlesPage) -> WeReadEinkArticlesPage = { vid, block ->
+        WeReadEinkRequestGate.execute(vid, block)
+    },
+    private val maxTransientRetries: Int = AppConfig.wereadEinkMaxTransientRetries,
+    private val retryBaseDelayMs: Long = AppConfig.wereadEinkRetryBaseDelay * 1000L,
+    private val waitProvider: (Long) -> Unit = { Thread.sleep(it) },
 ) {
     fun fetchArticles(
         accountId: String,
@@ -72,11 +81,52 @@ class WeReadEinkChaptersClient(
         val activeCredentials = session?.credentialsForRequest() ?: credentials
 
         return try {
-            requestPage(accountId, count, synckey, offset, requestedOffset, activeCredentials)
+            requestPageWithRetries(accountId, count, synckey, offset, requestedOffset, activeCredentials)
         } catch (error: WeReadEinkApiException) {
             if (error.kind != WeReadEinkResponseKind.AUTH_EXPIRED || session == null) throw error
             val refreshed = session.refreshIfAccessTokenWas(activeCredentials.accessToken)
-            requestPage(accountId, count, synckey, offset, requestedOffset, refreshed)
+            try {
+                requestPageWithRetries(accountId, count, synckey, offset, requestedOffset, refreshed)
+            } catch (retryError: WeReadEinkApiException) {
+                if (retryError.kind == WeReadEinkResponseKind.AUTH_EXPIRED) {
+                    session.reportAuthenticationFailure(retryError)
+                }
+                throw retryError
+            }
+        }
+    }
+
+    private fun requestPageWithRetries(
+        accountId: String,
+        count: Int,
+        synckey: Long?,
+        offset: Long?,
+        requestedOffset: Long,
+        requestCredentials: WeReadEinkCredentials,
+    ): WeReadEinkArticlesPage {
+        var transientFailures = 0
+        while (true) {
+            try {
+                return requestGate(requestCredentials.vid) {
+                    requestPage(accountId, count, synckey, offset, requestedOffset, requestCredentials)
+                }
+            } catch (error: WeReadEinkApiException) {
+                val retryable = error.kind == WeReadEinkResponseKind.RATE_LIMITED ||
+                    error.kind == WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
+                if (!retryable || transientFailures >= maxTransientRetries) throw error
+                val multiplier = 1L shl transientFailures.coerceAtMost(10)
+                val delayMs = retryBaseDelayMs * multiplier + Random.nextLong(0L, 250L)
+                transientFailures++
+                waitProvider(delayMs)
+            } catch (error: IOException) {
+                // DNS/connect/read failures are transient at this layer. Let the bounded
+                // retry budget absorb a short network flap without changing auth state.
+                if (transientFailures >= maxTransientRetries) throw error
+                val multiplier = 1L shl transientFailures.coerceAtMost(10)
+                val delayMs = retryBaseDelayMs * multiplier + Random.nextLong(0L, 250L)
+                transientFailures++
+                waitProvider(delayMs)
+            }
         }
     }
 

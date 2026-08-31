@@ -8,6 +8,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
@@ -119,9 +120,11 @@ class WeReadWebClient {
             .build()
         val req = authRequest(Request.Builder().url(url), creds).get().build()
         return try {
-            client.newCall(req).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                classifyProbeResponse(resp.code, raw)
+            WeReadRequestGate.execute(account.vid) {
+                client.newCall(req).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    classifyProbeResponse(resp.code, raw)
+                }
             }
         } catch (e: Exception) {
             logger.warn("微信读书账号探测异常（不判死）: vid=${creds.wrVid}, ${e.message}")
@@ -209,8 +212,8 @@ class WeReadWebClient {
                     PageKind.EXPIRED -> {
                         lastOutcome = PageOutcome.AUTH_EXPIRED
                         // 新版 Web accessToken 没有 refreshToken，不能用 HEAD 请求伪装续签。
-                        WeReadAccountPool.markExpired(account.vid, "凭证失效(401/-2012)")
-                        WeReadWebAuth.requestReloginIfNeeded(account.vid)
+                        WeReadAccountPool.markAuthExpired(account.vid, "凭证失效(401/-2012)")
+                        WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
                     }
                     PageKind.RATE_LIMITED -> {
                         lastOutcome = PageOutcome.RATE_LIMITED
@@ -226,7 +229,11 @@ class WeReadWebClient {
                 }
             } catch (e: Exception) {
                 logger.warn("微信读书请求异常（换号重试）: vid=${account.vid}, ${e.message}")
-                lastOutcome = PageOutcome.ERROR
+                lastOutcome = if (e is IOException) {
+                    PageOutcome.RETRYABLE_ERROR
+                } else {
+                    PageOutcome.ERROR
+                }
             } finally {
                 WeReadAccountPool.release(account.vid)
             }
@@ -285,6 +292,13 @@ class WeReadWebClient {
                     logger.warn("微信读书临时服务错误: HTTP ${resp.code}, offset=$offset, vid=${creds.wrVid}")
                     return AccountPageResult(PageKind.RETRYABLE_ERROR)
                 }
+                WeReadWebResponseKind.APPLICATION_ERROR -> {
+                    logger.warn(
+                        "微信读书业务错误: HTTP ${resp.code}, errCode=${classification.errCode}, " +
+                            "errMsg=${classification.errMsg}, offset=$offset, vid=${creds.wrVid}",
+                    )
+                    return AccountPageResult(PageKind.ERROR)
+                }
                 WeReadWebResponseKind.HTTP_ERROR -> {
                     logger.warn("微信读书获取文章失败: HTTP ${resp.code}, errCode=${classification.errCode}, offset=$offset, vid=${creds.wrVid}")
                     return AccountPageResult(PageKind.ERROR)
@@ -293,7 +307,14 @@ class WeReadWebClient {
             }
             val parsed = parseArticleList(raw)
             if (!parsed.validResponse) {
-                return AccountPageResult(PageKind.PARSE_ERROR)
+                // A gateway may return HTTP 200 HTML/empty/array content. Treat only a JSON
+                // object with an unknown schema as a parse failure; malformed content is
+                // transient and should use the bounded page retry path.
+                val isJsonObject = runCatching { JsonParser.parseString(raw).isJsonObject }
+                    .getOrDefault(false)
+                return AccountPageResult(
+                    if (isJsonObject) PageKind.PARSE_ERROR else PageKind.RETRYABLE_ERROR,
+                )
             }
             return AccountPageResult(PageKind.SUCCESS, parsed)
         }

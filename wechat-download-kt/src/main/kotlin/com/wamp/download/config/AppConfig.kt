@@ -73,10 +73,28 @@ object AppConfig {
         get() = getInt("weread.eink.max_pages", 1000).coerceAtLeast(1)
     val wereadEinkRefreshCheckInterval: Long
         get() = getLong("weread.eink.refresh_check_interval", 60L).coerceAtLeast(10L)
+    val wereadEinkHealthCheckInterval: Long
+        get() = getLong("weread.eink.health_check_interval", 300L).coerceAtLeast(30L)
     val wereadEinkRefreshSkew: Long
         get() = getLong("weread.eink.refresh_skew", 300L).coerceAtLeast(0L)
+    val wereadEinkRefreshRetryInitial: Long
+        get() = getLong("weread.eink.refresh_retry_initial", 30L).coerceAtLeast(1L)
+    val wereadEinkRefreshRetryMax: Long
+        get() = getLong("weread.eink.refresh_retry_max", 900L).coerceAtLeast(wereadEinkRefreshRetryInitial)
+    val wereadEinkSyncRetryBackoff: Long
+        get() = getLong("weread.eink.sync_retry_backoff", 300L).coerceAtLeast(10L)
+    val wereadEinkMaxTransientRetries: Int
+        get() = getInt("weread.eink.max_transient_retries", 2).coerceIn(0, 5)
+    val wereadEinkRetryBaseDelay: Long
+        get() = getLong("weread.eink.retry_base_delay", 2L).coerceAtLeast(1L)
+    val wereadEinkMaxConcurrentPerAccount: Int
+        get() = getInt("weread.eink.max_concurrent_per_account", 1).coerceAtLeast(1)
+    val wereadEinkMinRequestInterval: Long
+        get() = getLong("weread.eink.min_request_interval", 1L).coerceAtLeast(0L)
     val wereadEinkAutoReloginEnabled: Boolean
         get() = getBool("weread.eink.auto_relogin_enabled", wereadAutoReloginEnabled)
+    val wereadEinkReloginRetryBackoff: Long
+        get() = getLong("weread.eink.relogin_retry_backoff", 300L).coerceAtLeast(30L)
 
     // 多账号池：账号凭证存储目录 + 频控冷却时长
     val wereadAccountDir: String get() = getString("weread.account_dir", "data/weread_accounts")
@@ -86,6 +104,8 @@ object AppConfig {
     val wereadRefreshInterval: Long get() = getLong("weread.refresh_interval", 3000L)   // 50 分钟
     val wereadRefreshFailThreshold: Int get() = getInt("weread.refresh_fail_threshold", 3)
     val wereadAutoReloginEnabled: Boolean get() = getBool("weread.auto_relogin_enabled", false)
+    val wereadReloginRetryBackoff: Long
+        get() = getLong("weread.relogin_retry_backoff", 300L).coerceAtLeast(30L)
 
     // 翻页控制
     val wereadContentInterval: Long get() = getLong("weread.content_interval", 5L)      // 翻页基础间隔（秒）
@@ -105,6 +125,8 @@ object AppConfig {
     val adbPollIntervalMs: Long
         get() = getLong("adb.poll_interval_ms", 15_000L).coerceAtLeast(1_000L)
     val adbEnabled: Boolean get() = getBool("adb.enabled", false)
+    val adbRecoveryMaxDelayMs: Long
+        get() = getLong("adb.recovery_max_delay_ms", 15 * 60_000L).coerceAtLeast(adbPollIntervalMs)
 
     // 预热（拉文章前先调公众号信息接口触发关联）
     val wereadWarmupEnabled: Boolean get() = getBool("weread.warmup_enabled", true)

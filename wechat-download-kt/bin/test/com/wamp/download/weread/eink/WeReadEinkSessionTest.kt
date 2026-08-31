@@ -9,6 +9,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import java.util.concurrent.ExecutionException
 
 class WeReadEinkSessionTest {
     @Test
@@ -132,6 +133,43 @@ class WeReadEinkSessionTest {
             assertEquals("refresh-2", store.load()?.refreshToken)
         } finally {
             root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `concurrent failed refreshes open one backoff circuit`() {
+        var refreshRequests = 0
+        var failureCallbacks = 0
+        val session = WeReadEinkSession(
+            initialCredentials = credentials(),
+            transport = WeReadEinkTransport {
+                synchronized(this) { refreshRequests++ }
+                WeReadEinkResponse(401, "{\"errCode\":-2012}")
+            },
+            clock = { 1_000L },
+            refreshRetryInitialDelayMs = 100L,
+            refreshRetryMaxDelayMs = 1_000L,
+            onRefreshFailure = { synchronized(this) { failureCallbacks++ } },
+        )
+        val executor = Executors.newFixedThreadPool(4)
+
+        try {
+            val failures = (1..4).map {
+                executor.submit<WeReadEinkCredentials> {
+                    session.refreshIfAccessTokenWas("access-1")
+                }
+            }.map { future ->
+                assertFailsWith<ExecutionException> { future.get(5, TimeUnit.SECONDS) }.cause
+            }
+
+            assertEquals(1, refreshRequests)
+            assertEquals(1, failureCallbacks)
+            assertTrue(failures.any { it is WeReadEinkApiException })
+            assertTrue(failures.any { it is WeReadEinkRefreshBackoffException })
+            assertTrue(session.refreshStatus().authExpired)
+            assertEquals(1, session.refreshStatus().consecutiveFailures)
+        } finally {
+            executor.shutdownNow()
         }
     }
 

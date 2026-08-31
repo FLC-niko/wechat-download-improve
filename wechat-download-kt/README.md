@@ -38,7 +38,7 @@
 
 ### 当前上线模式：不依赖 ADB
 
-默认配置不会执行 `adb devices`，也不会启动设备监督和自动扫码恢复。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此默认关闭；已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。
+默认配置不会执行 `adb devices`，也不会启动 ADB 设备监督；凭证会被主动探测并记录状态，但自动二维码恢复默认关闭，避免服务重启或无人值守时意外发起扫码。需要时可显式打开对应的自动恢复开关。已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此主通道默认关闭。
 
 ```yaml
 auth:
@@ -62,7 +62,7 @@ wx:
     enabled: false
 ```
 
-需要恢复凭证时使用服务端扫码登录接口和机器人通知。默认也关闭启动后的自动扫码，避免 Worker 重启时打扰账号。将来确实需要设备自动恢复，再显式设置 `adb.enabled: true`。ADB 状态仍可通过以下接口查看：
+需要恢复凭证时使用服务端扫码登录接口和机器人通知。将 `auth.auto_recovery_enabled`、`weread.auto_relogin_enabled` 或 `weread.eink.auto_relogin_enabled` 显式设为 `true` 后，才会在对应通道失效时自动恢复；ADB 设备恢复还需要显式设置 `adb.enabled: true`。ADB 状态仍可通过以下接口查看：
 
 ```bash
 curl http://localhost:5000/api/adb/status

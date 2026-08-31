@@ -221,13 +221,14 @@ class TaskProcessor(
                 false
             }
             WxApiClient.TokenStatus.EXPIRED -> {
-                // 当前上线模式不依赖 ADB；无自动恢复能力时快速返回明确终态，避免任务阻塞数十分钟。
-                if (!AppConfig.adbEnabled) {
+                // 主微信登录由服务端二维码恢复，不依赖 ADB；关闭自动恢复时快速返回明确终态。
+                if (!AppConfig.authAutoRecoveryEnabled) {
                     publishFailed(task, "ACCOUNT_LOOKUP_AUTH_REQUIRED", "公众号尚未入库，需要人工恢复主微信登录", false)
                     false
                 } else {
-                    loginChecker.startRecoveryAndWait()
-                    val recovered = loginChecker.checkTokenStatus(forceRefresh = true) == WxApiClient.TokenStatus.VALID
+                    val recoveryCompleted = loginChecker.startRecoveryAndWait()
+                    val recovered = recoveryCompleted &&
+                        loginChecker.checkTokenStatus(forceRefresh = true) == WxApiClient.TokenStatus.VALID
                     if (!recovered) publishFailed(task, "AUTH_RECOVERY_FAILED", "登录恢复失败", false)
                     recovered
                 }

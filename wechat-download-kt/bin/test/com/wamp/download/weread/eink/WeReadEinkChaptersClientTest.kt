@@ -1,6 +1,7 @@
 package com.wamp.download.weread.eink
 
 import okhttp3.HttpUrl
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -100,6 +101,99 @@ class WeReadEinkChaptersClientTest {
         assertFailsWith<WeReadEinkParseException> {
             client.fetchArticles("MP_WXS_1")
         }
+    }
+
+    @Test
+    fun `auth rejection refreshes once and retries with rotated access token`() {
+        val transport = RecordingTransport(
+            WeReadEinkResponse(401, "{\"errCode\":-2012}"),
+            WeReadEinkResponse(200, "{\"accessToken\":\"access-2\",\"refreshToken\":\"refresh-2\"}"),
+            WeReadEinkResponse(200, "{\"data\":[],\"synckey\":9,\"hasMore\":0}"),
+        )
+        val session = WeReadEinkSession(
+            initialCredentials = credentials(),
+            transport = transport,
+            baseUrl = "https://eink.example.test",
+        )
+        val client = WeReadEinkChaptersClient(
+            credentials = credentials(),
+            transport = transport,
+            baseUrl = "https://eink.example.test",
+            session = session,
+            requestGate = { _, block -> block() },
+        )
+
+        val page = client.fetchArticles("MP_WXS_1")
+
+        assertEquals(0, page.returnedCount)
+        assertEquals(listOf("mp", "login", "mp"), transport.requests.map { it.url.pathSegments.first() })
+        assertEquals("access-token", transport.requests.first().headers["accessToken"])
+        assertEquals("access-2", transport.requests.last().headers["accessToken"])
+        assertEquals("refresh-2", session.credentials().refreshToken)
+    }
+
+    @Test
+    fun `transient server error is retried with bounded backoff`() {
+        val transport = RecordingTransport(
+            WeReadEinkResponse(503, "service unavailable"),
+            WeReadEinkResponse(200, "{\"data\":[],\"hasMore\":0}"),
+        )
+        val delays = mutableListOf<Long>()
+        val client = WeReadEinkChaptersClient(
+            credentials = credentials(),
+            transport = transport,
+            baseUrl = "https://eink.example.test",
+            requestGate = { _, block -> block() },
+            maxTransientRetries = 1,
+            retryBaseDelayMs = 10L,
+            waitProvider = delays::add,
+        )
+
+        assertEquals(0, client.fetchArticles("MP_WXS_1").returnedCount)
+        assertEquals(2, transport.requests.size)
+        assertEquals(1, delays.size)
+        assertTrue(delays.single() >= 10L)
+    }
+
+    @Test
+    fun `200 html gateway response is retried instead of becoming a parse failure`() {
+        val transport = RecordingTransport(
+            WeReadEinkResponse(200, "<html>gateway</html>"),
+            WeReadEinkResponse(200, "{\"data\":[],\"hasMore\":0}"),
+        )
+        val client = WeReadEinkChaptersClient(
+            credentials = credentials(),
+            transport = transport,
+            baseUrl = "https://eink.example.test",
+            requestGate = { _, block -> block() },
+            maxTransientRetries = 1,
+            retryBaseDelayMs = 0L,
+            waitProvider = {},
+        )
+
+        assertEquals(0, client.fetchArticles("MP_WXS_1").returnedCount)
+        assertEquals(2, transport.requests.size)
+    }
+
+    @Test
+    fun `transient transport failure is retried without changing auth state`() {
+        var requests = 0
+        val client = WeReadEinkChaptersClient(
+            credentials = credentials(),
+            transport = WeReadEinkTransport {
+                requests++
+                if (requests == 1) throw IOException("temporary disconnect")
+                WeReadEinkResponse(200, "{\"data\":[],\"hasMore\":0}")
+            },
+            baseUrl = "https://eink.example.test",
+            requestGate = { _, block -> block() },
+            maxTransientRetries = 1,
+            retryBaseDelayMs = 0L,
+            waitProvider = {},
+        )
+
+        assertEquals(0, client.fetchArticles("MP_WXS_1").returnedCount)
+        assertEquals(2, requests)
     }
 
     private fun credentials() = WeReadEinkCredentials(

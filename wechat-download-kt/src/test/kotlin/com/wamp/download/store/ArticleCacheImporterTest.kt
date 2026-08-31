@@ -3,9 +3,11 @@ package com.wamp.download.store
 import com.wamp.download.config.AppConfig
 import org.jetbrains.exposed.sql.selectAll
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Disabled
 import java.io.File
 import kotlin.test.assertTrue
 
+@Disabled("会读取外部历史目录并写入真实 SQLite，仅供人工导入验收")
 class ArticleCacheImporterTest {
 
     @Test
