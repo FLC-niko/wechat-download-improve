@@ -126,21 +126,27 @@ fun main() {
         scope.launch { LoginReminder.start() }
         // 主微信始终周期探测；开关只决定失效后是否自动发起二维码恢复。
         loginChecker.start()
-        // 周期凭证健康检查：E-Ink 未知过期时间也会真实探活，EXPIRED Web 账号会恢复排队。
+        // E-Ink 与 Web 使用独立调度周期，避免调低一条通道的间隔时连带打高另一条通道的频率。
         scope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(10_000)
             while (isActive) {
                 try {
-                    CredentialHealthChecker.checkAll()
+                    CredentialHealthChecker.checkEink()
                 } catch (e: Exception) {
-                    logger.warn("周期凭证健康检查异常: ${e.message}")
+                    logger.warn("E-Ink 周期凭证健康检查异常: ${e.message}")
                 }
-                kotlinx.coroutines.delay(
-                    minOf(
-                        AppConfig.wereadEinkHealthCheckInterval,
-                        AppConfig.wereadWebHealthCheckInterval,
-                    ) * 1000L,
-                )
+                kotlinx.coroutines.delay(AppConfig.wereadEinkHealthCheckInterval * 1000L)
+            }
+        }
+        scope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(10_000)
+            while (isActive) {
+                try {
+                    CredentialHealthChecker.checkWebAccounts()
+                } catch (e: Exception) {
+                    logger.warn("Web 周期凭证健康检查异常: ${e.message}")
+                }
+                kotlinx.coroutines.delay(AppConfig.wereadWebHealthCheckInterval * 1000L)
             }
         }
         // E-Ink 只按服务端明确过期时间提前续签；未提供日期时由 401/-2012 触发真实 /login 续签。

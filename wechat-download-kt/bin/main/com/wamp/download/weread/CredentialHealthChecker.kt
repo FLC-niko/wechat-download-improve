@@ -28,7 +28,7 @@ object CredentialHealthChecker {
     /**
      * E-Ink：明确到期时续签；未知到期时间时发送轻量鉴权请求主动探活。
      */
-    private suspend fun checkEink() {
+    suspend fun checkEink() {
         if (!AppConfig.wereadEinkEnabled) return
         val session = WeReadEinkRuntime.session()
         if (session == null) {
@@ -60,7 +60,7 @@ object CredentialHealthChecker {
     }
 
     /** Web 渠道：探测 ACTIVE 账号，并恢复持久化的 EXPIRED 账号。 */
-    private suspend fun checkWebAccounts() {
+    suspend fun checkWebAccounts() {
         val accounts = WeReadAccountPool.list().filter {
             it.status in setOf(AccountStatus.ACTIVE, AccountStatus.EXPIRED) && it.hasWebCredentials()
         }

@@ -49,6 +49,12 @@ object WeReadEinkRuntime {
     @Volatile
     private var lastScheduledSyncTarget: String? = null
 
+    private data class RuntimeSnapshot(
+        val generation: Long,
+        val session: WeReadEinkSession,
+        val service: WeReadEinkSyncService,
+    )
+
     fun initialize(scope: CoroutineScope? = null): WeReadEinkSyncService? {
         if (scope != null) recoveryScope = scope
         return reload()
@@ -68,11 +74,17 @@ object WeReadEinkRuntime {
         synchronized(credentialWriteLock) {
             credentialStore().save(credentials)
         }
-        checkNotNull(reload()) { "E-Ink credentials were saved but the runtime could not be reloaded" }
-        authState = "HEALTHY"
-        lastProbeAt = System.currentTimeMillis()
-        lastProbeResult = "QR_LOGIN_SUCCEEDED"
-        lastProbeError = null
+        val installedService = checkNotNull(reload()) {
+            "E-Ink credentials were saved but the runtime could not be reloaded"
+        }
+        synchronized(runtimeLock) {
+            if (activeSyncService === installedService) {
+                authState = "HEALTHY"
+                lastProbeAt = System.currentTimeMillis()
+                lastProbeResult = "QR_LOGIN_SUCCEEDED"
+                lastProbeError = null
+            }
+        }
     }
 
     fun reload(): WeReadEinkSyncService? = synchronized(runtimeLock) {
@@ -119,11 +131,9 @@ object WeReadEinkRuntime {
                 refreshRetryInitialDelayMs = AppConfig.wereadEinkRefreshRetryInitial * 1000L,
                 refreshRetryMaxDelayMs = AppConfig.wereadEinkRefreshRetryMax * 1000L,
                 refreshRequest = { vid, block -> WeReadEinkRequestGate.execute(vid, block) },
-                onRefreshFailure = { error ->
-                    if (sessionGeneration == generation) handleRefreshFailure(error)
-                },
+                onRefreshFailure = { error -> handleRefreshFailure(error, generation) },
                 onRefreshSuccess = {
-                    if (sessionGeneration == generation) authState = "HEALTHY"
+                    updateAuthStateIfGeneration(generation, "HEALTHY")
                 },
             )
             val service = WeReadEinkSyncService(
@@ -154,78 +164,94 @@ object WeReadEinkRuntime {
         now: Long = System.currentTimeMillis(),
         skewMs: Long = AppConfig.wereadEinkRefreshSkew * 1000L,
     ): Boolean {
-        val session = activeSession ?: return false
+        val snapshot = currentSnapshot() ?: return false
+        val session = snapshot.session
         if (!session.retryPendingPersistence()) {
-            WebhookNotifier.notify(
-                "weread_eink_persistence_failed",
-                mapOf(
-                    "message" to "微信读书 E-Ink 新凭证已在内存生效，但尚未写入磁盘；请检查磁盘空间和目录权限，期间不要重启服务",
-                    "error" to session.lastPersistenceError(),
-                ),
-            )
+            if (isCurrent(snapshot)) {
+                WebhookNotifier.notify(
+                    "weread_eink_persistence_failed",
+                    mapOf(
+                        "message" to "微信读书 E-Ink 新凭证已在内存生效，但尚未写入磁盘；请检查磁盘空间和目录权限，期间不要重启服务",
+                        "error" to session.lastPersistenceError(),
+                    ),
+                )
+            }
         }
+        if (!isCurrent(snapshot)) return false
         val credentials = session.credentials()
         if (session.refreshStatus().authExpired) {
-            ensureAutoRecovery()
+            if (isCurrent(snapshot)) ensureAutoRecovery()
             return false
         }
         if (!credentials.accessTokenNeedsRefresh(now, skewMs)) return false
         return try {
             session.refresh()
-            authState = "HEALTHY"
+            if (!updateIfCurrent(snapshot) { authState = "HEALTHY" }) return false
             logger.info("E-Ink accessToken 已按服务端过期时间续签")
             true
         } catch (_: WeReadEinkRefreshBackoffException) {
-            ensureAutoRecovery()
+            if (isCurrent(snapshot)) ensureAutoRecovery()
             false
         } catch (error: Exception) {
-            logger.warn("E-Ink accessToken 主动续签失败，将在鉴权拒绝时再次尝试: ${error.message}")
+            if (isCurrent(snapshot)) {
+                logger.warn("E-Ink accessToken 主动续签失败，将在鉴权拒绝时再次尝试: ${error.message}")
+            }
             false
         }
     }
 
     /** Uses one known public-account id for a real authenticated probe without advancing sync state. */
     fun probe(): Boolean {
-        val service = activeSyncService ?: return false
+        val snapshot = currentSnapshot() ?: return false
+        val service = snapshot.service
         val target = SubscriptionStore.list(limit = PROBE_SUBSCRIPTION_LIMIT).first
             .firstOrNull(service::canSync)
-        lastProbeAt = System.currentTimeMillis()
         if (target == null) {
-            lastProbeResult = "NO_TARGET"
-            lastProbeError = null
+            updateIfCurrent(snapshot) {
+                lastProbeAt = System.currentTimeMillis()
+                lastProbeResult = "NO_TARGET"
+                lastProbeError = null
+            }
             return false
         }
 
         return try {
+            if (!isCurrent(snapshot)) return false
             service.probe(target)
-            authState = "HEALTHY"
-            lastProbeResult = "SUCCESS"
-            lastProbeError = null
-            true
+            updateIfCurrent(snapshot) {
+                authState = "HEALTHY"
+                lastProbeAt = System.currentTimeMillis()
+                lastProbeResult = "SUCCESS"
+                lastProbeError = null
+            }
         } catch (error: Exception) {
-            val refresh = activeSession?.refreshStatus()
-            authState = when {
-                refresh?.authExpired == true -> "REAUTH_REQUIRED"
-                error is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
-                else -> "DEGRADED"
+            val updated = updateIfCurrent(snapshot) {
+                val refresh = snapshot.session.refreshStatus()
+                authState = when {
+                    refresh.authExpired -> "REAUTH_REQUIRED"
+                    error is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
+                    else -> "DEGRADED"
+                }
+                lastProbeAt = System.currentTimeMillis()
+                lastProbeResult = when (error) {
+                    is WeReadEinkApiException -> error.kind.name
+                    is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
+                    is WeReadEinkParseException -> "PARSE_ERROR"
+                    else -> "ERROR"
+                }
+                lastProbeError = error.message.orEmpty().take(500)
             }
-            lastProbeResult = when (error) {
-                is WeReadEinkApiException -> error.kind.name
-                is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
-                is WeReadEinkParseException -> "PARSE_ERROR"
-                else -> "ERROR"
-            }
-            lastProbeError = error.message.orEmpty().take(500)
-            ensureAutoRecovery()
+            if (updated) ensureAutoRecovery()
             false
         }
     }
 
     /** Synchronizes at most one due subscription per scheduler tick to avoid startup request bursts. */
     fun syncNextDueSubscription(now: Long = System.currentTimeMillis() / 1000L): Boolean {
-        val service = activeSyncService ?: return false
-        if (activeSession?.refreshStatus()?.authExpired == true) {
-            ensureAutoRecovery()
+        val snapshot = currentSnapshot() ?: return false
+        val service = snapshot.service
+        if (snapshot.session.refreshStatus().authExpired) {
+            if (isCurrent(snapshot)) ensureAutoRecovery()
             return false
         }
         val target = SubscriptionStore.list(limit = SCHEDULED_SYNC_SUBSCRIPTION_LIMIT).first
@@ -234,39 +260,58 @@ object WeReadEinkRuntime {
             .firstOrNull { service.isSyncDue(it, AppConfig.wereadEinkSyncInterval, now) }
             ?: return false
 
-        lastScheduledSyncAt = System.currentTimeMillis()
-        lastScheduledSyncTarget = target.fakeid
+        if (!updateIfCurrent(snapshot) {
+                lastScheduledSyncAt = System.currentTimeMillis()
+                lastScheduledSyncTarget = target.fakeid
+            }
+        ) return false
         return try {
             service.sync(target)
-            authState = "HEALTHY"
-            lastScheduledSyncResult = "SUCCESS"
-            true
-        } catch (error: Exception) {
-            lastScheduledSyncResult = when (error) {
-                is WeReadEinkApiException -> error.kind.name
-                is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
-                else -> "FAILED"
+            updateIfCurrent(snapshot) {
+                authState = "HEALTHY"
+                lastScheduledSyncResult = "SUCCESS"
             }
-            ensureAutoRecovery()
-            logger.warn("E-Ink 后台增量同步失败: fakeid=${target.fakeid.take(8)}..., ${error.message}")
+        } catch (error: Exception) {
+            val updated = updateIfCurrent(snapshot) {
+                lastScheduledSyncResult = when (error) {
+                    is WeReadEinkApiException -> error.kind.name
+                    is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
+                    else -> "FAILED"
+                }
+            }
+            if (updated) {
+                ensureAutoRecovery()
+                logger.warn("E-Ink 后台增量同步失败: fakeid=${target.fakeid.take(8)}..., ${error.message}")
+            }
             false
         }
     }
 
     fun ensureAutoRecovery(): Boolean {
-        val session = activeSession ?: return false
-        if (!session.refreshStatus().authExpired) return false
-        authState = if (WeReadEinkLoginCoordinator.isInProgress()) "REAUTH_IN_PROGRESS" else "REAUTH_REQUIRED"
+        val snapshot = currentSnapshot() ?: return false
+        if (!snapshot.session.refreshStatus().authExpired) return false
         val scope = recoveryScope ?: return false
-        if (!AppConfig.wereadEinkAutoReloginEnabled) return false
-        val started = WeReadEinkLoginCoordinator.start(scope, automatic = true)
-        if (started || WeReadEinkLoginCoordinator.isInProgress()) authState = "REAUTH_IN_PROGRESS"
-        return started
+        return synchronized(runtimeLock) {
+            if (!matchesCurrent(snapshot)) return@synchronized false
+            authState = if (WeReadEinkLoginCoordinator.isInProgress()) {
+                "REAUTH_IN_PROGRESS"
+            } else {
+                "REAUTH_REQUIRED"
+            }
+            if (!AppConfig.wereadEinkAutoReloginEnabled) return@synchronized false
+            val started = WeReadEinkLoginCoordinator.start(scope, automatic = true)
+            if (started || WeReadEinkLoginCoordinator.isInProgress()) authState = "REAUTH_IN_PROGRESS"
+            started
+        }
     }
 
-    private fun handleRefreshFailure(error: Throwable) {
+    private fun handleRefreshFailure(error: Throwable, generation: Long) {
         val authExpired = error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.AUTH_EXPIRED
-        authState = if (authExpired) "REAUTH_REQUIRED" else "REFRESH_BACKOFF"
+        if (!updateAuthStateIfGeneration(
+                generation,
+                if (authExpired) "REAUTH_REQUIRED" else "REFRESH_BACKOFF",
+            )
+        ) return
         if (authExpired) {
             val message = if (AppConfig.wereadEinkAutoReloginEnabled) {
                 "微信读书 E-Ink refreshToken 已失效，正在请求重新扫码"
@@ -274,6 +319,7 @@ object WeReadEinkRuntime {
                 "微信读书 E-Ink refreshToken 已失效，自动扫码已关闭，请调用登录接口人工恢复"
             }
             recoveryScope?.launch {
+                if (sessionGeneration != generation) return@launch
                 WebhookNotifier.notify(
                     "weread_eink_expired",
                     mapOf(
@@ -287,19 +333,21 @@ object WeReadEinkRuntime {
     }
 
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
-        val credentials = activeSession?.credentials()
+        val snapshot = currentSnapshot()
+        val credentials = snapshot?.session?.credentials()
             ?: runCatching { credentialStore().load() }.getOrNull()
-        val refreshStatus = activeSession?.refreshStatus()
+        val refreshStatus = snapshot?.session?.refreshStatus()
         val currentAuthState = if (WeReadEinkLoginCoordinator.isInProgress()) {
             "REAUTH_IN_PROGRESS"
         } else {
             authState
         }
+        val runtimeReady = snapshot != null
         return mapOf(
             "enabled" to AppConfig.wereadEinkEnabled,
             "configured" to (credentials != null),
-            "runtime_ready" to (activeSyncService != null),
-            "operational" to (currentAuthState == "HEALTHY"),
+            "runtime_ready" to runtimeReady,
+            "operational" to (runtimeReady && currentAuthState == "HEALTHY"),
             "auth_state" to currentAuthState,
             "vid" to credentials?.vid,
             "has_access_token" to credentials?.hasAccessToken(),
@@ -328,6 +376,37 @@ object WeReadEinkRuntime {
 
     private fun credentialStore(): WeReadEinkCredentialStore =
         WeReadEinkCredentialStore(File(AppConfig.wereadEinkCredentialsFile))
+
+    private fun currentSnapshot(): RuntimeSnapshot? = synchronized(runtimeLock) {
+        val session = activeSession ?: return@synchronized null
+        val service = activeSyncService ?: return@synchronized null
+        RuntimeSnapshot(sessionGeneration, session, service)
+    }
+
+    private fun isCurrent(snapshot: RuntimeSnapshot): Boolean = synchronized(runtimeLock) {
+        matchesCurrent(snapshot)
+    }
+
+    private fun updateIfCurrent(snapshot: RuntimeSnapshot, update: () -> Unit): Boolean =
+        synchronized(runtimeLock) {
+            if (!matchesCurrent(snapshot)) return@synchronized false
+            update()
+            true
+        }
+
+    private fun matchesCurrent(snapshot: RuntimeSnapshot): Boolean =
+        sessionGeneration == snapshot.generation &&
+            activeSession === snapshot.session &&
+            activeSyncService === snapshot.service
+
+    private fun updateAuthStateIfGeneration(generation: Long, state: String): Boolean =
+        synchronized(runtimeLock) {
+            if (sessionGeneration != generation || activeSession == null || activeSyncService == null) {
+                return@synchronized false
+            }
+            authState = state
+            true
+        }
 
     private fun resetRuntimeHistory() {
         lastProbeAt = 0L
