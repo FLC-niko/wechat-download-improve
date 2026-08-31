@@ -359,15 +359,18 @@ fun main() {
             post("/api/weread/account/recover") {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
-                val exists = com.wamp.download.weread.WeReadAccountPool.get(vid) != null
-                val accepted = exists && AppConfig.adbEnabled
-                if (accepted) recoveryManager.request(vid)
-                val message = when {
-                    !exists -> "账号不存在"
-                    !AppConfig.adbEnabled -> "ADB 已关闭，请使用微信读书手动登录接口恢复"
-                    else -> "恢复任务已排队"
-                }
-                call.respond(mapOf("ok" to accepted, "vid" to vid, "message" to message))
+                val result = com.wamp.download.weread.WeReadWebAuth.requestReloginIfNeeded(
+                    vid,
+                    force = true,
+                    automatic = false,
+                )
+                call.respond(mapOf(
+                    "ok" to (result == com.wamp.download.weread.WeReadWebAuth.ReloginRequestResult.STARTED ||
+                        result == com.wamp.download.weread.WeReadWebAuth.ReloginRequestResult.ALREADY_RUNNING),
+                    "vid" to vid,
+                    "result" to result.name,
+                    "message" to com.wamp.download.weread.CredentialHealthChecker.recoveryMessage(result),
+                ))
             }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()

@@ -45,7 +45,7 @@ weread:
   account_dir: "data/weread_accounts"
   refresh_interval: 3000
   refresh_fail_threshold: 3
-  auto_relogin_enabled: false  # 仅探测并告警；设为 true 才自动推送二维码或交给 ADB 恢复
+  auto_qr_notification_enabled: true # 失效后自动生成并通过机器人发送人工扫码二维码
   relogin_retry_backoff: 300   # Web 自动恢复失败后的最小重试间隔（秒）
   health_check_interval: 300   # Web 凭证健康检查间隔（秒）
   web_probe_freshness: 600     # /api/ready 认可最近一次成功探测的最长时间（秒）
@@ -66,7 +66,7 @@ weread:
     retry_base_delay: 2         # 临时错误重试基础延迟（秒）
     max_concurrent_per_account: 1
     min_request_interval: 1     # 同一 E-Ink 账号请求最小间隔（秒）
-    auto_relogin_enabled: false # 仅探测并告警；设为 true 才自动推送新二维码
+    auto_qr_notification_enabled: true # refreshToken 失效后自动发送人工扫码二维码；-2041 除外
     relogin_retry_backoff: 300  # 自动二维码流程失败后的最小重试间隔（秒）
 
 adb:

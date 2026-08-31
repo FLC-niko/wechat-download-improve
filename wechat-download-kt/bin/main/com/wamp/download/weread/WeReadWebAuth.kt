@@ -34,6 +34,16 @@ import java.util.concurrent.TimeUnit
  * 凭证持久化到文件（风格对齐 AuthManager），复用 WeReadCookieStore。
  */
 object WeReadWebAuth {
+    enum class ReloginRequestResult {
+        STARTED,
+        AUTO_QR_DISABLED,
+        ALREADY_RUNNING,
+        BACKOFF,
+        NO_ACCOUNT,
+        NOT_ELIGIBLE,
+        RECOVERY_UNAVAILABLE,
+    }
+
     private val logger = LoggerFactory.getLogger(WeReadWebAuth::class.java)
     private val gson = Gson()
     private val client = OkHttpClient.Builder()
@@ -65,8 +75,8 @@ object WeReadWebAuth {
     }
 
     /** 达到重新扫码阈值时异步发起登录（操作主账号，兼容入口） */
-    fun requestReloginIfNeeded(): Boolean {
-        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return false
+    fun requestReloginIfNeeded(): ReloginRequestResult {
+        val vid = WeReadAccountPool.primaryAccount()?.vid ?: return ReloginRequestResult.NO_ACCOUNT
         return requestReloginIfNeeded(vid)
     }
 
@@ -76,33 +86,43 @@ object WeReadWebAuth {
      * 在抓取链路（被动刷新失败）中调用，不阻塞当前协程。
      * 由独立线程执行扫码登录流程，结束自动复位标志。
      */
-    fun requestReloginIfNeeded(vid: String, force: Boolean = false): Boolean {
-        val account = WeReadAccountPool.get(vid) ?: return false
+    fun requestReloginIfNeeded(
+        vid: String,
+        force: Boolean = false,
+        automatic: Boolean = true,
+    ): ReloginRequestResult {
+        val account = WeReadAccountPool.get(vid) ?: return ReloginRequestResult.NO_ACCOUNT
         if (!reloginEligible(
                 status = account.status,
                 refreshFailCount = account.credentials.refreshFailCount,
                 threshold = AppConfig.wereadRefreshFailThreshold,
-                enabled = AppConfig.wereadAutoReloginEnabled,
                 force = force,
             )
-        ) return false
+        ) return ReloginRequestResult.NOT_ELIGIBLE
         val now = System.currentTimeMillis()
-        if (now < nextReloginAttemptAt.getOrDefault(vid, 0L)) return false
+        if (automatic && now < nextReloginAttemptAt.getOrDefault(vid, 0L)) {
+            return ReloginRequestResult.BACKOFF
+        }
+        // ADB recovery has its own explicit adb.enabled gate and must not be coupled to the
+        // human QR-notification preference.
         deviceRecoveryHandler?.let {
             it(vid)
-            return true
+            return ReloginRequestResult.STARTED
         }
-        if (reloginInProgress.putIfAbsent(vid, true) != null) return false
+        if (automatic && !AppConfig.wereadAutoQrNotificationEnabled) {
+            return ReloginRequestResult.AUTO_QR_DISABLED
+        }
+        if (reloginInProgress.putIfAbsent(vid, true) != null) return ReloginRequestResult.ALREADY_RUNNING
         val scope = recoveryScope
         if (scope == null) {
             reloginInProgress.remove(vid)
             logger.error("微信读书自动恢复未配置应用协程，无法启动: vid=$vid")
-            return false
+            return ReloginRequestResult.RECOVERY_UNAVAILABLE
         }
         if (!scope.isActive) {
             reloginInProgress.remove(vid)
             logger.error("微信读书自动恢复协程已关闭，无法启动: vid=$vid")
-            return false
+            return ReloginRequestResult.RECOVERY_UNAVAILABLE
         }
         val job = scope.launch(Dispatchers.IO) {
             try {
@@ -116,19 +136,21 @@ object WeReadWebAuth {
                     )
                 } else {
                     recordReloginFailure(vid)
+                    notifyReloginFailure(vid, "二维码生成、投递或扫码流程未完成")
                 }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
                 logger.error("微信读书自动恢复异常: vid=$vid, ${error.message}", error)
                 recordReloginFailure(vid)
+                notifyReloginFailure(vid, error.message ?: error.javaClass.simpleName)
             } finally {
                 reloginInProgress.remove(vid)
             }
         }
         // A cancelled scope can prevent the coroutine body from running at all.
         job.invokeOnCompletion { reloginInProgress.remove(vid) }
-        return true
+        return ReloginRequestResult.STARTED
     }
 
     /**
@@ -355,6 +377,8 @@ object WeReadWebAuth {
         } == true
 
     fun recoveryStatus(vid: String): Map<String, Any?> = mapOf(
+        "auto_qr_notification_enabled" to AppConfig.wereadAutoQrNotificationEnabled,
+        "adb_recovery_configured" to (deviceRecoveryHandler != null),
         "in_progress" to reloginInProgress.getOrDefault(vid, false),
         "failure_count" to reloginFailureCount.getOrDefault(vid, 0),
         "next_retry_at" to nextReloginAttemptAt[vid],
@@ -369,13 +393,24 @@ object WeReadWebAuth {
         nextReloginAttemptAt[vid] = System.currentTimeMillis() + delayMs
     }
 
+    private suspend fun notifyReloginFailure(vid: String, reason: String) {
+        WebhookNotifier.notify(
+            "weread_account_recovery_failed",
+            mapOf(
+                "message" to "微信读书 Web 二维码恢复未完成，服务将按退避策略重试",
+                "vid" to vid,
+                "reason" to reason.take(500),
+                "next_retry_at" to nextReloginAttemptAt[vid],
+            ),
+        )
+    }
+
     internal fun reloginEligible(
         status: AccountStatus,
         refreshFailCount: Int,
         threshold: Int,
-        enabled: Boolean,
         force: Boolean,
-    ): Boolean = enabled && (force || status == AccountStatus.EXPIRED || refreshFailCount >= threshold)
+    ): Boolean = force || status == AccountStatus.EXPIRED || refreshFailCount >= threshold
 
     /**
      * 清除登录状态

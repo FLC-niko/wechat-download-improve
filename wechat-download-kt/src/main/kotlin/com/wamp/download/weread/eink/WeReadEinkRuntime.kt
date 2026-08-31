@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Owns the live E-Ink session and can reload it immediately after QR login. */
 object WeReadEinkRuntime {
@@ -49,6 +50,8 @@ object WeReadEinkRuntime {
     @Volatile
     private var lastScheduledSyncTarget: String? = null
 
+    private val humanVerificationReported = AtomicBoolean(false)
+
     private data class RuntimeSnapshot(
         val generation: Long,
         val session: WeReadEinkSession,
@@ -80,6 +83,7 @@ object WeReadEinkRuntime {
         synchronized(runtimeLock) {
             if (activeSyncService === installedService) {
                 authState = "HEALTHY"
+                humanVerificationReported.set(false)
                 lastProbeAt = System.currentTimeMillis()
                 lastProbeResult = "QR_LOGIN_SUCCEEDED"
                 lastProbeError = null
@@ -187,6 +191,7 @@ object WeReadEinkRuntime {
         return try {
             session.refresh()
             if (!updateIfCurrent(snapshot) { authState = "HEALTHY" }) return false
+            humanVerificationReported.set(false)
             logger.info("E-Ink accessToken 已按服务端过期时间续签")
             true
         } catch (_: WeReadEinkRefreshBackoffException) {
@@ -218,20 +223,18 @@ object WeReadEinkRuntime {
         return try {
             if (!isCurrent(snapshot)) return false
             service.probe(target)
-            updateIfCurrent(snapshot) {
+            val updated = updateIfCurrent(snapshot) {
                 authState = "HEALTHY"
                 lastProbeAt = System.currentTimeMillis()
                 lastProbeResult = "SUCCESS"
                 lastProbeError = null
             }
+            if (updated) humanVerificationReported.set(false)
+            updated
         } catch (error: Exception) {
             val updated = updateIfCurrent(snapshot) {
                 val refresh = snapshot.session.refreshStatus()
-                authState = when {
-                    refresh.authExpired -> "REAUTH_REQUIRED"
-                    error is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
-                    else -> "DEGRADED"
-                }
+                authState = authStateAfterFailure(refresh.authExpired, error)
                 lastProbeAt = System.currentTimeMillis()
                 lastProbeResult = when (error) {
                     is WeReadEinkApiException -> error.kind.name
@@ -241,13 +244,23 @@ object WeReadEinkRuntime {
                 }
                 lastProbeError = error.message.orEmpty().take(500)
             }
-            if (updated) ensureAutoRecovery()
+            if (updated) {
+                if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
+                    notifyHumanVerification(error)
+                } else {
+                    ensureAutoRecovery()
+                }
+            }
             false
         }
     }
 
     /** Synchronizes at most one due subscription per scheduler tick to avoid startup request bursts. */
     fun syncNextDueSubscription(now: Long = System.currentTimeMillis() / 1000L): Boolean {
+        // -2041 is an account-side challenge. Replaying a different subscription every minute
+        // cannot solve it and only adds risk; the slower health probe remains responsible for
+        // observing recovery after the user completes verification in the official client.
+        if (scheduledSyncSuppressed(authState)) return false
         val snapshot = currentSnapshot() ?: return false
         val service = snapshot.service
         if (snapshot.session.refreshStatus().authExpired) {
@@ -267,12 +280,17 @@ object WeReadEinkRuntime {
         ) return false
         return try {
             service.sync(target)
-            updateIfCurrent(snapshot) {
+            val updated = updateIfCurrent(snapshot) {
                 authState = "HEALTHY"
                 lastScheduledSyncResult = "SUCCESS"
             }
+            if (updated) humanVerificationReported.set(false)
+            updated
         } catch (error: Exception) {
             val updated = updateIfCurrent(snapshot) {
+                if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
+                    authState = "HUMAN_VERIFY_REQUIRED"
+                }
                 lastScheduledSyncResult = when (error) {
                     is WeReadEinkApiException -> error.kind.name
                     is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
@@ -280,7 +298,11 @@ object WeReadEinkRuntime {
                 }
             }
             if (updated) {
-                ensureAutoRecovery()
+                if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
+                    notifyHumanVerification(error)
+                } else {
+                    ensureAutoRecovery()
+                }
                 logger.warn("E-Ink 后台增量同步失败: fakeid=${target.fakeid.take(8)}..., ${error.message}")
             }
             false
@@ -298,7 +320,7 @@ object WeReadEinkRuntime {
             } else {
                 "REAUTH_REQUIRED"
             }
-            if (!AppConfig.wereadEinkAutoReloginEnabled) return@synchronized false
+            if (!AppConfig.wereadEinkAutoQrNotificationEnabled) return@synchronized false
             val started = WeReadEinkLoginCoordinator.start(scope, automatic = true)
             if (started || WeReadEinkLoginCoordinator.isInProgress()) authState = "REAUTH_IN_PROGRESS"
             started
@@ -307,16 +329,25 @@ object WeReadEinkRuntime {
 
     private fun handleRefreshFailure(error: Throwable, generation: Long) {
         val authExpired = error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.AUTH_EXPIRED
+        val humanVerify = error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY
         if (!updateAuthStateIfGeneration(
                 generation,
-                if (authExpired) "REAUTH_REQUIRED" else "REFRESH_BACKOFF",
+                when {
+                    humanVerify -> "HUMAN_VERIFY_REQUIRED"
+                    authExpired -> "REAUTH_REQUIRED"
+                    else -> "REFRESH_BACKOFF"
+                },
             )
         ) return
+        if (humanVerify) {
+            notifyHumanVerification(error as WeReadEinkApiException)
+            return
+        }
         if (authExpired) {
-            val message = if (AppConfig.wereadEinkAutoReloginEnabled) {
-                "微信读书 E-Ink refreshToken 已失效，正在请求重新扫码"
+            val message = if (AppConfig.wereadEinkAutoQrNotificationEnabled) {
+                "微信读书 E-Ink refreshToken 已失效，正在生成并推送人工扫码二维码"
             } else {
-                "微信读书 E-Ink refreshToken 已失效，自动扫码已关闭，请调用登录接口人工恢复"
+                "微信读书 E-Ink refreshToken 已失效，自动二维码通知已关闭，请调用 /api/weread/eink/login/start 人工恢复"
             }
             recoveryScope?.launch {
                 if (sessionGeneration != generation) return@launch
@@ -332,6 +363,33 @@ object WeReadEinkRuntime {
         }
     }
 
+    private fun notifyHumanVerification(error: WeReadEinkApiException) {
+        if (!humanVerificationReported.compareAndSet(false, true)) return
+        recoveryScope?.launch {
+            WebhookNotifier.notify(
+                "weread_eink_human_verify",
+                mapOf(
+                    "message" to "微信读书 E-Ink 触发 -2041 人工验证；重新登录二维码通常无法解除，请在微信读书官方客户端完成验证后再重试",
+                    "error" to error.message,
+                ),
+            )
+        } ?: run {
+            humanVerificationReported.set(false)
+            logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")
+        }
+    }
+
+    internal fun authStateAfterFailure(refreshAuthExpired: Boolean, error: Throwable): String = when {
+        error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY ->
+            "HUMAN_VERIFY_REQUIRED"
+        refreshAuthExpired -> "REAUTH_REQUIRED"
+        error is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
+        else -> "DEGRADED"
+    }
+
+    internal fun scheduledSyncSuppressed(state: String): Boolean =
+        state == "HUMAN_VERIFY_REQUIRED" || state == "REAUTH_IN_PROGRESS"
+
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
         val snapshot = currentSnapshot()
         val credentials = snapshot?.session?.credentials()
@@ -345,6 +403,7 @@ object WeReadEinkRuntime {
         val runtimeReady = snapshot != null
         return mapOf(
             "enabled" to AppConfig.wereadEinkEnabled,
+            "auto_qr_notification_enabled" to AppConfig.wereadEinkAutoQrNotificationEnabled,
             "configured" to (credentials != null),
             "runtime_ready" to runtimeReady,
             "operational" to (runtimeReady && currentAuthState == "HEALTHY"),
@@ -409,6 +468,7 @@ object WeReadEinkRuntime {
         }
 
     private fun resetRuntimeHistory() {
+        humanVerificationReported.set(false)
         lastProbeAt = 0L
         lastProbeResult = "NEVER"
         lastProbeError = null

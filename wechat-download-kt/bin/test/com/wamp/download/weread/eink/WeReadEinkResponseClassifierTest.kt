@@ -39,4 +39,21 @@ class WeReadEinkResponseClassifierTest {
             ).kind,
         )
     }
+
+    @Test
+    fun `human verification is never downgraded to qr reauthentication`() {
+        val error = WeReadEinkApiException(
+            kind = WeReadEinkResponseKind.HUMAN_VERIFY,
+            statusCode = 200,
+            errCode = -2041,
+            errMsg = "verify",
+        )
+
+        assertEquals(
+            "HUMAN_VERIFY_REQUIRED",
+            WeReadEinkRuntime.authStateAfterFailure(refreshAuthExpired = true, error = error),
+        )
+        assertEquals(true, WeReadEinkRuntime.scheduledSyncSuppressed("HUMAN_VERIFY_REQUIRED"))
+        assertEquals(false, WeReadEinkRuntime.scheduledSyncSuppressed("HEALTHY"))
+    }
 }

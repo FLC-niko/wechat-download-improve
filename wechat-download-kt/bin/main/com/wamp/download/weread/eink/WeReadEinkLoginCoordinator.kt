@@ -107,6 +107,14 @@ object WeReadEinkLoginCoordinator {
                     val maxDelayMs = AppConfig.wereadEinkRefreshRetryMax * 1000L
                     val delayMs = (baseDelayMs * (1L shl exponent)).coerceAtMost(maxDelayMs)
                     nextAutomaticRetryAt = System.currentTimeMillis() + delayMs
+                    WebhookNotifier.notify(
+                        "weread_eink_recovery_failed",
+                        mapOf(
+                            "message" to "微信读书 E-Ink 二维码恢复未完成，服务将按退避策略重试",
+                            "reason" to lastError,
+                            "next_retry_at" to nextAutomaticRetryAt,
+                        ),
+                    )
                 }
                 logger.error("E-Ink 登录失败: ${error.message}")
             } finally {

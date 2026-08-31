@@ -91,8 +91,9 @@ object AppConfig {
         get() = getInt("weread.eink.max_concurrent_per_account", 1).coerceAtLeast(1)
     val wereadEinkMinRequestInterval: Long
         get() = getLong("weread.eink.min_request_interval", 1L).coerceAtLeast(0L)
-    val wereadEinkAutoReloginEnabled: Boolean
-        get() = getBool("weread.eink.auto_relogin_enabled", false)
+    /** 自动生成并通过机器人投递人工扫码二维码；与 ADB 无人值守扫码互不依赖。 */
+    val wereadEinkAutoQrNotificationEnabled: Boolean
+        get() = getBool("weread.eink.auto_qr_notification_enabled", true)
     val wereadEinkReloginRetryBackoff: Long
         get() = getLong("weread.eink.relogin_retry_backoff", 300L).coerceAtLeast(30L)
     val wereadWebHealthCheckInterval: Long
@@ -108,7 +109,9 @@ object AppConfig {
     // wr_skey 双层刷新保活（wr_skey 有效期 5400s，刷新间隔必须 < 5400s）
     val wereadRefreshInterval: Long get() = getLong("weread.refresh_interval", 3000L)   // 50 分钟
     val wereadRefreshFailThreshold: Int get() = getInt("weread.refresh_fail_threshold", 3)
-    val wereadAutoReloginEnabled: Boolean get() = getBool("weread.auto_relogin_enabled", false)
+    /** Web 凭证失效后自动生成并通过机器人投递人工扫码二维码。 */
+    val wereadAutoQrNotificationEnabled: Boolean
+        get() = getBool("weread.auto_qr_notification_enabled", true)
     val wereadReloginRetryBackoff: Long
         get() = getLong("weread.relogin_retry_backoff", 300L).coerceAtLeast(30L)
 

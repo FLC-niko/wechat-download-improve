@@ -51,9 +51,12 @@ object WebhookNotifier {
         "qr_code_pushed" to "二维码已推送",
         "weread_eink_persistence_failed" to "微信读书 E-Ink 凭证落盘失败",
         "weread_eink_expired" to "微信读书 E-Ink 登录失效",
+        "weread_eink_human_verify" to "微信读书 E-Ink 需要人工验证",
         "weread_eink_recovered" to "微信读书 E-Ink 登录恢复",
         "weread_accounts_expired" to "微信读书 Web 账号失效",
         "weread_account_recovered" to "微信读书 Web 账号恢复",
+        "weread_account_recovery_failed" to "微信读书 Web 二维码恢复未完成",
+        "weread_eink_recovery_failed" to "微信读书 E-Ink 二维码恢复未完成",
     )
 
     private fun enabled(): Boolean =

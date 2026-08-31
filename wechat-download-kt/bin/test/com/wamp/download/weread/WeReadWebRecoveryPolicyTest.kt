@@ -1,7 +1,6 @@
 package com.wamp.download.weread
 
 import kotlin.test.Test
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class WeReadWebRecoveryPolicyTest {
@@ -12,22 +11,32 @@ class WeReadWebRecoveryPolicyTest {
                 status = AccountStatus.EXPIRED,
                 refreshFailCount = 0,
                 threshold = 3,
-                enabled = true,
                 force = false,
             ),
         )
     }
 
     @Test
-    fun `automatic recovery switch is authoritative`() {
-        assertFalse(
+    fun `manual request can force qr recovery independently of account status`() {
+        assertTrue(
             WeReadWebAuth.reloginEligible(
-                status = AccountStatus.EXPIRED,
-                refreshFailCount = 10,
+                status = AccountStatus.ACTIVE,
+                refreshFailCount = 0,
                 threshold = 3,
-                enabled = false,
                 force = true,
             ),
+        )
+    }
+
+    @Test
+    fun `health notification only claims orchestration when recovery started`() {
+        assertTrue(
+            CredentialHealthChecker.recoveryMessage(WeReadWebAuth.ReloginRequestResult.STARTED)
+                .contains("已启动"),
+        )
+        assertTrue(
+            CredentialHealthChecker.recoveryMessage(WeReadWebAuth.ReloginRequestResult.AUTO_QR_DISABLED)
+                .contains("已关闭"),
         )
     }
 }

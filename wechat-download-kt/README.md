@@ -38,19 +38,19 @@
 
 ### 当前上线模式：不依赖 ADB
 
-默认配置不会执行 `adb devices`，也不会启动 ADB 设备监督；凭证会被主动探测并记录状态，但自动二维码恢复默认关闭，避免服务重启或无人值守时意外发起扫码。需要时可显式打开对应的自动恢复开关。已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此主通道默认关闭。
+默认配置不会执行 `adb devices`，也不会启动 ADB 设备监督；凭证会被主动探测，Web 或 E-Ink refreshToken 明确失效后自动生成二维码并通过机器人通知，由用户人工扫码。二维码通知与 ADB 无人值守扫码是两个独立能力，后者继续默认关闭。已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此主通道默认关闭。
 
 ```yaml
 auth:
   auto_recovery_enabled: false
 
 weread:
-  auto_relogin_enabled: false
+  auto_qr_notification_enabled: true
   health_check_interval: 300
   web_probe_freshness: 600
   eink:
     enabled: true
-    auto_relogin_enabled: false
+    auto_qr_notification_enabled: true
 
 adb:
   enabled: false
@@ -64,13 +64,21 @@ wx:
     enabled: false
 ```
 
-需要恢复凭证时使用服务端扫码登录接口和机器人通知。将 `auth.auto_recovery_enabled`、`weread.auto_relogin_enabled` 或 `weread.eink.auto_relogin_enabled` 显式设为 `true` 后，才会在对应通道失效时自动恢复；ADB 设备恢复还需要显式设置 `adb.enabled: true`。ADB 状态仍可通过以下接口查看：
+Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。ADB 设备代扫仍需显式设置 `adb.enabled: true`。E-Ink 返回 `-2041` 时属于官方风控人工验证，服务不会用重新登录二维码冒充恢复，需先在微信读书官方客户端完成验证。ADB 状态仍可通过以下接口查看：
 
 ```bash
 curl http://localhost:5000/api/adb/status
 ```
 
-关闭 ADB 时 `/api/weread/account/recover` 会明确拒绝设备恢复请求，可使用 `/api/weread/login` 发起微信读书手动扫码。
+关闭 ADB 时 `/api/weread/account/recover` 会直接生成目标 Web 账号的二维码并通过机器人发送；E-Ink 可调用 `/api/weread/eink/login/start`，两者都不要求服务器安装 Android APK。
+
+```bash
+curl -X POST http://localhost:5000/api/weread/account/recover \
+  -H 'Content-Type: application/json' \
+  -d '{"vid":"目标 Web 账号 vid"}'
+
+curl -X POST http://localhost:5000/api/weread/eink/login/start
+```
 
 ### 1. 配置
 

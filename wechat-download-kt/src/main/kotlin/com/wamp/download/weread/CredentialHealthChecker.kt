@@ -4,6 +4,7 @@ import com.wamp.download.config.AppConfig
 import com.wamp.download.notify.WebhookNotifier
 import com.wamp.download.weread.eink.WeReadEinkRuntime
 import org.slf4j.LoggerFactory
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 启动时凭证健康检查
@@ -19,6 +20,7 @@ import org.slf4j.LoggerFactory
 object CredentialHealthChecker {
     private val logger = LoggerFactory.getLogger(CredentialHealthChecker::class.java)
     private val webClient = WeReadWebClient()
+    private val reportedExpiredAccounts = ConcurrentHashMap.newKeySet<String>()
 
     suspend fun checkAll() {
         checkEink()
@@ -69,31 +71,61 @@ object CredentialHealthChecker {
             return
         }
 
-        val expired = mutableListOf<String>()
+        val expired = mutableListOf<Pair<String, WeReadWebAuth.ReloginRequestResult>>()
         for (account in accounts) {
             if (account.status == AccountStatus.EXPIRED) {
-                expired += account.vid
-                WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
+                expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
                 continue
             }
             when (webClient.probeAccount(account)) {
                 WeReadWebResponseKind.AUTH_EXPIRED -> {
                     WeReadAccountPool.markAuthExpired(account.vid, "凭证检测:凭证失效(401/-2012)")
-                    expired += account.vid
-                    WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
+                    expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
                 }
-                WeReadWebResponseKind.SUCCESS -> WeReadAccountPool.markProbeSuccess(account.vid)
+                WeReadWebResponseKind.SUCCESS -> {
+                    WeReadAccountPool.markProbeSuccess(account.vid)
+                    reportedExpiredAccounts.remove(account.vid)
+                }
                 else -> Unit  // 存活 / 频控 / 网络异常均不动作
             }
         }
 
         if (expired.isNotEmpty()) {
-            logger.warn("凭证检测: ${expired.size} 个微信读书 Web 账号等待恢复: ${expired.joinToString()}")
-            WebhookNotifier.notify("weread_accounts_expired", mapOf(
-                "message" to "微信读书 Web 账号凭证失效 ${expired.size} 个（${expired.joinToString()}），已进入恢复编排",
-            ))
+            logger.warn(
+                "凭证检测: ${expired.size} 个微信读书 Web 账号等待恢复: " +
+                    expired.joinToString { "${it.first}=${it.second}" },
+            )
+            expired.forEach { (vid, result) ->
+                if (reportedExpiredAccounts.add(vid)) {
+                    WebhookNotifier.notify(
+                        "weread_accounts_expired",
+                        mapOf(
+                            "message" to recoveryMessage(result),
+                            "vid" to vid,
+                            "recovery_result" to result.name,
+                        ),
+                    )
+                }
+            }
         } else {
             logger.info("凭证检测: 微信读书 Web 账号全部存活（${accounts.size} 个）")
         }
+    }
+
+    internal fun recoveryMessage(result: WeReadWebAuth.ReloginRequestResult): String = when (result) {
+        WeReadWebAuth.ReloginRequestResult.STARTED ->
+            "微信读书 Web 凭证失效，人工扫码二维码生成任务已启动，二维码将由机器人发送"
+        WeReadWebAuth.ReloginRequestResult.ALREADY_RUNNING ->
+            "微信读书 Web 凭证失效，已有二维码正在等待扫码"
+        WeReadWebAuth.ReloginRequestResult.BACKOFF ->
+            "微信读书 Web 凭证失效，上次二维码恢复未完成，正在退避等待下次重试"
+        WeReadWebAuth.ReloginRequestResult.AUTO_QR_DISABLED ->
+            "微信读书 Web 凭证失效，自动二维码通知已关闭；请调用 /api/weread/account/recover 人工启动"
+        WeReadWebAuth.ReloginRequestResult.NO_ACCOUNT ->
+            "微信读书 Web 凭证失效，但账号已不存在"
+        WeReadWebAuth.ReloginRequestResult.NOT_ELIGIBLE ->
+            "微信读书 Web 账号当前不满足恢复条件"
+        WeReadWebAuth.ReloginRequestResult.RECOVERY_UNAVAILABLE ->
+            "微信读书 Web 凭证失效，但恢复协程不可用，请检查服务状态"
     }
 }
