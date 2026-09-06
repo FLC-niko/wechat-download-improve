@@ -88,4 +88,14 @@ data class WeReadAccount(
             AccountStatus.COOLDOWN -> now >= cooldownUntil
             AccountStatus.EXPIRED, AccountStatus.DISABLED -> false
         }
+
+    fun normalized(): WeReadAccount {
+        @Suppress("SENSELESS_COMPARISON")
+        if (bindingStrategy == null || bindingStrategy.isBlank()) bindingStrategy = "FIXED_DEVICE"
+        @Suppress("SENSELESS_COMPARISON")
+        if (boundSerial == null) boundSerial = ""
+        @Suppress("SENSELESS_COMPARISON")
+        if (disabledReason == null) disabledReason = ""
+        return this
+    }
 }

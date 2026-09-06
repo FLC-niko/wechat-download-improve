@@ -83,9 +83,33 @@ class AdbDeviceSupervisor(
 
     fun hasOnlineDevice(): Boolean = devices.isNotEmpty()
 
-    /** 返回在线设备的 User 0 / XSpace 槽位，后续 AAOS 调度器可在此基础上加占用锁。 */
+    /** 返回在线设备的 User 0 / XSpace 槽位，包含真实硬件序列号映射及版本特征。 */
     fun availableSlots(): List<DeviceSlot> = devices.values.flatMap { device ->
-        device.userIds.map { userId -> DeviceSlot(device.serial, userId) }
+        device.userIds.map { userId ->
+            DeviceSlot(
+                serial = device.serial,
+                userId = userId,
+                hardwareSerial = device.hardwareSerial,
+                sdkVersion = device.sdkVersion,
+                wechatVersion = device.wechatVersion,
+            )
+        }
+    }
+
+    /** 通过硬件序列号（ro.serialno）查找在线槽位。 */
+    fun findSlotByHardware(hardwareSerial: String, userId: Int): DeviceSlot? {
+        if (hardwareSerial.isBlank()) return null
+        return devices.values
+            .firstOrNull { it.hardwareSerial == hardwareSerial && userId in it.userIds }
+            ?.let {
+                DeviceSlot(
+                    serial = it.serial,
+                    userId = userId,
+                    hardwareSerial = it.hardwareSerial,
+                    sdkVersion = it.sdkVersion,
+                    wechatVersion = it.wechatVersion,
+                )
+            }
     }
 
     private fun discover(): List<AdbDevice> {
@@ -98,15 +122,40 @@ class AdbDeviceSupervisor(
             .mapNotNull { parseDeviceLine(it) }
             .map { device ->
                 val users = detectUsers(device.serial)
-                device.copy(userIds = users)
+                val hwSerial = detectHardwareSerial(device.serial)
+                val sdkVer = detectSdkVersion(device.serial)
+                val wxVer = detectWechatVersion(device.serial)
+                device.copy(
+                    userIds = users,
+                    hardwareSerial = hwSerial,
+                    sdkVersion = sdkVer,
+                    wechatVersion = wxVer,
+                )
             }
             .toList()
     }
 
+    fun detectSdkVersion(serial: String): Int {
+        val result = runCatching { commandRunner.run(listOf("-s", serial, "shell", "getprop", "ro.build.version.sdk")) }.getOrNull()
+        return if (result?.exitCode == 0) result.stdout.trim().toIntOrNull() ?: 0 else 0
+    }
+
+    fun detectWechatVersion(serial: String): String {
+        val result = runCatching { commandRunner.run(listOf("-s", serial, "shell", "dumpsys", "package", "com.tencent.mm")) }.getOrNull()
+        if (result?.exitCode != 0) return ""
+        val match = WECHAT_VERSION_NAME_REGEX.find(result.stdout)
+        return match?.groupValues?.getOrNull(1)?.trim() ?: ""
+    }
+
+    private fun detectHardwareSerial(serial: String): String {
+        val result = runCatching { commandRunner.run(listOf("-s", serial, "shell", "getprop", "ro.serialno")) }.getOrNull()
+        return if (result?.exitCode == 0) result.stdout.trim().ifBlank { serial } else serial
+    }
+
     private fun detectUsers(serial: String): List<Int> {
-        val result = commandRunner.run(listOf("-s", serial, "shell", "pm", "list", "users"))
-        if (result.exitCode != 0) {
-            logger.warn("无法探测设备用户空间: serial=$serial, ${result.stderr}")
+        val result = runCatching { commandRunner.run(listOf("-s", serial, "shell", "pm", "list", "users")) }.getOrNull()
+        if (result == null || result.exitCode != 0) {
+            logger.warn("无法探测设备用户空间: serial=$serial, ${result?.stderr}")
             return listOf(0)
         }
         val ids = USER_ID_REGEX.findAll(result.stdout)
@@ -124,6 +173,31 @@ class AdbDeviceSupervisor(
 
     companion object {
         private val USER_ID_REGEX = Regex("UserInfo\\{(\\d+):")
+        private val WECHAT_VERSION_NAME_REGEX = Regex("""versionName=([^\s]+)""")
+
+        /**
+         * 语义化版本号比较：v1 < v2 返回负数，v1 == v2 返回 0，v1 > v2 返回正数。
+         */
+        fun compareWechatVersion(v1: String, v2: String): Int {
+            if (v1.isBlank() && v2.isBlank()) return 0
+            if (v1.isBlank()) return -1
+            if (v2.isBlank()) return 1
+            val parts1 = v1.split(".").mapNotNull { part ->
+                part.takeWhile { it.isDigit() }.toIntOrNull()
+            }
+            val parts2 = v2.split(".").mapNotNull { part ->
+                part.takeWhile { it.isDigit() }.toIntOrNull()
+            }
+            val maxLen = maxOf(parts1.size, parts2.size)
+            for (i in 0 until maxLen) {
+                val num1 = parts1.getOrElse(i) { 0 }
+                val num2 = parts2.getOrElse(i) { 0 }
+                if (num1 != num2) {
+                    return num1.compareTo(num2)
+                }
+            }
+            return 0
+        }
     }
 }
 
@@ -135,12 +209,29 @@ enum class RecoveryMode {
 data class AdbDevice(
     val serial: String,
     val userIds: List<Int>,
-)
+    val hardwareSerial: String = "",
+    val sdkVersion: Int = 0,
+    val wechatVersion: String = "",
+) {
+    val isLegacyWechat: Boolean get() = wechatVersion.isNotBlank() && AdbDeviceSupervisor.compareWechatVersion(wechatVersion, "8.0.40") < 0
+    val isLegacyAndroid: Boolean get() = sdkVersion in 1..29
+    val isLegacyRoute: Boolean get() = isLegacyWechat || isLegacyAndroid
+}
 
 data class DeviceSlot(
     val serial: String,
     val userId: Int,
-)
+    val hardwareSerial: String = "",
+    val sdkVersion: Int = 0,
+    val wechatVersion: String = "",
+) {
+    /** 物理硬件 + 多用户复合唯一键，例如 M7Z5HABUMJT8BUO7#0 或 M7Z5HABUMJT8BUO7#999 */
+    val slotKey: String get() = "${hardwareSerial.ifBlank { serial }}#$userId"
+
+    val isLegacyWechat: Boolean get() = wechatVersion.isNotBlank() && AdbDeviceSupervisor.compareWechatVersion(wechatVersion, "8.0.40") < 0
+    val isLegacyAndroid: Boolean get() = sdkVersion in 1..29
+    val isLegacyRoute: Boolean get() = isLegacyWechat || isLegacyAndroid
+}
 
 data class DeviceSnapshot(
     val mode: RecoveryMode,

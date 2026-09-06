@@ -37,7 +37,12 @@ for serial in "${devices[@]}"; do
         adb -s "$serial" shell settings --user "$user_id" put secure enabled_accessibility_services "$SERVICE"
         adb -s "$serial" shell settings --user "$user_id" put secure accessibility_enabled 1
         adb -s "$serial" shell cmd appops set --user "$user_id" com.tencent.mm RUN_IN_BACKGROUND allow || true
-        echo "    user=$user_id accessibility=enabled"
+        # HyperOS 2 专属：赋予相册读取权限与后台弹出界面权限 (10021)
+        adb -s "$serial" shell pm grant --user "$user_id" com.tencent.mm android.permission.READ_MEDIA_IMAGES >/dev/null 2>&1 || true
+        adb -s "$serial" shell pm grant --user "$user_id" com.tencent.mm android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true
+        adb -s "$serial" shell cmd appops set --user "$user_id" "$PACKAGE" 10021 allow >/dev/null 2>&1 || true
+        adb -s "$serial" shell cmd appops set --user "$user_id" "$PACKAGE" SYSTEM_ALERT_WINDOW allow >/dev/null 2>&1 || true
+        echo "    user=$user_id accessibility=enabled, media/popup permissions granted"
     done
 
     adb -s "$serial" shell svc power stayonusb true || true

@@ -99,28 +99,60 @@ class DeviceRecoveryManager(
             if ((attempts[vid]?.attempts ?: 0) == 0) notifyManual(account)
             return "没有可用的 ADB 设备槽位"
         }
-        val lock = deviceLocks.computeIfAbsent(slot.serial) { Mutex() }
+        // 升级为物理硬件级独占互斥锁，彻底避免同一手机主身与分身并发执行
+        val hardwareKey = slot.hardwareSerial.ifBlank { slot.serial }
+        val lock = deviceLocks.computeIfAbsent(hardwareKey) { Mutex() }
         return lock.withLock {
             val login = WeReadWebAuth.createLogin() ?: return@withLock "创建微信读书登录二维码失败"
             val qrFile = saveQrCode(login.second, vid) ?: return@withLock "保存微信读书登录二维码失败"
-            if (!operations.isReady(slot) || !operations.pushQrCode(slot, qrFile) || !operations.startWeReadLogin(slot)) {
-                logger.warn("微信读书自动恢复无法启动 AAOS: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-                return@withLock "ADB/AAOS 登录流程启动失败"
+            
+            // 采用增强的推码与前置清理机制
+            val pushResult = operations.pushQrCode(slot, qrFile)
+            if (!pushResult.success) {
+                logger.warn("微信读书二维码推送失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
+                return@withLock "推送二维码到手机失败"
             }
-            val credentials = WeReadWebAuth.pollLoginCredentials(login.first)
-            if (credentials == null) {
-                logger.warn("微信读书自动恢复扫码超时: vid=$vid")
-                return@withLock "ADB 扫码登录超时"
+
+            try {
+                // 双轨调度：如果是老版本环境且安装了 AAOS，走经典 AAOS 无障碍全自动路线；
+                // 现代环境（Android 14 / HyperOS / 微信 8.0.76+）走坐标穿透管线
+                val scanStarted = if (slot.isLegacyRoute && operations.isReady(slot)) {
+                    logger.info("设备命中经典 AAOS 路线，启动无障碍全自动登录: vid=$vid, serial=${slot.serial}")
+                    operations.startWeReadLogin(slot)
+                } else {
+                    logger.info("设备执行现代坐标穿透自绘扫码管线: vid=$vid, serial=${slot.serial}")
+                    operations.performWeReadScanAndConfirm(slot, isWeb = true)
+                }
+                if (!scanStarted) {
+                    logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
+                    return@withLock "自动扫码与点击流程启动失败"
+                }
+
+                val credentials = WeReadWebAuth.pollLoginCredentials(login.first, timeoutSeconds = 60)
+                if (credentials == null) {
+                    logger.warn("微信读书自动恢复扫码超时: vid=$vid")
+                    return@withLock "ADB 扫码登录超时"
+                }
+                if (credentials.wrVid != vid) {
+                    logger.warn("扫码账号与目标账号不匹配，拒绝写入: target=$vid, scanned=${credentials.wrVid}")
+                    return@withLock "扫码账号与目标账号不匹配"
+                }
+                if (!WeReadAccountPool.completeRecovery(vid, credentials, slot.serial, slot.userId)) {
+                    return@withLock "恢复凭证持久化失败"
+                }
+                logger.info("微信读书账号自动恢复成功: vid=$vid, slotKey=${slot.slotKey}")
+                null
+            } finally {
+                // 1. 严格点击左上角叉叉关闭 WebView 并复位回微信根页面 LauncherUI
+                runCatching {
+                    operations.dismissAuthorizationAndReset(slot)
+                }.onFailure {
+                    logger.warn("复位微信前台失败: vid=$vid, ${it.message}")
+                }
+                // 2. 严格阅后即焚清理临时图片
+                operations.cleanupQrCode(slot, pushResult.destinationPath)
+                qrFile.delete()
             }
-            if (credentials.wrVid != vid) {
-                logger.warn("扫码账号与目标账号不匹配，拒绝写入: target=$vid, scanned=${credentials.wrVid}")
-                return@withLock "扫码账号与目标账号不匹配"
-            }
-            if (!WeReadAccountPool.completeRecovery(vid, credentials, slot.serial, slot.userId)) {
-                return@withLock "恢复凭证持久化失败"
-            }
-            logger.info("微信读书账号自动恢复成功: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-            null
         }
     }
 
@@ -145,14 +177,21 @@ class DeviceRecoveryManager(
         logger.warn("微信读书设备恢复失败，已退避: vid=$vid, attempt=$current, delayMs=$delayMs, reason=$reason")
     }
 
-    private fun chooseSlot(account: WeReadAccount): DeviceSlot? {
+    internal fun chooseSlot(account: WeReadAccount): DeviceSlot? {
+        // 优先通过硬件永久指纹 (ro.serialno) + 用户空间查找，解决无线/重新连接后 serial 变化问题
+        if (account.boundSerial.isNotBlank()) {
+            supervisor.findSlotByHardware(account.boundSerial, account.boundUserId)?.let { return it }
+        }
         val snapshot = supervisor.snapshot()
         val exact = snapshot.devices
             .firstOrNull { it.serial == account.boundSerial && account.boundUserId in it.userIds }
-            ?.let { DeviceSlot(it.serial, account.boundUserId) }
+            ?.let { DeviceSlot(it.serial, account.boundUserId, it.hardwareSerial) }
         if (exact != null) return exact
-        if (account.bindingStrategy != "ELASTIC_DEVICE") return null
-        return supervisor.availableSlots().firstOrNull()
+        // 未绑定槽位的新账号或弹性设备策略均可借用首个可用在线槽位
+        if (account.boundSerial.isBlank() || account.bindingStrategy == "ELASTIC_DEVICE") {
+            return supervisor.availableSlots().firstOrNull()
+        }
+        return null
     }
 
     private fun saveQrCode(scanUrl: String, vid: String): File? {
@@ -165,10 +204,16 @@ class DeviceRecoveryManager(
     }
 
     private suspend fun notifyManual(account: WeReadAccount) {
-        WebhookNotifier.notify("weread_login_qr", mapOf(
-            "message" to "微信读书账号等待设备恢复或人工扫码",
-            "vid" to account.vid,
-            "bound_serial" to account.boundSerial,
-        ))
+        // 当 ADB 设备离线或无可用槽位时，回退至生成带图二维码通知供人工扫码
+        val started = runCatching {
+            WeReadWebAuth.startLogin(targetVid = account.vid, requireNotification = true)
+        }.getOrDefault(false)
+        if (!started) {
+            WebhookNotifier.notify("weread_login_qr", mapOf(
+                "message" to "微信读书账号等待设备恢复或人工扫码（无可用 ADB 设备）",
+                "vid" to account.vid,
+                "bound_serial" to account.boundSerial,
+            ))
+        }
     }
 }

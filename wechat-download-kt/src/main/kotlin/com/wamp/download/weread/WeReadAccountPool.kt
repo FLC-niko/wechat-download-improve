@@ -48,7 +48,7 @@ object WeReadAccountPool {
             ?.filter { it.isFile && it.name.endsWith(".json") }
             ?.forEach { file ->
                 try {
-                    val acc = gson.fromJson(file.readText(), WeReadAccount::class.java)
+                    val acc = gson.fromJson(file.readText(), WeReadAccount::class.java).normalized()
                     if (acc.vid.isNotBlank()) {
                         // 落盘时可能为 COOLDOWN，读入时若已过冷却则恢复 ACTIVE
                         if (acc.status == AccountStatus.COOLDOWN && System.currentTimeMillis() >= acc.cooldownUntil) {

@@ -20,6 +20,11 @@ class AdbDeviceSupervisorTest {
                     """.trimIndent(),
                     "",
                 ),
+                listOf("-s", "usb-1", "shell", "getprop", "ro.serialno") to AdbCommandResult(
+                    0,
+                    "HW-SERIAL-1",
+                    "",
+                ),
                 listOf("-s", "usb-1", "shell", "pm", "list", "users") to AdbCommandResult(
                     0,
                     "Users:\n    UserInfo{0:Owner:13} running\n    UserInfo{999:XSpace:800010}",
@@ -34,7 +39,17 @@ class AdbDeviceSupervisorTest {
         assertEquals(RecoveryMode.AUTO_RECOVERABLE, snapshot.mode)
         assertEquals(listOf("usb-1"), snapshot.devices.map { it.serial })
         assertEquals(listOf(0, 999), snapshot.devices.single().userIds)
-        assertEquals(listOf(DeviceSlot("usb-1", 0), DeviceSlot("usb-1", 999)), supervisor.availableSlots())
+        assertEquals("HW-SERIAL-1", snapshot.devices.single().hardwareSerial)
+        assertEquals(
+            listOf(DeviceSlot("usb-1", 0, "HW-SERIAL-1"), DeviceSlot("usb-1", 999, "HW-SERIAL-1")),
+            supervisor.availableSlots(),
+        )
+        assertEquals("HW-SERIAL-1#0", supervisor.availableSlots()[0].slotKey)
+        assertEquals("HW-SERIAL-1#999", supervisor.availableSlots()[1].slotKey)
+        assertEquals(
+            DeviceSlot("usb-1", 999, "HW-SERIAL-1"),
+            supervisor.findSlotByHardware("HW-SERIAL-1", 999),
+        )
     }
 
     @Test
@@ -71,7 +86,7 @@ class AdbDeviceSupervisorTest {
         private val responses: Map<List<String>, AdbCommandResult>,
     ) : AdbCommandRunner {
         override fun run(arguments: List<String>): AdbCommandResult =
-            responses[arguments] ?: error("未配置 ADB 命令: $arguments")
+            responses[arguments] ?: AdbCommandResult(1, "", "未配置 ADB 命令: $arguments")
     }
 
     private class SequenceAdbRunner(
@@ -79,6 +94,7 @@ class AdbDeviceSupervisorTest {
     ) : AdbCommandRunner {
         private var index = 0
         override fun run(arguments: List<String>): AdbCommandResult {
+            if (index >= responses.size) return AdbCommandResult(1, "", "")
             val response = responses[index]
             index++
             return response
