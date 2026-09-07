@@ -447,4 +447,12 @@ object WeReadAccountPool {
         if (updated) logger.info("微信读书账号已${if (enabled) "启用" else "禁用"}: vid=$vid")
         return updated
     }
+
+    internal fun setForTest(account: WeReadAccount) {
+        accounts[account.vid] = account
+    }
+
+    internal fun removeForTest(vid: String) {
+        accounts.remove(vid)
+    }
 }

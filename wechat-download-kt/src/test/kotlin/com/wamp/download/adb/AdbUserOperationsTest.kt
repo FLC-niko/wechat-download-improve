@@ -148,5 +148,82 @@ class AdbUserOperationsTest {
             it.contains("input") && it.contains("tap") && it.contains("600") && it.contains("2264")
         })
     }
+
+    @Test
+    fun `isLoginFailedPage 正确识别失败提示`() {
+        val opsFailed = AdbUserOperations(screenTextDetector = { "微信读书网页版 登录失败，请重新扫码登录" })
+        val opsSuccess = AdbUserOperations(screenTextDetector = { "微信读书网页版 登录确认 24小时后自动退出登录" })
+        val slot = DeviceSlot("d1", 0)
+
+        assertTrue(opsFailed.isLoginFailedPage(slot))
+        assertTrue(!opsSuccess.isLoginFailedPage(slot))
+    }
+
+    @Test
+    fun `performWeReadScanAndConfirm 检测到登录失败页面时自动关闭复位并返回 LOGIN_FAILED_PAGE`() {
+        val executed = mutableListOf<List<String>>()
+        val runner = AdbCommandRunner { args ->
+            executed.add(args)
+            if (args.contains("wm") && args.contains("size")) {
+                AdbCommandResult(0, "Physical size: 1080x2460", "")
+            } else {
+                AdbCommandResult(0, "", "")
+            }
+        }
+        val ops = AdbUserOperations(
+            commandRunner = runner,
+            screenTextDetector = { "微信读书网页版 登录失败，请重新扫码登录 登录" },
+        )
+        val slot = DeviceSlot("dev-test", 0)
+
+        val result = ops.performWeReadScanAndConfirm(slot, isWeb = true)
+
+        assertEquals(ScanConfirmResult.LOGIN_FAILED_PAGE, result)
+
+        // 验证执行了关闭叉叉与复位回到主页
+        val closeX = (1080 * AdbUserOperations.RATIO_CLOSE_BTN_X).toInt().toString()
+        val closeY = (2460 * AdbUserOperations.RATIO_CLOSE_BTN_Y).toInt().toString()
+        assertTrue(executed.any { it.contains("input") && it.contains("tap") && it.contains(closeX) && it.contains(closeY) })
+        assertTrue(executed.any { it.contains("keyevent") && it.contains("4") })
+        assertTrue(executed.any { it.contains("com.tencent.mm/.ui.LauncherUI") })
+    }
+
+    @Test
+    fun `performWeReadScanAndConfirm 正常流程点击确认授权并返回 SUCCESS`() {
+        val executed = mutableListOf<List<String>>()
+        val runner = AdbCommandRunner { args ->
+            executed.add(args)
+            if (args.contains("wm") && args.contains("size")) {
+                AdbCommandResult(0, "Physical size: 1080x2460", "")
+            } else {
+                AdbCommandResult(0, "", "")
+            }
+        }
+        val ops = AdbUserOperations(
+            commandRunner = runner,
+            screenTextDetector = { "微信读书网页版 登录确认 24小时后自动退出登录 登录" },
+        )
+        val slot = DeviceSlot("dev-test", 0)
+
+        val result = ops.performWeReadScanAndConfirm(slot, isWeb = true)
+
+        assertEquals(ScanConfirmResult.SUCCESS, result)
+
+        // 验证执行了点击确认按钮
+        val confirmX = (1080 * AdbUserOperations.RATIO_CONFIRM_BTN_X).toInt().toString()
+        val confirmY = (2460 * AdbUserOperations.RATIO_CONFIRM_BTN_Y).toInt().toString()
+        assertTrue(executed.any { it.contains("input") && it.contains("tap") && it.contains(confirmX) && it.contains(confirmY) })
+    }
+
+    @org.junit.jupiter.api.Disabled("需要真实 ADB 设备，仅供人工验收")
+    @Test
+    fun `实测真机当前屏幕文字识别`() {
+        val ops = AdbUserOperations()
+        val slot = DeviceSlot("M7Z5HABUMJT8BUO7", 0)
+        val text = ops.detectScreenText(slot)
+        println(">>> 真机实测提取结果: $text <<<")
+        println(">>> 是否包含失败提示: ${ops.isLoginFailedPage(slot)} <<<")
+        assertTrue(text.contains("登录失败") || text.contains("重新扫码"), "应成功识别到登录失败提示文字")
+    }
 }
 

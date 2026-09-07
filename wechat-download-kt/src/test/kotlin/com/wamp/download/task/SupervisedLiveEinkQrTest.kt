@@ -7,11 +7,13 @@ import com.wamp.download.store.Database
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.client.j2se.MatrixToImageWriter
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Test
 import java.io.File
 import java.nio.file.FileSystems
 import kotlin.test.assertTrue
 
+@Disabled("需要真实 ADB 设备，仅供人工验收")
 class SupervisedLiveEinkQrTest {
 
     private fun resolveDevice(): String {

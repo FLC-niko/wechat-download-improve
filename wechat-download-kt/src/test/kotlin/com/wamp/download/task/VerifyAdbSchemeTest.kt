@@ -12,6 +12,7 @@ import com.wamp.download.config.AppConfig
 import com.wamp.download.store.Database
 import com.wamp.download.weread.WeReadAccountPool
 import com.wamp.download.weread.WeReadWebAuth
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Test
 import java.io.File
 import java.nio.file.FileSystems
@@ -19,6 +20,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
+@Disabled("需要真实 ADB 设备，仅供人工验收")
 class VerifyAdbSchemeTest {
 
     private val adbPath: String = run {

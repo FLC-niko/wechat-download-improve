@@ -92,7 +92,7 @@ class DeviceRecoveryManager(
         }
     }
 
-    private suspend fun recover(vid: String): String? {
+    internal suspend fun recover(vid: String): String? {
         val account = WeReadAccountPool.get(vid) ?: return null
         val slot = chooseSlot(account)
         if (slot == null) {
@@ -103,56 +103,75 @@ class DeviceRecoveryManager(
         val hardwareKey = slot.hardwareSerial.ifBlank { slot.serial }
         val lock = deviceLocks.computeIfAbsent(hardwareKey) { Mutex() }
         return lock.withLock {
-            val login = WeReadWebAuth.createLogin() ?: return@withLock "创建微信读书登录二维码失败"
-            val qrFile = saveQrCode(login.second, vid) ?: return@withLock "保存微信读书登录二维码失败"
-            
-            // 采用增强的推码与前置清理机制
-            val pushResult = operations.pushQrCode(slot, qrFile)
-            if (!pushResult.success) {
-                logger.warn("微信读书二维码推送失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-                return@withLock "推送二维码到手机失败"
-            }
+            val maxAttempts = 3
+            var lastFailureReason = "ADB 扫码流程未完成"
+            for (attempt in 1..maxAttempts) {
+                val login = WeReadWebAuth.createLogin() ?: return@withLock "创建微信读书登录二维码失败"
+                val qrFile = saveQrCode(login.second, vid) ?: return@withLock "保存微信读书登录二维码失败"
 
-            try {
-                // 双轨调度：如果是老版本环境且安装了 AAOS，走经典 AAOS 无障碍全自动路线；
-                // 现代环境（Android 14 / HyperOS / 微信 8.0.76+）走坐标穿透管线
-                val scanStarted = if (slot.isLegacyRoute && operations.isReady(slot)) {
-                    logger.info("设备命中经典 AAOS 路线，启动无障碍全自动登录: vid=$vid, serial=${slot.serial}")
-                    operations.startWeReadLogin(slot)
-                } else {
-                    logger.info("设备执行现代坐标穿透自绘扫码管线: vid=$vid, serial=${slot.serial}")
-                    operations.performWeReadScanAndConfirm(slot, isWeb = true)
-                }
-                if (!scanStarted) {
-                    logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-                    return@withLock "自动扫码与点击流程启动失败"
+                // 采用增强的推码与前置清理机制
+                val pushResult = operations.pushQrCode(slot, qrFile)
+                if (!pushResult.success) {
+                    qrFile.delete()
+                    logger.warn("微信读书二维码推送失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
+                    lastFailureReason = "推送二维码到手机失败"
+                    continue
                 }
 
-                val credentials = WeReadWebAuth.pollLoginCredentials(login.first, timeoutSeconds = 60)
-                if (credentials == null) {
-                    logger.warn("微信读书自动恢复扫码超时: vid=$vid")
-                    return@withLock "ADB 扫码登录超时"
+                try {
+                    // 双轨调度：如果是老版本环境且安装了 AAOS，走经典 AAOS 无障碍全自动路线；
+                    // 现代环境（Android 14 / HyperOS / 微信 8.0.76+）走坐标穿透管线
+                    if (slot.isLegacyRoute && operations.isReady(slot)) {
+                        logger.info("设备命中经典 AAOS 路线，启动无障碍全自动登录: vid=$vid, serial=${slot.serial}")
+                        if (!operations.startWeReadLogin(slot)) {
+                            logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
+                            lastFailureReason = "自动扫码启动失败"
+                            continue
+                        }
+                    } else {
+                        logger.info("设备执行现代坐标穿透自绘扫码管线 (第 $attempt 次): vid=$vid, serial=${slot.serial}")
+                        val scanResult = operations.performWeReadScanAndConfirm(slot, isWeb = true)
+                        if (scanResult == com.wamp.download.adb.ScanConfirmResult.LOGIN_FAILED_PAGE) {
+                            logger.warn("识别到微信页面提示【登录失败，请重新扫码登录】，退出并立即重试全新流程: vid=$vid (尝试 $attempt/$maxAttempts)")
+                            lastFailureReason = "页面提示登录失败重新扫码"
+                            Thread.sleep(800)
+                            continue
+                        }
+                        if (scanResult != com.wamp.download.adb.ScanConfirmResult.SUCCESS) {
+                            logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
+                            lastFailureReason = "自动扫码与点击流程启动失败"
+                            continue
+                        }
+                    }
+
+                    val credentials = WeReadWebAuth.pollLoginCredentials(login.first, timeoutSeconds = 60)
+                    if (credentials == null) {
+                        logger.warn("微信读书自动恢复扫码超时: vid=$vid")
+                        lastFailureReason = "ADB 扫码登录超时"
+                        continue
+                    }
+                    if (credentials.wrVid != vid) {
+                        logger.warn("扫码账号与目标账号不匹配，拒绝写入: target=$vid, scanned=${credentials.wrVid}")
+                        return@withLock "扫码账号与目标账号不匹配"
+                    }
+                    if (!WeReadAccountPool.completeRecovery(vid, credentials, slot.serial, slot.userId)) {
+                        return@withLock "恢复凭证持久化失败"
+                    }
+                    logger.info("微信读书账号自动恢复成功: vid=$vid, slotKey=${slot.slotKey}")
+                    return@withLock null
+                } finally {
+                    // 1. 严格点击左上角叉叉关闭 WebView 并复位回微信根页面 LauncherUI
+                    runCatching {
+                        operations.dismissAuthorizationAndReset(slot)
+                    }.onFailure {
+                        logger.warn("复位微信前台失败: vid=$vid, ${it.message}")
+                    }
+                    // 2. 严格阅后即焚清理临时图片
+                    operations.cleanupQrCode(slot, pushResult.destinationPath)
+                    qrFile.delete()
                 }
-                if (credentials.wrVid != vid) {
-                    logger.warn("扫码账号与目标账号不匹配，拒绝写入: target=$vid, scanned=${credentials.wrVid}")
-                    return@withLock "扫码账号与目标账号不匹配"
-                }
-                if (!WeReadAccountPool.completeRecovery(vid, credentials, slot.serial, slot.userId)) {
-                    return@withLock "恢复凭证持久化失败"
-                }
-                logger.info("微信读书账号自动恢复成功: vid=$vid, slotKey=${slot.slotKey}")
-                null
-            } finally {
-                // 1. 严格点击左上角叉叉关闭 WebView 并复位回微信根页面 LauncherUI
-                runCatching {
-                    operations.dismissAuthorizationAndReset(slot)
-                }.onFailure {
-                    logger.warn("复位微信前台失败: vid=$vid, ${it.message}")
-                }
-                // 2. 严格阅后即焚清理临时图片
-                operations.cleanupQrCode(slot, pushResult.destinationPath)
-                qrFile.delete()
             }
+            lastFailureReason
         }
     }
 

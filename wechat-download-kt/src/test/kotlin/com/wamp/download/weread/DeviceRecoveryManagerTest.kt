@@ -111,5 +111,27 @@ class DeviceRecoveryManagerTest {
         assertNotNull(elasticSlot)
         assertEquals("dev-other", elasticSlot.serial)
     }
+
+    @Test
+    fun `recover 在无可用设备槽位时返回失败原因并不抛出异常`() = kotlinx.coroutines.runBlocking {
+        val supervisor = mockSupervisor(emptyList()) // 无在线设备
+        val manager = DeviceRecoveryManager(supervisor, scope = CoroutineScope(SupervisorJob() + Dispatchers.IO))
+
+        // 临时注册一个测试账号
+        val testVid = "test-no-slot-vid"
+        val account = WeReadAccount(
+            vid = testVid,
+            credentials = WeReadWebCredentials(wrVid = testVid, wrSkey = "dummy"),
+            boundSerial = "offline-device",
+            boundUserId = 0,
+            bindingStrategy = "FIXED_DEVICE",
+        )
+        WeReadAccountPool.setForTest(account)
+
+        val failure = manager.recover(testVid)
+        assertEquals("没有可用的 ADB 设备槽位", failure)
+
+        WeReadAccountPool.removeForTest(testVid)
+    }
 }
 
