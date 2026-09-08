@@ -59,6 +59,9 @@ class WeReadEinkChaptersClient(
     private val requestGate: (String, () -> WeReadEinkArticlesPage) -> WeReadEinkArticlesPage = { vid, block ->
         WeReadEinkRequestGate.execute(vid, block)
     },
+    private val stringRequestGate: (String, () -> String?) -> String? = { vid, block ->
+        WeReadEinkRequestGate.execute(vid, block)
+    },
     private val maxTransientRetries: Int = AppConfig.wereadEinkMaxTransientRetries,
     private val retryBaseDelayMs: Long = AppConfig.wereadEinkRetryBaseDelay * 1000L,
     private val waitProvider: (Long) -> Unit = { Thread.sleep(it) },
@@ -249,6 +252,125 @@ class WeReadEinkChaptersClient(
     private fun longField(obj: JsonObject, name: String): Long? = obj.get(name)
         ?.takeIf { it.isJsonPrimitive }
         ?.let { runCatching { it.asLong }.getOrNull() }
+
+    /**
+     * Resolves the article URL for a given reviewId by calling `/review/single`.
+     * This is used to backfill the `docUrl` when `/mp/chapters` omits it.
+     */
+    fun fetchSingleReviewArticleUrl(reviewId: String): String? {
+        require(reviewId.isNotBlank()) { "reviewId must not be blank" }
+        val activeCredentials = session?.credentialsForRequest() ?: credentials
+        return try {
+            requestSingleReviewUrlWithRetries(reviewId, activeCredentials)
+        } catch (error: WeReadEinkApiException) {
+            if (error.kind != WeReadEinkResponseKind.AUTH_EXPIRED || session == null) throw error
+            val refreshed = session.refreshIfAccessTokenWas(activeCredentials.accessToken)
+            try {
+                requestSingleReviewUrlWithRetries(reviewId, refreshed)
+            } catch (retryError: WeReadEinkApiException) {
+                if (retryError.kind == WeReadEinkResponseKind.AUTH_EXPIRED) {
+                    session.reportAuthenticationFailure(retryError)
+                }
+                throw retryError
+            }
+        }
+    }
+
+    private fun requestSingleReviewUrlWithRetries(reviewId: String, requestCredentials: WeReadEinkCredentials): String? {
+        var transientFailures = 0
+        while (true) {
+            try {
+                return stringRequestGate(requestCredentials.vid) {
+                    requestSingleReviewUrl(reviewId, requestCredentials)
+                }
+            } catch (error: WeReadEinkApiException) {
+                val retryable = error.kind == WeReadEinkResponseKind.RATE_LIMITED ||
+                    error.kind == WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
+                if (!retryable || transientFailures >= maxTransientRetries) throw error
+                val multiplier = 1L shl transientFailures.coerceAtMost(10)
+                val delayMs = retryBaseDelayMs * multiplier + Random.nextLong(0L, 250L)
+                transientFailures++
+                waitProvider(delayMs)
+            } catch (error: IOException) {
+                if (transientFailures >= maxTransientRetries) throw error
+                val multiplier = 1L shl transientFailures.coerceAtMost(10)
+                val delayMs = retryBaseDelayMs * multiplier + Random.nextLong(0L, 250L)
+                transientFailures++
+                waitProvider(delayMs)
+            }
+        }
+    }
+
+    private fun requestSingleReviewUrl(reviewId: String, requestCredentials: WeReadEinkCredentials): String? {
+        val requestUrl = baseUrl.toHttpUrl()
+            .newBuilder()
+            .addPathSegment("review")
+            .addPathSegment("single")
+            .addQueryParameter("reviewId", reviewId)
+            .addQueryParameter("commentsCount", "10")
+            .addQueryParameter("commentsDirection", "0")
+            .addQueryParameter("likesCount", "10")
+            .addQueryParameter("likesDirection", "0")
+            .addQueryParameter("synckey", "0")
+            .build()
+            
+        val request = WeReadEinkRequest(
+            method = "GET",
+            url = requestUrl,
+            headers = profile.versionHeaders + profile.authHeaders(requestCredentials),
+        )
+        val response = transport.execute(request)
+        val classification = WeReadEinkResponseClassifier.classify(response)
+        if (classification.kind != WeReadEinkResponseKind.SUCCESS) {
+            throw WeReadEinkApiException(
+                kind = classification.kind,
+                statusCode = response.statusCode,
+                errCode = classification.errCode,
+                errMsg = classification.errMsg,
+            )
+        }
+        
+        return parseSingleReviewUrl(response.body)
+    }
+
+    private fun parseSingleReviewUrl(raw: String): String? {
+        try {
+            val root = JsonParser.parseString(raw)
+            if (!root.isJsonObject) return null
+            val obj = root.asJsonObject
+            val review = obj.getAsJsonObject("review") ?: obj
+            val mpInfo = review.getAsJsonObject("mpInfo") ?: return null
+            
+            val urlCandidates = listOf(
+                mpInfo.get("doc_url")?.asString,
+                mpInfo.get("docUrl")?.asString,
+                mpInfo.get("url")?.asString,
+                review.get("url")?.asString
+            )
+            for (c in urlCandidates) {
+                if (!c.isNullOrBlank() && (c.startsWith("http://") || c.startsWith("https://"))) {
+                    return c
+                }
+            }
+            
+            val originalId = mpInfo.get("originalId")?.asString?.trim().orEmpty()
+            if (originalId.isNotBlank()) {
+                if (originalId.startsWith("http://") || originalId.startsWith("https://")) {
+                    return originalId
+                }
+                if (originalId.startsWith("/s")) {
+                    return "https://mp.weixin.qq.com$originalId"
+                }
+                if (originalId.contains("__biz=") || originalId.startsWith("?")) {
+                    return "https://mp.weixin.qq.com/s?${originalId.removePrefix("?")}"
+                }
+                return "https://mp.weixin.qq.com/s/$originalId" 
+            }
+            return null
+        } catch (e: Exception) {
+            return null
+        }
+    }
 
     private companion object {
         const val DEFAULT_BASE_URL = "https://i.weread.qq.com"

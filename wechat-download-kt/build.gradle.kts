@@ -55,6 +55,9 @@ dependencies {
     implementation("com.google.zxing:core:3.5.2")
     implementation("com.google.zxing:javase:3.5.2")
 
+    // HTML 解析
+    implementation("org.jsoup:jsoup:1.17.2")
+
     // 测试
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5:1.9.20")
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.1")

@@ -13,6 +13,7 @@ import com.wamp.download.rabbitmq.RabbitMqService
 import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.store.Database
 import com.wamp.download.task.TaskProcessor
+import com.wamp.download.task.IdleHistoryPoller
 import com.wamp.download.wx.WxApiClient
 import com.wamp.download.weread.CredentialHealthChecker
 import com.wamp.download.weread.eink.WeReadEinkRuntime
@@ -77,6 +78,9 @@ fun main() {
         einkSyncServiceProvider = WeReadEinkRuntime::syncService,
     )
 
+    // 启动闲时历史回源轮询器
+    IdleHistoryPoller.start(scope)
+
     // JVM shutdown hook：Ctrl+C / kill 时清理资源，避免残留进程
     Runtime.getRuntime().addShutdownHook(Thread {
         logger.info("收到关闭信号，正在清理资源...")
@@ -85,6 +89,7 @@ fun main() {
         loginChecker.stop()
         LoginReminder.stop()
         adbDeviceSupervisor.stop()
+        IdleHistoryPoller.stop()
         try {
             // RabbitMQ 关闭是阻塞网络调用，断网/自动恢复时可能长时间不返回；
             // 用超时兜底，保证 Ctrl+C 能顺利退出，不残留进程

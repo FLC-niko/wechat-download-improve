@@ -23,6 +23,8 @@ import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.weread.WeReadWebClient
 import com.wamp.download.weread.eink.WeReadEinkSyncService
 import com.wamp.download.weread.eink.WeReadEinkRuntime
+import com.wamp.download.task.IdleHistoryPoller
+import com.wamp.download.article.ArticleIdentityResolver
 import com.wamp.download.wx.WxApiClient
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
@@ -90,6 +92,7 @@ class TaskProcessor(
 
     private suspend fun processTask(task: ProcessingTask) {
         logger.info("【任务处理】开始: gzh=${task.gzhName}, 日期=${task.dateRange}, jobId=${task.jobId}")
+        IdleHistoryPoller.recordTaskActivity()
 
         val (startTs, endTs) = parseDateRange(task.dateRange)
         if (startTs == null || endTs == null) {
@@ -561,6 +564,40 @@ class TaskProcessor(
      * @return fakeid（找不到返回 null）
      */
     private fun findOrCreateSubscription(gzhName: String): String? {
+        // 支持传入文章链接作为订阅源
+        if (gzhName.startsWith("http://") || gzhName.startsWith("https://")) {
+            logger.info("【任务处理】检测到文章链接输入，尝试提取公众号身份...")
+            return try {
+                // 注意：这里用阻塞的 HTTP 客户端或 Ktor 都可以，由于我们在协程里，先用简单的 Ktor 或 OkHttp?
+                // 因为我们在 TaskProcessor 里面没有现成的 OkHttp client 实例直接暴露。
+                // 暂时用 Jsoup.connect 获取，Jsoup 底层是同步的，最好包装在 Dispatchers.IO，这里是在协程内。
+                val doc = org.jsoup.Jsoup.connect(gzhName).userAgent("Mozilla/5.0").timeout(10000).get()
+                val identity = ArticleIdentityResolver.extractIdentityFromHtml(doc.outerHtml(), gzhName)
+                if (identity != null) {
+                    val fakeid = identity.biz // fakeid 其实就是 base64 编码的 biz
+                    val existing = SubscriptionStore.get(fakeid)
+                    if (existing != null) {
+                        return fakeid
+                    }
+                    SubscriptionStore.add(
+                        fakeid = fakeid,
+                        nickname = identity.accountName.ifBlank { "Unknown" },
+                        alias = "",
+                        headImg = ""
+                    )
+                    SubscriptionStore.saveWereadMpId(fakeid, identity.bookId)
+                    logger.info("【任务处理】通过链接提取公众号成功: fakeid=$fakeid, mpId=${identity.bookId}, name=${identity.accountName}")
+                    fakeid
+                } else {
+                    logger.warn("【任务处理】无法从链接提取公众号身份")
+                    null
+                }
+            } catch (e: Exception) {
+                logger.warn("【任务处理】提取链接身份失败: ${e.message}")
+                null
+            }
+        }
+
         // 先查本地数据库
         val existing = SubscriptionStore.findByNickname(gzhName)
         if (existing != null) {

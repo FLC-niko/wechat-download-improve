@@ -181,7 +181,7 @@ class WeReadEinkSyncService(
             }
 
             val mapped = collected.mapNotNull { article ->
-                article.toArticle(fakeid) ?: run {
+                article.toArticle(fakeid, client) ?: run {
                     logger.warn(
                         "跳过无效的 E-Ink 文章: fakeid=${fakeid.take(8)}..., " +
                             "reviewId=${article.reviewId.orEmpty().take(32)}",
@@ -280,11 +280,24 @@ class WeReadEinkSyncService(
         return mpId
     }
 
-    private fun WeReadEinkArticle.toArticle(fakeid: String): Article? {
-        val link = mpInfo?.docUrl
+    private fun WeReadEinkArticle.toArticle(fakeid: String, client: WeReadEinkChaptersClient): Article? {
+        var link = mpInfo?.docUrl
             ?.trim()
             ?.let { candidate -> candidate.toHttpUrlOrNull()?.toString() }
-            ?: return null
+            
+        if (link == null && !reviewId.isNullOrBlank()) {
+            logger.info("文章缺少 docUrl，尝试通过 /review/single 补全: reviewId=$reviewId")
+            val backfilledUrl = try {
+                client.fetchSingleReviewArticleUrl(reviewId)
+            } catch (e: Exception) {
+                logger.warn("回填 /review/single 失败: ${e.message}")
+                null
+            }
+            link = backfilledUrl?.trim()?.takeIf { it.isNotBlank() }
+        }
+        
+        if (link == null) return null
+        
         val title = title?.takeIf { it.isNotBlank() }
             ?: mpInfo?.title?.takeIf { it.isNotBlank() }
             ?: return null

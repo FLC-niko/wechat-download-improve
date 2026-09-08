@@ -14,6 +14,7 @@ import kotlin.random.Random
 internal object WeReadEinkRequestGate {
     private val semaphores = ConcurrentHashMap<String, Semaphore>()
     private val lastRequestAt = ConcurrentHashMap<String, Long>()
+    private val requestCounts = ConcurrentHashMap<String, Int>()
 
     fun <T> execute(vid: String, block: () -> T): T {
         val semaphore = semaphores.computeIfAbsent(vid) {
@@ -29,13 +30,22 @@ internal object WeReadEinkRequestGate {
     }
 
     private fun throttle(vid: String) {
-        val minIntervalMs = AppConfig.wereadEinkMinRequestInterval * 1000L
+        val configuredMinIntervalMs = AppConfig.wereadEinkMinRequestInterval * 1000L
+        val minIntervalMs = maxOf(configuredMinIntervalMs, 2000L) // Force at least 2 seconds for E-Ink requests
+
         while (true) {
             val now = System.currentTimeMillis()
             val previous = lastRequestAt[vid] ?: 0L
             val waitMs = previous + minIntervalMs - now
             if (waitMs <= 0L) {
                 if (lastRequestAt.replace(vid, previous, now) || lastRequestAt.putIfAbsent(vid, now) == null) {
+                    val count = requestCounts.compute(vid) { _, current -> (current ?: 0) + 1 } ?: 1
+                    if (count >= Random.nextInt(10, 20)) {
+                        requestCounts[vid] = 0
+                        val jitterMs = Random.nextLong(30000L, 120000L)
+                        lastRequestAt[vid] = now + jitterMs
+                        Thread.sleep(jitterMs)
+                    }
                     return
                 }
             } else {

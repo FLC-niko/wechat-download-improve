@@ -23,7 +23,7 @@ internal object WeReadEinkResponseClassifier {
         val error = parseError(response.body)
         val kind = when {
             response.statusCode == 401 || error.errCode == -2012 -> WeReadEinkResponseKind.AUTH_EXPIRED
-            error.errCode == -2041 -> WeReadEinkResponseKind.HUMAN_VERIFY
+            error.errCode == -2041 || error.errCode == -2010 -> WeReadEinkResponseKind.HUMAN_VERIFY
             error.errCode == -2014 -> WeReadEinkResponseKind.RATE_LIMITED
             response.statusCode == 429 -> WeReadEinkResponseKind.RATE_LIMITED
             response.statusCode in 500..599 -> WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
