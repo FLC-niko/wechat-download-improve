@@ -1,7 +1,9 @@
 package com.wamp.download.rabbitmq
 
 import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.rabbitmq.client.*
+import com.wamp.download.article.ArticleQrService
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -42,14 +44,10 @@ class RabbitMqClientManager(
         val port: Int,
         val username: String,
         val password: String,
-        val virtualHost: String
+        val virtualHost: String,
     )
 
-    @Volatile
     private var connectionSettings: ConnectionSettings? = null
-
-    val configuredVirtualHost: String?
-        get() = connectionSettings?.virtualHost
 
     suspend fun connect(
         host: String = RABBITMQ_HOST,
@@ -313,7 +311,12 @@ class RabbitMqClientManager(
                 } catch (e: Exception) {
                     logger.error("【RabbitMQ】消费处理异常", e)
                     if (!autoAck) {
-                        retryOrDeadLetter(ch, ctx, e)
+                        if (e is com.wamp.download.task.AaosFallbackRequiredException) {
+                            runCatching { moveToDeadLetter(ch, ctx, e) }
+                                .onFailure { logger.error("【RabbitMQ】降级兜底转死信失败", it) }
+                        } else {
+                            retryOrDeadLetter(ch, ctx, e)
+                        }
                     }
                 }
             }
@@ -335,6 +338,38 @@ class RabbitMqClientManager(
         }
     }
 
+    /**
+     * 若当前任务需要转入死信队列或由 AAOS 兜底，尝试查询本地已采集文章。
+     * 若存在历史文章，将任务中的公众号名片码置换为高清文章二维码，并填入 entryUrl，
+     * 以便 AAOS 绕过公众号名片码高频扫码风控，通过文章 WebView 点击作者头像进入公众号。
+     */
+    internal fun enrichBodyWithArticleQr(body: ByteArray): ByteArray {
+        return try {
+            val jsonStr = body.toString(Charsets.UTF_8)
+            val element = JsonParser.parseString(jsonStr)
+            if (!element.isJsonObject) return body
+            val root = element.asJsonObject
+            val payload = root.getAsJsonObject("payload") ?: return body
+            val account = payload.getAsJsonObject("account") ?: return body
+            val accountName = account.get("name")?.asString.orEmpty()
+            if (accountName.isBlank()) return body
+
+            val qrResult = ArticleQrService.getOrGenerateArticleQr(accountName)
+            if (qrResult != null) {
+                val (articleUrl, qrRef) = qrResult
+                account.addProperty("entryUrl", articleUrl)
+                account.add("qrImage", gson.toJsonTree(qrRef))
+                logger.info("【RabbitMQ】兜底转死信：成功为公众号 [$accountName] 置换为历史文章二维码 ($articleUrl)")
+                root.toString().toByteArray(Charsets.UTF_8)
+            } else {
+                body
+            }
+        } catch (e: Exception) {
+            logger.warn("【RabbitMQ】尝试置换文章二维码失败，维持原 payload", e)
+            body
+        }
+    }
+
     private suspend fun moveToDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
         channelOperationMutex.withLock {
             if (!ch.isOpen) {
@@ -344,13 +379,21 @@ class RabbitMqClientManager(
             val headers = ctx.headers.toMutableMap().apply {
                 put("x-last-error", error.javaClass.simpleName)
                 put("x-original-queue", ctx.queue)
+                error.message?.let { put("x-error-message", it) }
             }
+
+            val vhost = connectionSettings?.virtualHost ?: ""
+            val isXdag = vhost == RABBITMQ_XDAG_VIRTUAL_HOST
+            val exchange = if (isXdag) "archive.new-media.v2" else EXCHANGE_NEW_MEDIA
+            val routingKey = if (isXdag) "archive.gzh.auto.atd.v2.dlq" else GZH_DEAD_ROUTING
+
+            val enrichedBody = enrichBodyWithArticleQr(ctx.body)
             publishAndConfirm(
                 ch = ch,
-                exchange = EXCHANGE_NEW_MEDIA,
-                routingKey = GZH_DEAD_ROUTING,
+                exchange = exchange,
+                routingKey = routingKey,
                 properties = ctx.delivery.properties.builder().headers(headers).build(),
-                body = ctx.body,
+                body = enrichedBody,
             )
             ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
         }
@@ -387,12 +430,13 @@ class RabbitMqClientManager(
                 } else {
                     headers["x-original-queue"] = ctx.queue
                     val deadProperties = ctx.delivery.properties.builder().headers(headers).build()
+                    val enrichedBody = enrichBodyWithArticleQr(ctx.body)
                     publishAndConfirm(
                         ch = ch,
                         exchange = EXCHANGE_NEW_MEDIA,
                         routingKey = GZH_DEAD_ROUTING,
                         properties = deadProperties,
-                        body = ctx.body,
+                        body = enrichedBody,
                     )
                     ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
                     logger.error("【RabbitMQ】任务重试次数耗尽，已转入 $GZH_DEAD_QUEUE", error)

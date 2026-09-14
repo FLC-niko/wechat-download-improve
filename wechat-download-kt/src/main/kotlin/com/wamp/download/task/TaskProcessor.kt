@@ -228,13 +228,7 @@ class TaskProcessor(
         ) {
             val details = sourceResults.joinToString("; ") { "${it.source}:${it.detail}" }
             logger.error("【任务处理】采集范围未覆盖，不能误报 EMPTY: gzh=${task.gzhName}, $details")
-            publishFailed(
-                task,
-                "COVERAGE_INCOMPLETE",
-                "采集通道未能覆盖请求时间窗口，无法确认该窗口为空",
-                retryable = false,
-            )
-            return
+            throw AaosFallbackRequiredException("采集范围未覆盖，不能误报 EMPTY，需要转入 AAOS 兜底: $details")
         }
 
         publishTerminal(task, urls)

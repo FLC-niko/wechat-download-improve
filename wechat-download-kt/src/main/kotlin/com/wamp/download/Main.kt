@@ -55,6 +55,7 @@ fun main() {
     )
     if (AppConfig.adbEnabled) {
         com.wamp.download.weread.WeReadWebAuth.configureRecovery(scope, recoveryManager::request)
+        WeReadEinkLoginCoordinator.configureAdb(adbDeviceSupervisor, recoveryManager.operations)
         adbDeviceSupervisor.refresh()
         adbDeviceSupervisor.start(scope)
         recoveryManager.start()

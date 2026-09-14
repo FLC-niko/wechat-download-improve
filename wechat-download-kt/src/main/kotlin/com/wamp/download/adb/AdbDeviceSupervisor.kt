@@ -7,6 +7,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -24,9 +25,16 @@ class AdbDeviceSupervisor(
 ) {
     private val logger = LoggerFactory.getLogger(AdbDeviceSupervisor::class.java)
     private val devices = ConcurrentHashMap<String, AdbDevice>()
+    private val deviceLocks = ConcurrentHashMap<String, Mutex>()
     @Volatile
     private var recoveryMode: RecoveryMode = RecoveryMode.MANUAL_ONLY
     private var watcherJob: Job? = null
+
+    /** 获取物理设备级别的独占互斥锁，彻底避免同机主身/分身或 Web/Eink 自动代扫并发冲突 */
+    fun getDeviceLock(slot: DeviceSlot): Mutex {
+        val key = slot.hardwareSerial.ifBlank { slot.serial }
+        return deviceLocks.computeIfAbsent(key) { Mutex() }
+    }
 
     fun start(scope: CoroutineScope) {
         if (watcherJob?.isActive == true) return

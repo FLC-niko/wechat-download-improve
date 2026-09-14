@@ -40,7 +40,9 @@ data class CollectionOptions(
 )
 
 data class QrImageRef(
-    val objectKey: String,
+    val transport: String? = null,
+    val dataBase64: String? = null,
+    val objectKey: String? = null,
     val sha256: String,
     val contentType: String,
     val sizeBytes: Long,

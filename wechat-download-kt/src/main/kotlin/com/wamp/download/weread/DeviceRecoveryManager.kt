@@ -28,11 +28,10 @@ data class DeviceRecoveryStatus(
 
 class DeviceRecoveryManager(
     private val supervisor: AdbDeviceSupervisor,
-    private val operations: AdbUserOperations = AdbUserOperations(),
+    val operations: AdbUserOperations = AdbUserOperations(),
     private val scope: CoroutineScope,
 ) {
     private val logger = LoggerFactory.getLogger(DeviceRecoveryManager::class.java)
-    private val deviceLocks = ConcurrentHashMap<String, Mutex>()
     private val pending = ConcurrentHashMap<String, Job>()
     private val waiting = ConcurrentHashMap.newKeySet<String>()
     private val attempts = ConcurrentHashMap<String, DeviceRecoveryStatus>()
@@ -100,8 +99,7 @@ class DeviceRecoveryManager(
             return "没有可用的 ADB 设备槽位"
         }
         // 升级为物理硬件级独占互斥锁，彻底避免同一手机主身与分身并发执行
-        val hardwareKey = slot.hardwareSerial.ifBlank { slot.serial }
-        val lock = deviceLocks.computeIfAbsent(hardwareKey) { Mutex() }
+        val lock = supervisor.getDeviceLock(slot)
         return lock.withLock {
             val maxAttempts = 3
             var lastFailureReason = "ADB 扫码流程未完成"

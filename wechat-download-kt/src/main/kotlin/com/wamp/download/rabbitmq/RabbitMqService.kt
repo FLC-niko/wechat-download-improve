@@ -30,7 +30,7 @@ class RabbitMqService(
 
     val proManager = RabbitMqClientManager()
     val testManager = RabbitMqClientManager()
-    val xdagManager = RabbitMqClientManager(enableGzhTopology = false)
+    val xdagManager = RabbitMqClientManager(enableGzhTopology = true)
     val thdagManager = RabbitMqClientManager()
 
     private var supervisor: VhostConnectionSupervisor? = null
@@ -73,9 +73,7 @@ class RabbitMqService(
                     name = "xdag",
                     virtualHost = RABBITMQ_XDAG_VIRTUAL_HOST,
                     manager = xdagManager,
-                    onConnected = {
-                        logger.info("【xdag】连接成功；当前队列清单没有 $GZH_TASK_QUEUE，跳过公众号任务消费")
-                    }
+                    onConnected = { startConsumer(xdagManager, "xdag") }
                 ),
                 VhostConnectionSupervisor.VhostBinding(
                     name = "thdag",
@@ -91,7 +89,8 @@ class RabbitMqService(
     }
 
     private suspend fun startConsumer(manager: RabbitMqClientManager, env: String) {
-        manager.startConsumer(GZH_TASK_QUEUE, autoAck = false, prefetch = 1) consumer@{ _, ctx ->
+        val queueName = if (env == "xdag") "archive.gzh.auto.bta.v2" else GZH_TASK_QUEUE
+        manager.startConsumer(queueName, autoAck = false, prefetch = 1) consumer@{ _, ctx ->
             var taskMessage: RabbitTaskMessage? = null
             try {
                 taskMessage = RabbitTaskDecoder.decode(ctx.body)
