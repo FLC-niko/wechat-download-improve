@@ -1,9 +1,11 @@
 package com.wamp.download.article
 
+import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
-import com.wamp.download.rabbitmq.QrImageRef
+import com.wamp.download.model.QrImageRef
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.SubscriptionStore
 import org.slf4j.LoggerFactory
@@ -122,6 +124,37 @@ object ArticleQrService {
         } catch (e: Exception) {
             logger.error("为公众号 [$nameOrFakeid] 生成文章二维码失败", e)
             null
+        }
+    }
+
+    /**
+     * 将失败/待转死信任务的载荷进行文章二维码增强。
+     * 若任务的公众号在本地已采集过历史文章，将名片码置换为高清文章二维码，并填入 entryUrl。
+     */
+    fun enrichPayload(body: ByteArray): ByteArray {
+        return try {
+            val jsonStr = body.toString(Charsets.UTF_8)
+            val element = JsonParser.parseString(jsonStr)
+            if (!element.isJsonObject) return body
+            val root = element.asJsonObject
+            val payload = root.getAsJsonObject("payload") ?: return body
+            val account = payload.getAsJsonObject("account") ?: return body
+            val accountName = account.get("name")?.asString.orEmpty()
+            if (accountName.isBlank()) return body
+
+            val qrResult = getOrGenerateArticleQr(accountName)
+            if (qrResult != null) {
+                val (articleUrl, qrRef) = qrResult
+                account.addProperty("entryUrl", articleUrl)
+                account.add("qrImage", Gson().toJsonTree(qrRef))
+                logger.info("【ArticleQrService】兜底转死信：成功为公众号 [$accountName] 置换为历史文章二维码 ($articleUrl)")
+                root.toString().toByteArray(Charsets.UTF_8)
+            } else {
+                body
+            }
+        } catch (e: Exception) {
+            logger.warn("【ArticleQrService】尝试置换文章二维码失败，维持原 payload", e)
+            body
         }
     }
 }

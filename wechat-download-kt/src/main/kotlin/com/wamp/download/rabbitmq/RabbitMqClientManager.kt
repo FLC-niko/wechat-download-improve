@@ -1,9 +1,7 @@
 package com.wamp.download.rabbitmq
 
 import com.google.gson.Gson
-import com.google.gson.JsonParser
 import com.rabbitmq.client.*
-import com.wamp.download.article.ArticleQrService
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -32,6 +30,9 @@ class RabbitMqClientManager(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var connection: Connection? = null
     private var channel: Channel? = null
+
+    /** 可选的死信/兜底消息载荷增强回调（例如业务层置换文章二维码） */
+    var deadLetterPayloadEnricher: ((ByteArray) -> ByteArray)? = null
 
     private val consumerRegistry = ConcurrentHashMap<String, String>()
     private val closed = AtomicBoolean(false)
@@ -339,35 +340,10 @@ class RabbitMqClientManager(
     }
 
     /**
-     * 若当前任务需要转入死信队列或由 AAOS 兜底，尝试查询本地已采集文章。
-     * 若存在历史文章，将任务中的公众号名片码置换为高清文章二维码，并填入 entryUrl，
-     * 以便 AAOS 绕过公众号名片码高频扫码风控，通过文章 WebView 点击作者头像进入公众号。
+     * 若配置了 deadLetterPayloadEnricher，将消息体交由增强器处理（例如业务层置换为文章二维码）
      */
     internal fun enrichBodyWithArticleQr(body: ByteArray): ByteArray {
-        return try {
-            val jsonStr = body.toString(Charsets.UTF_8)
-            val element = JsonParser.parseString(jsonStr)
-            if (!element.isJsonObject) return body
-            val root = element.asJsonObject
-            val payload = root.getAsJsonObject("payload") ?: return body
-            val account = payload.getAsJsonObject("account") ?: return body
-            val accountName = account.get("name")?.asString.orEmpty()
-            if (accountName.isBlank()) return body
-
-            val qrResult = ArticleQrService.getOrGenerateArticleQr(accountName)
-            if (qrResult != null) {
-                val (articleUrl, qrRef) = qrResult
-                account.addProperty("entryUrl", articleUrl)
-                account.add("qrImage", gson.toJsonTree(qrRef))
-                logger.info("【RabbitMQ】兜底转死信：成功为公众号 [$accountName] 置换为历史文章二维码 ($articleUrl)")
-                root.toString().toByteArray(Charsets.UTF_8)
-            } else {
-                body
-            }
-        } catch (e: Exception) {
-            logger.warn("【RabbitMQ】尝试置换文章二维码失败，维持原 payload", e)
-            body
-        }
+        return deadLetterPayloadEnricher?.invoke(body) ?: body
     }
 
     private suspend fun moveToDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {

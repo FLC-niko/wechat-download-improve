@@ -2,6 +2,7 @@ package com.wamp.download
 
 import com.wamp.download.adapter.wxAdapterRoutes
 import com.wamp.download.adb.AdbDeviceSupervisor
+import com.wamp.download.article.ArticleQrService
 import com.wamp.download.article.articleRoutes
 import com.wamp.download.auth.authRoutes
 import com.wamp.download.auth.LoginChecker
@@ -70,7 +71,9 @@ fun main() {
     val loginChecker = LoginChecker(wxClient = wxClient, scope = scope)
 
     // RabbitMQ 服务（消费任务队列）
-    val rabbitMqService = RabbitMqService()
+    val rabbitMqService = RabbitMqService(
+        deadLetterPayloadEnricher = { ArticleQrService.enrichPayload(it) }
+    )
 
     // 任务处理器（搜索公众号 → 获取文章 → 发布结果）
     val taskProcessor = TaskProcessor(

@@ -45,7 +45,9 @@ class ArticleQrServiceTest {
 
     @Test
     fun testEnrichBodyWithArticleQr_NoMatchKeepsOriginal() {
-        val manager = RabbitMqClientManager()
+        val manager = RabbitMqClientManager().apply {
+            deadLetterPayloadEnricher = { ArticleQrService.enrichPayload(it) }
+        }
         val originalJson = """
             {
               "schemaVersion": "archive.rabbit.v2",

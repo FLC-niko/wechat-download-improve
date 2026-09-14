@@ -22,7 +22,8 @@ import com.wamp.download.store.InboxStore
  * ArticleFetcher 拉取文章后把链接发布到结果队列）。
  */
 class RabbitMqService(
-    private var onTaskReceived: suspend (RabbitTaskMessage, ResultQueuePublisher) -> Unit = { _, _ -> }
+    private var onTaskReceived: suspend (RabbitTaskMessage, ResultQueuePublisher) -> Unit = { _, _ -> },
+    deadLetterPayloadEnricher: ((ByteArray) -> ByteArray)? = null,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(RabbitMqService::class.java)
@@ -32,6 +33,15 @@ class RabbitMqService(
     val testManager = RabbitMqClientManager()
     val xdagManager = RabbitMqClientManager(enableGzhTopology = true)
     val thdagManager = RabbitMqClientManager()
+
+    init {
+        if (deadLetterPayloadEnricher != null) {
+            proManager.deadLetterPayloadEnricher = deadLetterPayloadEnricher
+            testManager.deadLetterPayloadEnricher = deadLetterPayloadEnricher
+            xdagManager.deadLetterPayloadEnricher = deadLetterPayloadEnricher
+            thdagManager.deadLetterPayloadEnricher = deadLetterPayloadEnricher
+        }
+    }
 
     private var supervisor: VhostConnectionSupervisor? = null
     private var started = false
