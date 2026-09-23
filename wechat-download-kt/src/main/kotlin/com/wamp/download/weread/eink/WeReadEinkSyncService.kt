@@ -16,6 +16,8 @@ import kotlin.math.max
 
 class WeReadEinkSyncException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
 
+class WeReadEinkBackgroundYieldException : RuntimeException("real-time task requires the E-Ink channel")
+
 data class WeReadEinkSyncResult(
     val fakeid: String,
     val accountVid: String,
@@ -123,17 +125,25 @@ class WeReadEinkSyncService(
     }
 
     /** Fetches all pages and commits the new cursor only after the entire cycle succeeds. */
-    fun sync(subscription: Subscription): WeReadEinkSyncResult {
+    fun sync(
+        subscription: Subscription,
+        shouldContinue: () -> Boolean = { true },
+    ): WeReadEinkSyncResult {
         val mpId = resolveMpId(subscription)
         if (mpId.isBlank()) {
             throw WeReadEinkSyncException("cannot derive E-Ink mpId for fakeid=${subscription.fakeid.take(8)}...")
         }
         return withSyncLock(session.credentials().vid, mpId) {
-            syncUnlocked(subscription, mpId)
+            ensureShouldContinue(shouldContinue)
+            syncUnlocked(subscription, mpId, shouldContinue)
         }
     }
 
-    private fun syncUnlocked(subscription: Subscription, mpId: String): WeReadEinkSyncResult {
+    private fun syncUnlocked(
+        subscription: Subscription,
+        mpId: String,
+        shouldContinue: () -> Boolean = { true },
+    ): WeReadEinkSyncResult {
         require(subscription.fakeid.isNotBlank()) { "subscription fakeid must not be blank" }
 
         val fakeid = subscription.fakeid
@@ -154,6 +164,7 @@ class WeReadEinkSyncService(
 
         try {
             while (pages < maxPages) {
+                ensureShouldContinue(shouldContinue)
                 val page = if (requestedOffset == null) {
                     client.fetchArticles(mpId, count = pageSize, synckey = initialSynckey)
                 } else {
@@ -181,6 +192,7 @@ class WeReadEinkSyncService(
             }
 
             val mapped = collected.mapNotNull { article ->
+                ensureShouldContinue(shouldContinue)
                 article.toArticle(fakeid, client) ?: run {
                     logger.warn(
                         "跳过无效的 E-Ink 文章: fakeid=${fakeid.take(8)}..., " +
@@ -231,6 +243,7 @@ class WeReadEinkSyncService(
                 historyComplete = historyComplete,
             )
         } catch (error: Exception) {
+            if (error is WeReadEinkBackgroundYieldException) throw error
             val errorType = when (error) {
                 is WeReadEinkApiException -> error.kind.name
                 is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
@@ -251,6 +264,10 @@ class WeReadEinkSyncService(
             }
             throw error
         }
+    }
+
+    private fun ensureShouldContinue(shouldContinue: () -> Boolean) {
+        if (!shouldContinue()) throw WeReadEinkBackgroundYieldException()
     }
 
     private fun <T> withSyncLock(accountVid: String, mpId: String, block: () -> T): T {

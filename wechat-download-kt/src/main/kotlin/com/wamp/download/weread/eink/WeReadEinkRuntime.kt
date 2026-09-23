@@ -297,11 +297,14 @@ object WeReadEinkRuntime {
     }
 
     /** Synchronizes at most one due subscription per scheduler tick to avoid startup request bursts. */
-    fun syncNextDueSubscription(now: Long = System.currentTimeMillis() / 1000L): Boolean {
+    fun syncNextDueSubscription(
+        now: Long = System.currentTimeMillis() / 1000L,
+        backgroundWorkAllowed: () -> Boolean = { true },
+    ): Boolean {
         // -2041 is an account-side challenge. Replaying a different subscription every minute
         // cannot solve it and only adds risk; the slower health probe remains responsible for
         // observing recovery after the user completes verification in the official client.
-        if (scheduledSyncSuppressed(authState)) return false
+        if (scheduledSyncSuppressed(authState) || !backgroundWorkAllowed()) return false
         val snapshot = currentSnapshot() ?: return false
         val service = snapshot.service
         if (snapshot.session.refreshStatus().authExpired) {
@@ -320,13 +323,17 @@ object WeReadEinkRuntime {
             }
         ) return false
         return try {
-            service.sync(target)
+            service.sync(target, backgroundWorkAllowed)
             val updated = updateIfCurrent(snapshot) {
                 authState = "HEALTHY"
                 lastScheduledSyncResult = "SUCCESS"
             }
             if (updated) humanVerificationReported.set(false)
             updated
+        } catch (_: WeReadEinkBackgroundYieldException) {
+            updateIfCurrent(snapshot) { lastScheduledSyncResult = "YIELDED_TO_REALTIME_TASK" }
+            logger.info("E-Ink 后台增量同步已让出给实时任务")
+            false
         } catch (error: Exception) {
             val updated = updateIfCurrent(snapshot) {
                 if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {

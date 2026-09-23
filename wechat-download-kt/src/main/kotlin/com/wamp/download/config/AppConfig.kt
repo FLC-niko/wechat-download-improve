@@ -43,6 +43,8 @@ object AppConfig {
     val rabbitmqReconnectMaxDelayMs: Long
         get() = getLong("rabbitmq.reconnect_max_delay_ms", 60_000L)
             .coerceAtLeast(rabbitmqReconnectInitialDelayMs)
+    val rabbitmqConsumerPrefetch: Int
+        get() = getInt("rabbitmq.consumer_prefetch", 4).coerceIn(1, 32)
 
     // --- RabbitMQ 任务策略 ---
     val maxTaskRetry: Int get() = getInt("rabbitmq.max_task_retry", 5)

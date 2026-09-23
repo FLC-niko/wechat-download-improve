@@ -29,6 +29,7 @@ rabbitmq:
   thdag_virtual_host: "thdag"
   reconnect_initial_delay_ms: 5000
   reconnect_max_delay_ms: 60000
+  consumer_prefetch: 4       # 允许缓存命中任务越过单条慢 E-Ink 任务，E-Ink 请求仍按账号串行
   max_task_retry: 5          # 任务最大重试次数，超过进死信队列
   task_retry_delay_ms: 60000
 

@@ -15,6 +15,7 @@ import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.store.Database
 import com.wamp.download.task.TaskProcessor
 import com.wamp.download.task.IdleHistoryPoller
+import com.wamp.download.task.RealtimeTaskActivity
 import com.wamp.download.wx.WxApiClient
 import com.wamp.download.weread.CredentialHealthChecker
 import com.wamp.download.weread.eink.WeReadEinkRuntime
@@ -141,7 +142,9 @@ fun main() {
             kotlinx.coroutines.delay(10_000)
             while (isActive) {
                 try {
-                    CredentialHealthChecker.checkEink()
+                    if (RealtimeTaskActivity.isBackgroundWorkAllowed()) {
+                        CredentialHealthChecker.checkEink()
+                    }
                 } catch (e: Exception) {
                     logger.warn("E-Ink 周期凭证健康检查异常: ${e.message}")
                 }
@@ -175,7 +178,9 @@ fun main() {
             kotlinx.coroutines.delay(30_000)
             while (isActive) {
                 try {
-                    WeReadEinkRuntime.syncNextDueSubscription()
+                    WeReadEinkRuntime.syncNextDueSubscription(
+                        backgroundWorkAllowed = RealtimeTaskActivity::isBackgroundWorkAllowed,
+                    )
                 } catch (e: Exception) {
                     logger.warn("E-Ink 后台增量同步调度异常: ${e.message}")
                 }

@@ -55,6 +55,20 @@ class WeReadEinkSyncCoverageTest {
         }
     }
 
+    @Test
+    fun `后台同步让出时不记录失败也不推进游标`() {
+        withTemporaryDatabase {
+            val subscription = subscription("yield-to-realtime")
+            val service = serviceWith("""{"data":[],"synckey":9,"hasMore":0}""")
+
+            assertFailsWith<WeReadEinkBackgroundYieldException> {
+                service.sync(subscription, shouldContinue = { false })
+            }
+
+            assertEquals(null, WeReadEinkSyncStateStore.get("vid-coverage", subscription.wereadMpId))
+        }
+    }
+
     private fun subscription(suffix: String) = com.wamp.download.store.Subscription(
         fakeid = "fakeid-$suffix",
         nickname = "测试公众号-$suffix",

@@ -3,6 +3,7 @@ package com.wamp.download.task
 import com.wamp.download.config.AppConfig
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.weread.eink.WeReadEinkRuntime
+import com.wamp.download.weread.eink.WeReadEinkBackgroundYieldException
 import com.wamp.download.weread.eink.WeReadEinkSyncResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -18,14 +19,6 @@ object IdleHistoryPoller {
     private val logger = LoggerFactory.getLogger(IdleHistoryPoller::class.java)
     private var job: Job? = null
     
-    // We only poll if the application indicates it's idle (e.g. no RabbitMQ tasks for the last X seconds)
-    @Volatile
-    private var lastActiveTaskTime = System.currentTimeMillis()
-
-    fun recordTaskActivity() {
-        lastActiveTaskTime = System.currentTimeMillis()
-    }
-
     fun start(scope: CoroutineScope = CoroutineScope(Dispatchers.IO)) {
         if (job?.isActive == true) return
         job = scope.launch {
@@ -54,8 +47,8 @@ object IdleHistoryPoller {
     private suspend fun pollOnce() {
         if (!AppConfig.wereadEinkEnabled) return
         
-        // Skip if active tasks were processed recently (e.g., in the last 2 minutes)
-        if (System.currentTimeMillis() - lastActiveTaskTime < 120_000L) {
+        // Real-time RabbitMQ work always wins over cache warming.
+        if (!RealtimeTaskActivity.isBackgroundWorkAllowed()) {
             logger.debug("近期有活动任务，跳过本轮历史回源")
             return
         }
@@ -81,7 +74,7 @@ object IdleHistoryPoller {
             if (job?.isActive != true) break
             
             // Check again before each subscription in case a real-time task arrived
-            if (System.currentTimeMillis() - lastActiveTaskTime < 10_000L) {
+            if (!RealtimeTaskActivity.isBackgroundWorkAllowed()) {
                 logger.info("检测到实时任务压入，主动让出队列并中断当前轮询轮次")
                 break
             }
@@ -93,7 +86,10 @@ object IdleHistoryPoller {
                 // Using sync() without strict time limits allows it to fetch pages.
                 // We use syncIfNeeded to fetch recent gaps or sync() if completely un-covered.
                 // It will naturally fetch offset=0, offset=20 etc., up to maxPages.
-                val result: WeReadEinkSyncResult = einkService.sync(sub)
+                val result: WeReadEinkSyncResult = einkService.sync(
+                    subscription = sub,
+                    shouldContinue = RealtimeTaskActivity::isBackgroundWorkAllowed,
+                )
                 
                 WeReadEinkRuntime.recordTaskRequestSuccess()
                 
@@ -101,6 +97,9 @@ object IdleHistoryPoller {
                 
                 // Sleep between accounts to avoid hitting API limits
                 delay(Random.nextLong(10000L, 30000L))
+            } catch (_: WeReadEinkBackgroundYieldException) {
+                logger.info("检测到实时任务，中断当前历史回源并让出 E-Ink 通道")
+                break
             } catch (e: Exception) {
                 logger.warn("闲时回源异常: fakeid=${sub.fakeid.take(8)}..., ${e.message}")
                 WeReadEinkRuntime.recordTaskRequestFailure(e)

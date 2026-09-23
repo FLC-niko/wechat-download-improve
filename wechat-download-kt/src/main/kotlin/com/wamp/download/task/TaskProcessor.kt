@@ -23,7 +23,6 @@ import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.weread.WeReadWebClient
 import com.wamp.download.weread.eink.WeReadEinkSyncService
 import com.wamp.download.weread.eink.WeReadEinkRuntime
-import com.wamp.download.task.IdleHistoryPoller
 import com.wamp.download.article.ArticleIdentityResolver
 import com.wamp.download.wx.WxApiClient
 import kotlinx.coroutines.delay
@@ -91,8 +90,16 @@ class TaskProcessor(
     }
 
     private suspend fun processTask(task: ProcessingTask) {
+        RealtimeTaskActivity.taskStarted()
+        try {
+            processTrackedTask(task)
+        } finally {
+            RealtimeTaskActivity.taskFinished()
+        }
+    }
+
+    private suspend fun processTrackedTask(task: ProcessingTask) {
         logger.info("【任务处理】开始: gzh=${task.gzhName}, 日期=${task.dateRange}, jobId=${task.jobId}")
-        IdleHistoryPoller.recordTaskActivity()
 
         val (startTs, endTs) = parseDateRange(task.dateRange)
         if (startTs == null || endTs == null) {
