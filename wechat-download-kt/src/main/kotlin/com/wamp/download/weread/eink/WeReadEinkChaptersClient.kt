@@ -65,6 +65,7 @@ class WeReadEinkChaptersClient(
     private val maxTransientRetries: Int = AppConfig.wereadEinkMaxTransientRetries,
     private val retryBaseDelayMs: Long = AppConfig.wereadEinkRetryBaseDelay * 1000L,
     private val waitProvider: (Long) -> Unit = { Thread.sleep(it) },
+    private val verificationHeaders: () -> Map<String, String> = WeReadEinkHumanVerification::requestHeaders,
 ) {
     fun fetchArticles(
         accountId: String,
@@ -144,7 +145,7 @@ class WeReadEinkChaptersClient(
         val request = WeReadEinkRequest(
             method = "GET",
             url = chaptersUrl(accountId, count, synckey, offset),
-            headers = profile.versionHeaders + profile.authHeaders(requestCredentials),
+            headers = profile.versionHeaders + profile.authHeaders(requestCredentials) + verificationHeaders(),
         )
         val response = transport.execute(request)
         val classification = WeReadEinkResponseClassifier.classify(response)
@@ -317,7 +318,7 @@ class WeReadEinkChaptersClient(
         val request = WeReadEinkRequest(
             method = "GET",
             url = requestUrl,
-            headers = profile.versionHeaders + profile.authHeaders(requestCredentials),
+            headers = profile.versionHeaders + profile.authHeaders(requestCredentials) + verificationHeaders(),
         )
         val response = transport.execute(request)
         val classification = WeReadEinkResponseClassifier.classify(response)

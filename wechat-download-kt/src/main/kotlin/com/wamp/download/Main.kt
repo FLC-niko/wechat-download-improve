@@ -19,6 +19,7 @@ import com.wamp.download.wx.WxApiClient
 import com.wamp.download.weread.CredentialHealthChecker
 import com.wamp.download.weread.eink.WeReadEinkRuntime
 import com.wamp.download.weread.eink.WeReadEinkLoginCoordinator
+import com.wamp.download.weread.eink.weReadEinkVerificationRoutes
 import io.ktor.serialization.gson.gson
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
@@ -268,6 +269,7 @@ fun main() {
             articleRoutes()
             feedRoutes()
             wxAdapterRoutes()
+            weReadEinkVerificationRoutes()
 
             // 微信读书官方直连回退通道：状态查询 + 手动触发扫码登录
             get("/api/weread/status") {

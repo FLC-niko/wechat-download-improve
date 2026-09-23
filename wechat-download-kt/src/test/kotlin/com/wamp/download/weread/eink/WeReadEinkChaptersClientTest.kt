@@ -94,6 +94,26 @@ class WeReadEinkChaptersClientTest {
     }
 
     @Test
+    fun `captcha result headers are added only by the short lived provider`() {
+        val transport = RecordingTransport(
+            WeReadEinkResponse(200, "{\"data\":[],\"hasMore\":0}"),
+        )
+        val client = WeReadEinkChaptersClient(
+            credentials = credentials(),
+            transport = transport,
+            baseUrl = "https://eink.example.test",
+            verificationHeaders = {
+                mapOf("wr_ticket" to "ticket-value", "wr_randstr" to "randstr-value")
+            },
+        )
+
+        client.fetchArticles("MP_WXS_1")
+
+        assertEquals("ticket-value", transport.requests.single().headers["wr_ticket"])
+        assertEquals("randstr-value", transport.requests.single().headers["wr_randstr"])
+    }
+
+    @Test
     fun `missing data array is a parse error`() {
         val transport = RecordingTransport(WeReadEinkResponse(200, "{\"synckey\":1}"))
         val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test")

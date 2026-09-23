@@ -75,6 +75,10 @@ object WeReadEinkRuntime {
         !taskSyncSuppressed(authState)
     }
 
+    fun requiresHumanVerification(): Boolean = synchronized(runtimeLock) {
+        authState == "HUMAN_VERIFY_REQUIRED"
+    }
+
     /** Keeps automatic recovery detection, but backs off aggressively while human action is required. */
     fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = synchronized(runtimeLock) {
         !healthProbeSuppressed(
@@ -128,6 +132,7 @@ object WeReadEinkRuntime {
     }
 
     fun reload(): WeReadEinkSyncService? = synchronized(runtimeLock) {
+        WeReadEinkHumanVerification.reset()
         val generation = ++sessionGeneration
         synchronized(credentialWriteLock) {
             reloadLocked(generation)
@@ -401,11 +406,14 @@ object WeReadEinkRuntime {
 
     private fun notifyHumanVerification(error: WeReadEinkApiException) {
         if (!humanVerificationReported.compareAndSet(false, true)) return
+        val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
         recoveryScope?.launch {
             WebhookNotifier.notify(
                 "weread_eink_human_verify",
                 mapOf(
-                    "message" to "微信读书 E-Ink 触发 -2041 人工验证；重新登录二维码通常无法解除，请在微信读书官方客户端完成验证后再重试",
+                    "message" to "微信读书 E-Ink 触发 -2041；请打开验证链接完成人工验证，服务器会自动带回结果并探测恢复",
+                    "verify_url" to verification.verifyUrl,
+                    "expires_at" to verification.expiresAt?.let(Instant::ofEpochMilli)?.toString(),
                     "error" to error.message,
                 ),
             )
@@ -413,6 +421,10 @@ object WeReadEinkRuntime {
             humanVerificationReported.set(false)
             logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")
         }
+    }
+
+    internal fun allowHumanVerificationNotificationRetry() {
+        humanVerificationReported.set(false)
     }
 
     internal fun authStateAfterFailure(refreshAuthExpired: Boolean, error: Throwable): String = when {
@@ -469,6 +481,7 @@ object WeReadEinkRuntime {
             "task_sync_suppressed" to taskSyncSuppressed(currentAuthState),
             "health_probe_suppressed" to probeSuppressed,
             "human_verify_probe_interval_seconds" to AppConfig.wereadEinkHumanVerifyProbeInterval,
+            "human_verification" to WeReadEinkHumanVerification.status(AppConfig.siteUrl),
             "next_health_probe_at" to if (probeSuppressed) lastProbeAt + humanVerifyProbeIntervalMs else null,
             "vid" to credentials?.vid,
             "has_access_token" to credentials?.hasAccessToken(),
