@@ -408,15 +408,41 @@ object WeReadEinkRuntime {
         if (!humanVerificationReported.compareAndSet(false, true)) return
         val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
         recoveryScope?.launch {
-            WebhookNotifier.notify(
+            val textSent = WebhookNotifier.notify(
                 "weread_eink_human_verify",
                 mapOf(
-                    "message" to "微信读书 E-Ink 触发 -2041；请打开验证链接完成人工验证，服务器会自动带回结果并探测恢复",
+                    "message" to "微信读书 E-Ink 触发 -2041；请点击验证链接或扫描随后发送的二维码",
                     "verify_url" to verification.verifyUrl,
                     "expires_at" to verification.expiresAt?.let(Instant::ofEpochMilli)?.toString(),
                     "error" to error.message,
                 ),
             )
+            val qrSent = verification.verifyUrl?.let { verifyUrl ->
+                runCatching {
+                    val png = WeReadEinkHumanVerification.generateQrPng(verifyUrl)
+                    val qrFile = File("qrcode/weread_eink_human_verify.png")
+                    val saved = runCatching {
+                        qrFile.parentFile?.mkdirs()
+                        qrFile.writeBytes(png)
+                    }.onFailure { saveError ->
+                        logger.warn("E-Ink 人工验证二维码保存失败: ${saveError.message}")
+                    }.isSuccess
+                    WebhookNotifier.pushQrcode(
+                        imageBytes = png,
+                        message = "二维码 5 分钟内有效；扫码完成后服务器会自动探测并恢复 E-Ink 通道",
+                        fileName = qrFile.name,
+                        localFileAvailable = saved,
+                        title = "微信读书 E-Ink 人工验证",
+                        heading = "请扫描二维码完成人工验证",
+                        targetUrl = verifyUrl,
+                    ).anySuccess
+                }.onFailure { qrError ->
+                    logger.warn("E-Ink 人工验证二维码生成或推送失败: ${qrError.message}")
+                }.getOrDefault(false)
+            } ?: false
+            if (!textSent && !qrSent) {
+                humanVerificationReported.set(false)
+            }
         } ?: run {
             humanVerificationReported.set(false)
             logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")

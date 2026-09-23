@@ -126,6 +126,9 @@ object WebhookNotifier {
         message: String = "",
         fileName: String = "wx_qrcode.png",
         localFileAvailable: Boolean = true,
+        title: String = "微信读书登录二维码",
+        heading: String = "请扫码登录微信读书",
+        targetUrl: String? = null,
     ): QrPushResult {
         val wecomUrl = AppConfig.wecomWebhookUrl
         val feishuUrl = AppConfig.feishuWebhookUrl
@@ -157,15 +160,16 @@ object WebhookNotifier {
                 val safeFileName = fileName.substringAfterLast('/').substringAfterLast('\\')
                 val qrUrl = "${AppConfig.siteUrl}/qrcode/$safeFileName?v=${System.currentTimeMillis()}"
                 val cardText = buildString {
-                    appendLine("**请扫码登录微信读书**")
+                    appendLine("**$heading**")
                     if (message.isNotEmpty()) appendLine(message)
                     appendLine()
+                    if (!targetUrl.isNullOrBlank()) {
+                        appendLine("[直接打开验证页面]($targetUrl)")
+                        appendLine()
+                    }
                     appendLine("[点击查看二维码]($qrUrl)")
-                    appendLine()
-                    appendLine("> 如果无法点击，请复制以下链接到浏览器：")
-                    appendLine("> $qrUrl")
                 }
-                val success = sendFeishuCard(feishuUrl, "微信读书登录二维码", cardText)
+                val success = sendFeishuCard(feishuUrl, title, cardText)
                 if (success) {
                     logger.info("二维码已推送到飞书")
                 } else {

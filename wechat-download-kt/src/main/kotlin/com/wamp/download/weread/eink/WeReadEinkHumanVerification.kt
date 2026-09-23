@@ -1,8 +1,14 @@
 package com.wamp.download.weread.eink
 
 import com.wamp.download.config.AppConfig
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
 import java.security.SecureRandom
 import java.util.Base64
+import javax.imageio.ImageIO
 
 enum class WeReadEinkVerificationState {
     IDLE,
@@ -205,6 +211,26 @@ object WeReadEinkHumanVerification {
     }
 
     fun requestHeaders(): Map<String, String> = coordinator.requestHeaders()
+
+    fun generateQrPng(url: String, size: Int = 600): ByteArray {
+        require(url.isNotBlank()) { "url must not be blank" }
+        require(size in 200..1200) { "size must be between 200 and 1200" }
+        val hints = mapOf(
+            EncodeHintType.CHARACTER_SET to "UTF-8",
+            EncodeHintType.MARGIN to 2,
+        )
+        val matrix = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, size, size, hints)
+        val image = BufferedImage(size, size, BufferedImage.TYPE_INT_RGB)
+        for (x in 0 until size) {
+            for (y in 0 until size) {
+                image.setRGB(x, y, if (matrix[x, y]) 0x000000 else 0xFFFFFF)
+            }
+        }
+        return ByteArrayOutputStream().use { output ->
+            check(ImageIO.write(image, "png", output)) { "PNG encoder unavailable" }
+            output.toByteArray()
+        }
+    }
 
     fun reset() = coordinator.reset()
 }

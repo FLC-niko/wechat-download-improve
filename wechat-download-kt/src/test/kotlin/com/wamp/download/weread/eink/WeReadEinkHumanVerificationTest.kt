@@ -1,5 +1,11 @@
 package com.wamp.download.weread.eink
 
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.client.j2se.BufferedImageLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import java.io.ByteArrayInputStream
+import javax.imageio.ImageIO
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -92,5 +98,16 @@ class WeReadEinkHumanVerificationTest {
         assertFalse(html.contains("accessToken"))
         assertFalse(html.contains("refreshToken"))
     }
-}
 
+    @Test
+    fun `verification url is encoded into a scannable png`() {
+        val url = "https://verify.example/weread/eink/verify/nonce"
+        val png = WeReadEinkHumanVerification.generateQrPng(url, size = 400)
+        val image = ImageIO.read(ByteArrayInputStream(png))
+        val decoded = MultiFormatReader().decode(
+            BinaryBitmap(HybridBinarizer(BufferedImageLuminanceSource(image))),
+        )
+
+        assertEquals(url, decoded.text)
+    }
+}
