@@ -2,6 +2,9 @@ package com.wamp.download.store
 
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -56,6 +59,27 @@ class InboxStoreTest {
 
             assertTrue(takeover.claimed)
             assertEquals(first.resultEventId, takeover.resultEventId)
+        }
+    }
+
+    @Test
+    fun `并发投递的 inbox 写入不会因 SQLite 写锁失败`() {
+        withTemporaryDatabase {
+            val workers = Executors.newFixedThreadPool(4)
+            val start = CountDownLatch(1)
+            try {
+                val claims = (0 until 24).map { index ->
+                    workers.submit<InboxStore.ClaimResult> {
+                        start.await()
+                        InboxStore.claim(message("wf-concurrent-$index:BTA", now = 10_000L + index))
+                    }
+                }
+                start.countDown()
+
+                assertTrue(claims.all { it.get(10, TimeUnit.SECONDS).claimed })
+            } finally {
+                workers.shutdownNow()
+            }
         }
     }
 

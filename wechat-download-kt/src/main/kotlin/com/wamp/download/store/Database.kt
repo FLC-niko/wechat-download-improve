@@ -8,6 +8,8 @@ import org.slf4j.LoggerFactory
 import java.io.File
 import java.sql.Connection
 import java.util.UUID
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * 数据库表定义 — 对齐 Python 版 rss_store.py 的 schema
@@ -98,6 +100,9 @@ object RabbitInbox : Table("rabbit_inbox") {
  */
 object Database {
     private val logger = LoggerFactory.getLogger(Database::class.java)
+    // SQLite only has one writer. Keep transactions short and fair so concurrent RabbitMQ
+    // deliveries wait locally instead of surfacing SQLITE_BUSY and entering broker retry.
+    private val queryLock = ReentrantLock(true)
     private var db: org.jetbrains.exposed.sql.Database? = null
 
     fun init(dbPath: String = AppConfig.dbPath) {
@@ -106,6 +111,12 @@ object Database {
         db = org.jetbrains.exposed.sql.Database.connect(
             url = "jdbc:sqlite:$dbPath",
             driver = "org.sqlite.JDBC",
+            setupConnection = { connection ->
+                connection.createStatement().use { statement ->
+                    statement.execute("PRAGMA foreign_keys=ON")
+                    statement.execute("PRAGMA busy_timeout=5000")
+                }
+            },
         )
 
         // PRAGMA 必须在事务外执行（WAL 模式不能从事务内切换），使用原生 JDBC 连接
@@ -132,7 +143,9 @@ object Database {
         }
     }
 
-    fun <T> query(block: Transaction.() -> T): T = transaction(db, block)
+    fun <T> query(block: Transaction.() -> T): T = queryLock.withLock {
+        transaction(db, block)
+    }
 
     private fun migrateRabbitInbox(conn: Connection) {
         val tableExists = conn.prepareStatement(
