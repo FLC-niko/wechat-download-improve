@@ -19,6 +19,14 @@ internal object CollectionCoverage {
     ): LongRange? = missingRanges.firstOrNull { it.first <= now }
         ?.let { it.first..minOf(requestedEnd, now) }
 
+    /**
+     * Remote APIs can only page down to "now": the future tail of a requested window is neither
+     * collectable nor a coverage gap. Use this as the completeness bound so a same-day window is
+     * not misjudged as incomplete (which would wrongly fall back to AAOS).
+     */
+    fun effectiveCoverageEnd(requestedStart: Long, requestedEnd: Long, now: Long): Long =
+        minOf(requestedEnd, maxOf(requestedStart, now))
+
     /** Returns uncovered inclusive ranges after merging overlapping or adjacent verified intervals. */
     fun missingRanges(
         requestedStart: Long,

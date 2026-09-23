@@ -82,4 +82,14 @@ class CollectionCoverageTest {
             CollectionCoverage.terminalDecision(resultCount = 1, coverageComplete = false),
         )
     }
+
+    @Test
+    fun `覆盖边界不会把未来时段算作缺口`() {
+        // 窗口末尾在未来（当天 23:59:59）时，覆盖判定只到当前时刻。
+        assertEquals(1_800L, CollectionCoverage.effectiveCoverageEnd(1_000L, 2_000L, now = 1_800L))
+        // 窗口完全在过去时保持原样。
+        assertEquals(2_000L, CollectionCoverage.effectiveCoverageEnd(1_000L, 2_000L, now = 2_500L))
+        // 窗口完全在未来时不会产生倒置区间。
+        assertEquals(1_000L, CollectionCoverage.effectiveCoverageEnd(1_000L, 2_000L, now = 500L))
+    }
 }

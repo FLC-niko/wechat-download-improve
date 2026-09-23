@@ -75,6 +75,35 @@ class TaskProcessorCacheFirstTest {
         }
     }
 
+    @Test
+    fun `当天窗口的未来时段不应算作覆盖缺口`() {
+        withTemporaryDatabase {
+            val today = java.time.LocalDate.now().toString()
+            val (start, _) = CaptureWindowParser.parse(listOf(today, today))
+            val startTs = checkNotNull(start)
+            val now = System.currentTimeMillis() / 1000L
+            val fakeid = "future-tail-fakeid"
+            SubscriptionStore.add(fakeid = fakeid, nickname = "当天窗口公众号")
+            // 已确认覆盖到“当前时刻”；窗口末尾（当天 23:59:59）属于未来，不应算作缺口。
+            ArticleCoverageStore.saveVerified(fakeid, startTs, now, "test")
+
+            val processor = TaskProcessor(
+                einkRequestAllowed = { error("未来时段不应触发远端抓取") },
+            )
+            processor.process(
+                GzhAutoFromBackend(
+                    queueName = "gzh-auto-BTA-queue",
+                    image = "",
+                    gzhName = "当天窗口公众号",
+                    tempTimeStamp = listOf(today, today),
+                    url = "",
+                    jobId = 3L,
+                    correlationId = "future-tail-coverage-test",
+                ),
+            )
+        }
+    }
+
     private fun withTemporaryDatabase(block: suspend () -> Unit) {
         val dbFile = Files.createTempFile("wechat-download-task-cache-", ".db").toFile()
         dbFile.delete()

@@ -99,6 +99,10 @@ class TaskProcessor(
             publishFailed(task, "INVALID_CAPTURE_WINDOW", "采集时间窗口格式非法或起止时间反向", retryable = false)
             return
         }
+        // 远端接口只能翻页到“当前时刻”，窗口的未来时段既采不到也不应算作缺口；
+        // 与 CollectionCoverage.remoteFetchEnvelope 的语义保持一致，避免当天窗口被误判为未覆盖。
+        val requestStartedAt = System.currentTimeMillis() / 1000L
+        val coverageEndTs = CollectionCoverage.effectiveCoverageEnd(startTs, endTs, requestStartedAt)
 
         // 本地订阅是所有回退通道共享的身份，不应因主微信登录失效而被挡住。
         var subscription = SubscriptionStore.findByNickname(task.gzhName)
@@ -132,12 +136,12 @@ class TaskProcessor(
         val verifiedIntervals = if (cacheHasUsableArticles) {
             emptyList()
         } else {
-            loadVerifiedCoverage(fakeid, startTs, endTs)
+            loadVerifiedCoverage(fakeid, startTs, coverageEndTs)
         }
         val missingRanges = if (cacheHasUsableArticles) {
             emptyList()
         } else {
-            CollectionCoverage.missingRanges(startTs, endTs, verifiedIntervals)
+            CollectionCoverage.missingRanges(startTs, coverageEndTs, verifiedIntervals)
         }
         if (cacheHasUsableArticles) {
             logger.info(
@@ -155,8 +159,7 @@ class TaskProcessor(
 
         // 当前远端接口只能“从最新文章向目标起点翻页”，不能指定结束时间。因此从最早缺口
         // 查询一次即可覆盖其后的全部缺口，不能为每个离散缺口重复消耗一次翻页机会。
-        val requestStartedAt = System.currentTimeMillis() / 1000L
-        val remoteRange = CollectionCoverage.remoteFetchEnvelope(endTs, requestStartedAt, missingRanges)
+        val remoteRange = CollectionCoverage.remoteFetchEnvelope(coverageEndTs, requestStartedAt, missingRanges)
         val rangeFetches = remoteRange?.let { range ->
             listOf(
                 MissingRangeFetch(
@@ -209,8 +212,8 @@ class TaskProcessor(
             }
         }
 
-        val finalCoverage = loadVerifiedCoverage(fakeid, startTs, endTs)
-        val coverageComplete = CollectionCoverage.missingRanges(startTs, endTs, finalCoverage).isEmpty()
+        val finalCoverage = loadVerifiedCoverage(fakeid, startTs, coverageEndTs)
+        val coverageComplete = CollectionCoverage.missingRanges(startTs, coverageEndTs, finalCoverage).isEmpty()
         val sourceName = buildList {
             if (cacheHasUsableArticles || missingRanges.isEmpty()) add("cache")
             addAll(sourceResults.filter { it.articles.isNotEmpty() || it.coverageComplete }.map { it.source })
