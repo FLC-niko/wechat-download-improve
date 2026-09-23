@@ -14,3 +14,6 @@ archive-system-crawling-android-master/
 # 运行时数据
 data/
 *.log
+
+# 本地机密文档（含明文凭据，禁止提交）
+交接文档.md

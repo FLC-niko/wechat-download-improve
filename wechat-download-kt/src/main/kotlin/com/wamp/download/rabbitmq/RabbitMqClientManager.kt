@@ -155,6 +155,13 @@ class RabbitMqClientManager(
 
     fun isConnected(): Boolean = connection?.isOpen == true && channel?.isOpen == true
 
+    /** 当前连接是否指向 xdag 租户（使用 archive.* v2 拓扑，而非 new-media-backend）。 */
+    internal val isXdagVhost: Boolean
+        get() = connectionSettings?.virtualHost == RABBITMQ_XDAG_VIRTUAL_HOST
+
+    /** 当前 vhost 对应的主交换机：xdag 用 archive.new-media.v2，其余用 new-media-backend。 */
+    private fun mainExchange(): String = if (isXdagVhost) XDAG_EXCHANGE_V2 else EXCHANGE_NEW_MEDIA
+
     suspend fun publishJson(queue: String, payload: Any) {
         val bytes = gson.toJson(payload).toByteArray(Charsets.UTF_8)
         publish(queue, bytes)
@@ -208,7 +215,7 @@ class RabbitMqClientManager(
                         ch.queueDeclare(queueForRoutingKey(routingKey), true, false, false, null)
                         publishAndConfirm(
                             ch = ch,
-                            exchange = EXCHANGE_NEW_MEDIA,
+                            exchange = mainExchange(),
                             routingKey = routingKey,
                             properties = basicProps(eventId, workflowId, producerService, headers),
                             body = body,
@@ -358,10 +365,8 @@ class RabbitMqClientManager(
                 error.message?.let { put("x-error-message", it) }
             }
 
-            val vhost = connectionSettings?.virtualHost ?: ""
-            val isXdag = vhost == RABBITMQ_XDAG_VIRTUAL_HOST
-            val exchange = if (isXdag) "archive.new-media.v2" else EXCHANGE_NEW_MEDIA
-            val routingKey = if (isXdag) "archive.gzh.auto.atd.v2.dlq" else GZH_DEAD_ROUTING
+            val exchange = mainExchange()
+            val routingKey = if (isXdagVhost) XDAG_DEAD_ROUTING else GZH_DEAD_ROUTING
 
             val enrichedBody = enrichBodyWithArticleQr(ctx.body)
             publishAndConfirm(
@@ -394,10 +399,13 @@ class RabbitMqClientManager(
                 if (shouldRequeue(ctx)) {
                     headers["x-retry-count"] = nextRetry
                     val retryProperties = ctx.delivery.properties.builder().headers(headers).build()
+                    // xdag 走 archive.new-media.retry.v2 / <queue>.retry；其余走 new-media-backend
+                    val retryExchange = if (isXdagVhost) XDAG_EXCHANGE_RETRY_V2 else EXCHANGE_NEW_MEDIA
+                    val retryRoutingKey = if (isXdagVhost) xdagRetryRoutingKey(ctx.queue) else queueRouting(ctx.queue)
                     publishAndConfirm(
                         ch = ch,
-                        exchange = EXCHANGE_NEW_MEDIA,
-                        routingKey = queueRouting(ctx.queue),
+                        exchange = retryExchange,
+                        routingKey = retryRoutingKey,
                         properties = retryProperties,
                         body = ctx.body,
                     )
@@ -407,15 +415,17 @@ class RabbitMqClientManager(
                     headers["x-original-queue"] = ctx.queue
                     val deadProperties = ctx.delivery.properties.builder().headers(headers).build()
                     val enrichedBody = enrichBodyWithArticleQr(ctx.body)
+                    val deadExchange = mainExchange()
+                    val deadRoutingKey = if (isXdagVhost) XDAG_DEAD_ROUTING else GZH_DEAD_ROUTING
                     publishAndConfirm(
                         ch = ch,
-                        exchange = EXCHANGE_NEW_MEDIA,
-                        routingKey = GZH_DEAD_ROUTING,
+                        exchange = deadExchange,
+                        routingKey = deadRoutingKey,
                         properties = deadProperties,
                         body = enrichedBody,
                     )
                     ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
-                    logger.error("【RabbitMQ】任务重试次数耗尽，已转入 $GZH_DEAD_QUEUE", error)
+                    logger.error("【RabbitMQ】任务重试次数耗尽，已转入 $deadRoutingKey", error)
                 }
             }
         } catch (e: CancellationException) {

@@ -40,6 +40,17 @@ const val GZH_DEAD_QUEUE = "dead-message-queue"
 const val GZH_DEAD_ROUTING = "dead-message-routing"
 const val SERVER_STATUS_QUEUE = "server.queue.provideLog"
 
+// --- xdag 租户 archive.* v2 拓扑（与 archive-backend 约定）---
+// xdag vhost 使用 archive.new-media.v2 主交换机，BTA/ATD/retry/dlq 均为直连路由。
+const val XDAG_EXCHANGE_V2 = "archive.new-media.v2"
+const val XDAG_EXCHANGE_RETRY_V2 = "archive.new-media.retry.v2"
+const val XDAG_TASK_QUEUE = "archive.gzh.auto.bta.v2"
+const val XDAG_RESULT_ROUTING = "archive.gzh.auto.atd.v2"
+const val XDAG_DEAD_ROUTING = "archive.gzh.auto.atd.v2.dlq"
+
+/** xdag 重试队列路由键约定：<原队列名>.retry（如 archive.gzh.auto.bta.v2.retry）。 */
+fun xdagRetryRoutingKey(queue: String): String = "$queue.retry"
+
 // --- 任务策略（从 AppConfig 读取）---
 val TASK_RETRY_DELAY_MS: Long
     get() = AppConfig.taskRetryDelayMs

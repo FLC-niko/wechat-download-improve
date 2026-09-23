@@ -99,7 +99,7 @@ class RabbitMqService(
     }
 
     private suspend fun startConsumer(manager: RabbitMqClientManager, env: String) {
-        val queueName = if (env == "xdag") "archive.gzh.auto.bta.v2" else GZH_TASK_QUEUE
+        val queueName = if (env == "xdag") XDAG_TASK_QUEUE else GZH_TASK_QUEUE
         manager.startConsumer(queueName, autoAck = false, prefetch = 1) consumer@{ _, ctx ->
             var taskMessage: RabbitTaskMessage? = null
             try {
@@ -148,7 +148,7 @@ class RabbitMqService(
                 throw e  // 触发 RabbitMQ 层的重试/死信
             }
         }
-        logger.info("【$env】已开始监听任务队列: $GZH_TASK_QUEUE")
+        logger.info("【$env】已开始监听任务队列: $queueName")
     }
 
     fun snapshot(): Map<String, VhostConnectionState> = supervisor?.snapshot() ?: emptyMap()

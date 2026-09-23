@@ -70,8 +70,11 @@ class ResultQueuePublisher(
         eventId: String = defaultResultEventId ?: "evt_${UUID.randomUUID()}"
     ) {
         val message = buildMessage(input, status, seedArticles, error, eventId)
+        // xdag 租户的结果经 archive.new-media.v2 路由到 archive.gzh.auto.atd.v2；
+        // 其余 vhost 仍走 new-media-backend / gzh-auto-ATD-queue。
+        val routingKey = if (clientManager.isXdagVhost) XDAG_RESULT_ROUTING else GZH_RESULT_ROUTING
         clientManager.publishJson(
-            routingKey = GZH_RESULT_ROUTING,
+            routingKey = routingKey,
             payload = message,
             eventId = message.eventId,
             workflowId = message.workflowId,
