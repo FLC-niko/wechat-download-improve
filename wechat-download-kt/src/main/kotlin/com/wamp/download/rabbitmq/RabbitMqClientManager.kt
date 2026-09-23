@@ -212,7 +212,11 @@ class RabbitMqClientManager(
                 try {
                     val ch = getValidChannel()
                     channelOperationMutex.withLock {
-                        ch.queueDeclare(queueForRoutingKey(routingKey), true, false, false, null)
+                        // xdag 的 archive.* 队列由 archive-backend 预声明（带 DLX 等参数），
+                        // 用空参数重新声明会触发 406 PRECONDITION_FAILED，因此跳过。
+                        if (!isXdagVhost) {
+                            ch.queueDeclare(queueForRoutingKey(routingKey), true, false, false, null)
+                        }
                         publishAndConfirm(
                             ch = ch,
                             exchange = mainExchange(),

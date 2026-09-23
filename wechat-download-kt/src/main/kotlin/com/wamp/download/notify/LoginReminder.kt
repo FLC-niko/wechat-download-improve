@@ -1,6 +1,7 @@
 package com.wamp.download.notify
 
 import com.wamp.download.auth.AuthManager
+import com.wamp.download.config.AppConfig
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
 
@@ -44,6 +45,13 @@ object LoginReminder {
     }
 
     private suspend fun checkLoginStatus() {
+        // 主通道关闭时不产生任何登录过期告警（与 LoginChecker 保持一致）；
+        // 清空告警等级，保证以后重新启用主通道且凭证仍失效时能再次告警。
+        if (!AppConfig.mainEnabled) {
+            lastWarningLevel = null
+            return
+        }
+
         if (!AuthManager.isLoggedIn()) {
             logger.debug("无登录凭证，跳过检查")
             return
