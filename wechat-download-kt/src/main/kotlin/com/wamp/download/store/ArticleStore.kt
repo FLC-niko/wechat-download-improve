@@ -82,6 +82,18 @@ object ArticleStore {
             ?.toArticle()
     }
 
+    /** Returns cached E-Ink review ids so interrupted scans do not call /review/single again. */
+    fun getByFakeidAndAids(fakeid: String, aids: Collection<String>): Map<String, Article> {
+        val normalizedAids = aids.asSequence().map(String::trim).filter(String::isNotEmpty).distinct().toList()
+        if (normalizedAids.isEmpty()) return emptyMap()
+        return Database.query {
+            Articles.selectAll()
+                .where { (Articles.fakeid eq fakeid) and (Articles.aid inList normalizedAids) }
+                .map { it.toArticle() }
+                .associateBy(Article::aid)
+        }
+    }
+
     /**
      * 取该公众号任一篇文章链接（用于微信读书 wxs2mp 解析 mpId）
      */

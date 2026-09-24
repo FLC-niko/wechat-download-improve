@@ -2,6 +2,7 @@ package com.wamp.download.weread.eink
 
 import com.wamp.download.store.Article
 import com.wamp.download.store.ArticleStore
+import com.wamp.download.store.PublicAccountCollectionCheckpointStore
 import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.store.WeReadEinkSyncStateStore
@@ -55,6 +56,9 @@ class WeReadEinkSyncService(
     /** Returns true only when persisted state proves the complete requested range was checked. */
     fun isRangeCovered(subscription: Subscription, startTime: Long, endTime: Long): Boolean {
         require(startTime <= endTime) { "startTime must not be after endTime" }
+        if (PublicAccountCollectionCheckpointStore.covers(subscription.fakeid, startTime, endTime)) {
+            return true
+        }
         val mpId = resolveMpId(subscription)
         if (mpId.isBlank()) return false
         val state = WeReadEinkSyncStateStore.get(session.credentials().vid, mpId) ?: return false
@@ -120,7 +124,12 @@ class WeReadEinkSyncService(
                     cacheCovered = true,
                 )
             }
-            syncUnlocked(subscription, mpId)
+            syncUnlocked(
+                subscription = subscription,
+                mpId = mpId,
+                requestedStartTime = startTime,
+                requestedEndTime = endTime,
+            )
         }
     }
 
@@ -143,11 +152,20 @@ class WeReadEinkSyncService(
         subscription: Subscription,
         mpId: String,
         shouldContinue: () -> Boolean = { true },
+        requestedStartTime: Long? = null,
+        requestedEndTime: Long? = null,
     ): WeReadEinkSyncResult {
         require(subscription.fakeid.isNotBlank()) { "subscription fakeid must not be blank" }
+        require((requestedStartTime == null) == (requestedEndTime == null)) {
+            "requestedStartTime and requestedEndTime must both be set or both be null"
+        }
+        require(requestedStartTime == null || requestedStartTime <= requestedEndTime!!) {
+            "requestedStartTime must not be after requestedEndTime"
+        }
 
         val fakeid = subscription.fakeid
         val accountVid = session.credentials().vid
+        val scanStartedAt = System.currentTimeMillis() / 1000
         val storedState = WeReadEinkSyncStateStore.get(accountVid, mpId)
         // Version 0 includes historical rows that could be marked complete even when every
         // returned record failed mapping. Re-baseline those rows from synckey=0.
@@ -156,11 +174,16 @@ class WeReadEinkSyncService(
         }
         val initialSynckey = previousState?.synckey ?: 0L
         val client = clientFactory(session, baseUrl)
-        val collected = mutableListOf<WeReadEinkArticle>()
         var pages = 0
+        var fetchedArticles = 0
+        var skippedArticles = 0
+        var savedArticles = 0
         var requestedOffset: Long? = null
         var nextSynckey: Long? = previousState?.synckey
         var cycleComplete = false
+        var targetedRangeComplete = false
+        var filteredForRequestedRange = false
+        var cycleOldestCollectedAt: Long? = null
 
         try {
             while (pages < maxPages) {
@@ -171,75 +194,121 @@ class WeReadEinkSyncService(
                     client.fetchArticles(mpId, count = pageSize, offset = requestedOffset)
                 }
                 pages++
-                collected += page.articles
+                fetchedArticles += page.articles.size
                 nextSynckey = page.synckey ?: nextSynckey
 
                 val nextOffset = nextOffset(page)
-                if (nextOffset == null) {
-                    cycleComplete = true
-                    break
-                }
-                if (nextOffset <= page.requestedOffset) {
+                val naturalEnd = nextOffset == null
+                if (nextOffset != null && nextOffset <= page.requestedOffset) {
                     throw WeReadEinkSyncException(
                         "E-Ink pagination did not advance: offset=${page.requestedOffset}, next=$nextOffset",
                     )
                 }
+
+                val pageTimes = page.articles.mapNotNull { it.collectionTime() }.filter { it > 0L }
+                val reachedRequestedStart = requestedStartTime != null &&
+                    (naturalEnd || pageTimes.any { it <= requestedStartTime })
+                val articlesToPersist = if (reachedRequestedStart) {
+                    page.articles.filter { article ->
+                        val publishTime = article.collectionTime()
+                        publishTime == null || publishTime >= requestedStartTime!!
+                    }
+                } else {
+                    page.articles
+                }
+                filteredForRequestedRange = filteredForRequestedRange ||
+                    articlesToPersist.size != page.articles.size
+
+                val cachedArticles = ArticleStore.getByFakeidAndAids(
+                    fakeid,
+                    articlesToPersist.mapNotNull(WeReadEinkArticle::reviewId),
+                )
+                val mapped = articlesToPersist.mapNotNull { article ->
+                    ensureShouldContinue(shouldContinue)
+                    article.toArticle(fakeid, client, cachedArticles[article.reviewId]) ?: run {
+                        logger.warn(
+                            "跳过无效的 E-Ink 文章: fakeid=${fakeid.take(8)}..., " +
+                                "reviewId=${article.reviewId.orEmpty().take(32)}",
+                        )
+                        null
+                    }
+                }
+                val pageSkippedArticles = articlesToPersist.size - mapped.size
+                skippedArticles += pageSkippedArticles
+                if (pageSkippedArticles > 0) {
+                    throw WeReadEinkSyncException(
+                        "E-Ink returned $pageSkippedArticles invalid article payloads out of " +
+                            "${articlesToPersist.size} relevant records on page $pages; " +
+                            "this page checkpoint was not advanced",
+                    )
+                }
+
+                savedArticles += ArticleStore.saveAll(fakeid, mapped, source = "eink")
+
+                val pageOldestCollectedAt = when {
+                    reachedRequestedStart -> requestedStartTime
+                    pageTimes.isNotEmpty() -> pageTimes.min()
+                    naturalEnd -> requestedStartTime ?: 0L
+                    else -> null
+                }
+                if (pageOldestCollectedAt != null) {
+                    cycleOldestCollectedAt = minOf(
+                        cycleOldestCollectedAt ?: pageOldestCollectedAt,
+                        pageOldestCollectedAt,
+                    )
+                    val checkpoint = PublicAccountCollectionCheckpointStore.recordProgress(
+                        fakeid = fakeid,
+                        mpId = mpId,
+                        oldestCollectedAt = cycleOldestCollectedAt!!,
+                        newestCollectedAt = scanStartedAt,
+                        pagesDelta = 1,
+                        articlesDelta = mapped.size,
+                    )
+                    targetedRangeComplete = requestedStartTime != null && requestedEndTime != null &&
+                        checkpoint.covers(requestedStartTime, requestedEndTime)
+                }
+
+                if (naturalEnd) cycleComplete = true
+                if (targetedRangeComplete || naturalEnd) break
                 requestedOffset = nextOffset
             }
 
-            if (!cycleComplete) {
+            if (!cycleComplete && !targetedRangeComplete) {
                 throw WeReadEinkSyncException("E-Ink pagination exceeded maxPages=$maxPages")
             }
 
-            val mapped = collected.mapNotNull { article ->
-                ensureShouldContinue(shouldContinue)
-                article.toArticle(fakeid, client) ?: run {
-                    logger.warn(
-                        "跳过无效的 E-Ink 文章: fakeid=${fakeid.take(8)}..., " +
-                            "reviewId=${article.reviewId.orEmpty().take(32)}",
-                    )
-                    null
-                }
-            }
-            val skippedArticles = collected.size - mapped.size
-            val savedArticles = ArticleStore.saveAll(fakeid, mapped, source = "eink")
-            if (skippedArticles > 0) {
-                throw WeReadEinkSyncException(
-                    "E-Ink returned $skippedArticles invalid article payloads out of ${collected.size}; " +
-                        "cursor and coverage were not advanced",
+            val completedFullCycle = cycleComplete && !filteredForRequestedRange
+            val historyComplete = previousState?.historyComplete == true ||
+                (completedFullCycle && initialSynckey == 0L)
+            if (completedFullCycle) {
+                val coverageStart = if (historyComplete) 0L else previousState?.coverageStart
+                val coverageEnd = max(scanStartedAt, previousState?.coverageEnd ?: 0L)
+                WeReadEinkSyncStateStore.saveSuccess(
+                    accountVid = accountVid,
+                    fakeid = fakeid,
+                    mpId = mpId,
+                    synckey = nextSynckey,
+                    coverageStart = coverageStart,
+                    coverageEnd = coverageEnd,
+                    historyComplete = historyComplete,
                 )
             }
-            val historyComplete = previousState?.historyComplete == true || initialSynckey == 0L
-            val coverageStart = if (historyComplete) 0L else previousState?.coverageStart
-            val coverageEnd = max(
-                System.currentTimeMillis() / 1000,
-                previousState?.coverageEnd ?: 0L,
-            )
-
-            WeReadEinkSyncStateStore.saveSuccess(
-                accountVid = accountVid,
-                fakeid = fakeid,
-                mpId = mpId,
-                synckey = nextSynckey,
-                coverageStart = coverageStart,
-                coverageEnd = coverageEnd,
-                historyComplete = historyComplete,
-            )
             SubscriptionStore.updateLastPoll(fakeid)
 
             logger.info(
                 "E-Ink 同步完成: fakeid=${fakeid.take(8)}..., pages=$pages, " +
-                    "fetched=${collected.size}, skipped=$skippedArticles, saved=$savedArticles",
+                    "fetched=$fetchedArticles, skipped=$skippedArticles, saved=$savedArticles, " +
+                    "targetCovered=$targetedRangeComplete, fullCycle=$completedFullCycle",
             )
             return WeReadEinkSyncResult(
                 fakeid = fakeid,
                 accountVid = accountVid,
                 mpId = mpId,
                 pages = pages,
-                fetchedArticles = collected.size,
+                fetchedArticles = fetchedArticles,
                 skippedArticles = skippedArticles,
                 savedArticles = savedArticles,
-                synckey = nextSynckey,
+                synckey = if (completedFullCycle) nextSynckey else previousState?.synckey,
                 historyComplete = historyComplete,
             )
         } catch (error: Exception) {
@@ -297,11 +366,21 @@ class WeReadEinkSyncService(
         return mpId
     }
 
-    private fun WeReadEinkArticle.toArticle(fakeid: String, client: WeReadEinkChaptersClient): Article? {
+    private fun WeReadEinkArticle.collectionTime(): Long? = createTime ?: mpInfo?.time
+
+    private fun WeReadEinkArticle.toArticle(
+        fakeid: String,
+        client: WeReadEinkChaptersClient,
+        cachedArticle: Article? = null,
+    ): Article? {
         var link = mpInfo?.docUrl
             ?.trim()
             ?.let { candidate -> candidate.toHttpUrlOrNull()?.toString() }
-            
+
+        if (link == null && cachedArticle?.link?.isNotBlank() == true) {
+            link = cachedArticle.link
+        }
+
         if (link == null && !reviewId.isNullOrBlank()) {
             logger.info("文章缺少 docUrl，尝试通过 /review/single 补全: reviewId=$reviewId")
             val backfilledUrl = try {

@@ -65,6 +65,29 @@ object WeReadEinkSyncStates : Table("weread_eink_sync_states") {
 }
 
 /**
+ * 每个公众号已经连续扫描并成功落库的时间节点。
+ *
+ * 与 E-Ink 账号游标不同，这份进度属于公众号内容本身。即使同步在整轮结束前被中断，
+ * 已成功处理的页面也可以留下安全的时间覆盖，后续实时任务无需重新补链这段历史。
+ */
+object PublicAccountCollectionCheckpoints : Table("public_account_collection_checkpoints") {
+    val fakeid = varchar("fakeid", 64).references(Subscriptions.fakeid, onDelete = ReferenceOption.CASCADE)
+    val mpId = text("mp_id").default("")
+    val collectionSource = varchar("source", 32)
+    val oldestCollectedAt = long("oldest_collected_at")
+    val newestCollectedAt = long("newest_collected_at")
+    val lastSuccessAt = long("last_success_at")
+    val pagesCollected = integer("pages_collected").default(0)
+    val articlesCollected = integer("articles_collected").default(0)
+
+    override val primaryKey = PrimaryKey(fakeid, collectionSource)
+
+    init {
+        index("idx_collection_checkpoint_range", isUnique = false, fakeid, oldestCollectedAt, newestCollectedAt)
+    }
+}
+
+/**
  * 已由远端完整核验过的文章时间区间。
  *
  * 文章表只能证明“缓存里有什么”，不能证明某个空窗口确实没有文章；因此覆盖信息必须
@@ -137,6 +160,7 @@ object Database {
                 Articles,
                 RabbitInbox,
                 WeReadEinkSyncStates,
+                PublicAccountCollectionCheckpoints,
                 ArticleCoverageIntervals,
             )
             logger.info("数据库初始化完成: $dbPath")

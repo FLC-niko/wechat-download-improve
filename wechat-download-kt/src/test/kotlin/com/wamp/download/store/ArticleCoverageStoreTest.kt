@@ -45,12 +45,13 @@ class ArticleCoverageStoreTest {
                     }
                 }
                 assertEquals(true, "coverage_version" in columns)
-                val coverageTableExists = connection.createStatement().use { statement ->
-                    statement.executeQuery(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='article_coverage_intervals'",
-                    ).use { rows -> rows.next() }
+                val tables = connection.createStatement().use { statement ->
+                    statement.executeQuery("SELECT name FROM sqlite_master WHERE type='table'").use { rows ->
+                        generateSequence { if (rows.next()) rows.getString("name") else null }.toSet()
+                    }
                 }
-                assertEquals(true, coverageTableExists)
+                assertEquals(true, "article_coverage_intervals" in tables)
+                assertEquals(true, "public_account_collection_checkpoints" in tables)
             }
         } finally {
             File(dbFile.absolutePath).delete()
@@ -85,6 +86,36 @@ class ArticleCoverageStoreTest {
                 listOf(100L..200L),
                 ArticleCoverageStore.intervals("fakeid-2", 0L, 1_000L),
             )
+        }
+    }
+
+    @Test
+    fun `公众号采集节点只合并连续覆盖并累计处理量`() {
+        withTemporaryDatabase {
+            SubscriptionStore.add(fakeid = "fakeid-checkpoint", nickname = "节点测试公众号")
+
+            PublicAccountCollectionCheckpointStore.recordProgress(
+                fakeid = "fakeid-checkpoint",
+                mpId = "MP_WXS_checkpoint",
+                oldestCollectedAt = 200L,
+                newestCollectedAt = 400L,
+                pagesDelta = 1,
+                articlesDelta = 20,
+            )
+            val checkpoint = PublicAccountCollectionCheckpointStore.recordProgress(
+                fakeid = "fakeid-checkpoint",
+                mpId = "MP_WXS_checkpoint",
+                oldestCollectedAt = 100L,
+                newestCollectedAt = 400L,
+                pagesDelta = 1,
+                articlesDelta = 15,
+            )
+
+            assertEquals(100L, checkpoint.oldestCollectedAt)
+            assertEquals(400L, checkpoint.newestCollectedAt)
+            assertEquals(2, checkpoint.pagesCollected)
+            assertEquals(35, checkpoint.articlesCollected)
+            assertEquals(true, checkpoint.covers(150L, 350L))
         }
     }
 
