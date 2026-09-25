@@ -115,9 +115,13 @@ class AdbUserOperationsTest {
 
         // Slot 综合判定
         val legacySlot = DeviceSlot("d1", 0, "H1", sdkVersion = 28, wechatVersion = "8.0.18")
+        val android11Slot = DeviceSlot("d11", 0, "H11", sdkVersion = 30, wechatVersion = "8.0.76")
+        val android12Slot = DeviceSlot("d12", 0, "H12", sdkVersion = 31, wechatVersion = "8.0.76")
         val modernSlot = DeviceSlot("d2", 0, "H2", sdkVersion = 34, wechatVersion = "8.0.76")
 
         assertTrue(legacySlot.isLegacyRoute)
+        assertTrue(!android11Slot.isLegacyRoute)
+        assertTrue(!android12Slot.isLegacyRoute)
         assertTrue(!modernSlot.isLegacyRoute)
     }
 
@@ -157,6 +161,28 @@ class AdbUserOperationsTest {
 
         assertTrue(opsFailed.isLoginFailedPage(slot))
         assertTrue(!opsSuccess.isLoginFailedPage(slot))
+    }
+
+    @Test
+    fun `isLoginFailedPage 优先从 uiautomator 节点识别失败提示`() {
+        val executed = mutableListOf<List<String>>()
+        val runner = AdbCommandRunner { args ->
+            executed.add(args)
+            when {
+                args.contains("uiautomator") -> AdbCommandResult(0, "UI hierchary dumped", "")
+                args.contains("cat") -> AdbCommandResult(
+                    0,
+                    """<node text="微信读书网页版" content-desc=""/><node text="登录失败，请重新扫码登录" content-desc=""/>""",
+                    "",
+                )
+                else -> AdbCommandResult(0, "", "")
+            }
+        }
+        val ops = AdbUserOperations(commandRunner = runner)
+
+        assertTrue(ops.isLoginFailedPage(DeviceSlot("dev-ui", 0)))
+        assertTrue(executed.any { it.contains("uiautomator") })
+        assertTrue(executed.none { it.contains("screencap") })
     }
 
     @Test
@@ -226,4 +252,3 @@ class AdbUserOperationsTest {
         assertTrue(text.contains("登录失败") || text.contains("重新扫码"), "应成功识别到登录失败提示文字")
     }
 }
-

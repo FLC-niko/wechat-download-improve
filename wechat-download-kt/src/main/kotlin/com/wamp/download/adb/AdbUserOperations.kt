@@ -42,6 +42,8 @@ class AdbUserOperations(
 
         // 5. Eink 授权弹窗中间确认位置覆盖比率
         const val RATIO_EINK_MID_BTN_Y = 0.610f
+
+        private val UI_TEXT_ATTRIBUTE = Regex("""(?:text|content-desc)=\"([^\"]*)\"""")
     }
 
     private val screenSizeCache = ConcurrentHashMap<String, Pair<Int, Int>>()
@@ -136,6 +138,30 @@ class AdbUserOperations(
     fun detectScreenText(slot: DeviceSlot): String {
         screenTextDetector?.let { return it(slot) }
         return runCatching {
+            // WebView 在部分微信/Android 组合上会把正文暴露给 uiautomator。
+            // 先走节点文本快速路径，避免 OCR 裁剪区域或语言包差异漏掉
+            // “登录失败，请重新扫码登录”。节点不可见时再回退截图 OCR。
+            val uiDumpRemote = "/sdcard/aaos_ui_${System.currentTimeMillis()}.xml"
+            val uiText = try {
+                val dumped = run(listOf("-s", slot.serial, "shell", "uiautomator", "dump", uiDumpRemote))
+                if (dumped.exitCode == 0) {
+                    val xml = run(listOf("-s", slot.serial, "shell", "cat", uiDumpRemote))
+                    if (xml.exitCode == 0) {
+                        UI_TEXT_ATTRIBUTE.findAll(xml.stdout)
+                            .mapNotNull { it.groupValues.getOrNull(1) }
+                            .filter { it.isNotBlank() }
+                            .joinToString(" ")
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                }
+            } finally {
+                run(listOf("-s", slot.serial, "shell", "rm", "-f", uiDumpRemote))
+            }
+            if (isLoginFailureText(uiText)) return uiText
+
             val tmpRemote = "/sdcard/ocr_${System.currentTimeMillis()}.png"
             val tmpLocal = File.createTempFile("ocr_", ".png")
             run(listOf("-s", slot.serial, "shell", "screencap", "-p", tmpRemote))
@@ -147,14 +173,16 @@ class AdbUserOperations(
                 return ""
             }
 
-            // 纯 Java 预处理：切出屏幕中间区域 (y: 35%~60%) 并二值化反色（微信深色模式 -> 白底黑字）
+            // 纯 Java 预处理：覆盖屏幕中下部 (y: 28%~82%) 并二值化反色
+            // （微信深色模式 -> 白底黑字）。失败提示在部分 Android 11/12
+            // WebView 上位于 60% 以下，旧的 35%~60% 裁剪会恰好漏掉。
             val preprocessed = File.createTempFile("ocr_prep_", ".png")
             try {
                 val rawImage = javax.imageio.ImageIO.read(tmpLocal)
                 val w = rawImage.width
                 val h = rawImage.height
-                val cropY = (h * 0.35f).toInt()
-                val cropH = (h * 0.25f).toInt()
+                val cropY = (h * 0.28f).toInt()
+                val cropH = (h * 0.54f).toInt()
                 val sub = rawImage.getSubimage(0, cropY, w, cropH)
                 val binarized = java.awt.image.BufferedImage(w, cropH, java.awt.image.BufferedImage.TYPE_BYTE_BINARY)
                 for (y in 0 until cropH) {
@@ -239,8 +267,11 @@ class AdbUserOperations(
     /** 检查是否停留在“登录失败，请重新扫码登录”状态 */
     fun isLoginFailedPage(slot: DeviceSlot): Boolean {
         val text = detectScreenText(slot)
-        return text.contains("登录失败") || text.contains("重新扫码")
+        return isLoginFailureText(text)
     }
+
+    private fun isLoginFailureText(text: String): Boolean =
+        text.contains("登录失败") || text.contains("重新扫码")
 
     /**
      * 自动调起微信扫一扫与选图、点击授权全流程
@@ -288,6 +319,12 @@ class AdbUserOperations(
                 return ScanConfirmResult.LOGIN_FAILED_PAGE
             }
             tapRatio(slot, RATIO_CONFIRM_BTN_X, RATIO_CONFIRM_BTN_Y)
+            Thread.sleep(1000)
+            if (isLoginFailedPage(slot)) {
+                logger.warn("二次授权点击后页面提示【登录失败，请重新扫码登录】，立即关闭退出并请求重新开始: slot=${slot.slotKey}")
+                dismissAuthorizationAndReset(slot)
+                return ScanConfirmResult.LOGIN_FAILED_PAGE
+            }
         } else {
             // Eink 授权弹窗位置覆盖
             tapRatio(slot, RATIO_CONFIRM_BTN_X, RATIO_CONFIRM_BTN_Y)

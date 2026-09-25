@@ -26,7 +26,7 @@
 |---|---|
 | **微信登录** | 服务端主动扫码登录，自动获取 token/cookie/fakeid |
 | **通知机器人** | 企业微信 + 飞书，支持文字通知 + 二维码图片推送 |
-| **文章列表抓取** | 微信读书 Web 为当前主采集通道；`appmsgpublish` 默认关闭 |
+| **文章列表抓取** | 本地缓存优先，微信读书 E-Ink 为首选远端通道，Web 降级；`appmsgpublish` 默认关闭 |
 | **SQLite 存储** | 订阅表 + 文章表，对齐 Python 版 schema |
 | **feed 接口** | `/api/feed/articles.json` 增量游标拉取 |
 | **适配壳** | `/api/v1/wx/*` 路由，让 Worker 不改代码就能对接 |
@@ -36,9 +36,11 @@
 
 ## 快速开始
 
-### 当前上线模式：不依赖 ADB
+### 当前生产模式：服务器通过 Windows USB ADB 自动恢复
 
-默认配置不会执行 `adb devices`，也不会启动 ADB 设备监督；凭证会被主动探测，Web 或 E-Ink refreshToken 明确失效后自动生成二维码并通过机器人通知，由用户人工扫码。二维码通知与 ADB 无人值守扫码是两个独立能力，后者继续默认关闭。已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，不是降低频率后可恢复的临时频控，因此主通道默认关闭。
+仓库默认配置仍允许关闭 ADB，但 `dag2.0-backend` 当前生产实例已经显式启用。手机通过 USB 连接 Windows，Windows 的 ADB Server 监听 `127.0.0.1:5037`，再由登录计划任务把它反向转发到服务器 `127.0.0.1:15037`。服务进程通过 `ADB_SERVER_SOCKET=tcp:127.0.0.1:15037` 使用远端 ADB Server，不连接手机 Wi-Fi 地址，也不向校园网暴露 ADB 端口。
+
+凭证仍会被主动探测；Web refreshToken 明确失效后可通过手机自动扫码恢复，设备离线时才回退为机器人二维码通知。E-Ink 的 `-2041` 是官方风控人工验证，ADB 不能绕过验证；服务会生成 5 分钟有效的验证链接和二维码，人工完成腾讯验证码后把一次性结果交给当前 E-Ink 会话并立即探测恢复。已有本地订阅优先使用微信读书 E-Ink 通道，并由 Web 与本地缓存兜底。`appmsgpublish` 返回 `200013` 已确认是通道失效标志，因此主通道保持关闭。
 
 ```yaml
 auth:
@@ -54,7 +56,7 @@ weread:
     human_verify_probe_interval: 3600
 
 adb:
-  enabled: false
+  enabled: true
   poll_interval_ms: 15000
 
 rss:
@@ -65,32 +67,43 @@ wx:
     enabled: false
 ```
 
-Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。ADB 设备代扫仍需显式设置 `adb.enabled: true`。E-Ink 返回 `-2041` 时属于官方风控人工验证，服务不会用重新登录二维码冒充恢复，需先在微信读书官方客户端完成验证。人工验证期间任务不会继续撞 E-Ink，真实健康探测默认退避到每小时一次。
+Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。其他部署若没有设备，应保持 `adb.enabled: false`；启用时还必须让服务进程继承正确的 `ADB_SERVER_SOCKET`。E-Ink 返回 `-2041` 时属于官方风控人工验证：机器人会发送验证页面链接和二维码，页面提交腾讯验证码的 `ticket/randstr` 后立即执行一次 E-Ink 恢复探测。链接默认 5 分钟有效且只允许提交一次，验证码结果不落盘、不出现在状态接口和日志中。未完成人工验证前任务不会继续撞 E-Ink，真实健康探测默认退避到每小时一次。
+
+ADB 序列号、安卓微信读书 App 的设备身份与 E-Ink 会话的 `deviceId` 不等价。当前代码只通过 ADB 发现设备和控制微信扫码页面，不读取微信读书 App 私有数据，也不会把手机客户端 `deviceId` 写入服务端 E-Ink 凭证。
 
 ### ADB 设备代扫与自愈机制
 
 - **双轨架构调度**：
-  - 老版系统/微信（微信 < 8.0.40 或 Android <= 29）：自动匹配经典 AAOS 无障碍全自动路线；
-  - 现代系统（Android 14 / HyperOS 2 / 微信 8.0.76+）：走屏幕比例自适应穿透管线（自动拉起 BaseScanUI、相册首张二维码选图、确认授权并关闭 WebView 复位）。
+  - 经典路线（微信 `<8.0.40` 或 Android API `<=29`）：安装 AAOS 时使用经典 AAOS 相册目录与无障碍路线；
+  - 现代路线（Android API `>=30` 且微信 `>=8.0.40`）：服务端直接走屏幕比例自适应管线，自动拉起 BaseScanUI、选二维码、确认授权并关闭 WebView。Android 11、12、13、14 都在这一分支，不存在 API 31 未覆盖的空档。
 - **离线页面感知与快速自愈**：
-  - 若手机选图后遇到「登录失败，请重新扫码登录」异常界面，系统集成纯本地离线 OCR（Linux 下自动调度 `tesseract-ocr`，macOS 下自动降级 `Vision`），0.2 秒内识别并自动复位退出，立即触发重新生成与扫码，避免 60 秒轮询假死。
+  - 若手机选图后遇到「登录失败，请重新扫码登录」，先从 `uiautomator` 节点读取提示，节点不可见再使用本地 OCR（Linux 调度 `tesseract-ocr`，macOS 降级 `Vision`）。OCR 覆盖屏幕 28%~82% 的中下部，兼容 Android 11/12 WebView 中文案位置更低的页面；识别后立即点左上角关闭、发送 BACK 并复位 LauncherUI。
   - 二维码文件执行严格阅后即焚清理并向系统广播 `MEDIA_SCANNER_SCAN_FILE` 刷新媒体库，防止旧图在相册残留引发错选。
 
 任务返回采用缓存优先：SQLite 中已有可用文章时直接返回，不调用任何远端通道；缓存为空时，只有已验证的时间覆盖区间才能直接确认 `EMPTY`，否则只从最早缺口向最新文章翻页一次，成功落库后再提交覆盖记录。旧版 E-Ink 覆盖记录不会直接沿用，避免把无法解析的返回误判为空历史。ADB 状态仍可通过以下接口查看：
 
 ```bash
-curl http://localhost:5000/api/adb/status
+curl http://localhost:8001/api/adb/status
 ```
 
 关闭 ADB 时 `/api/weread/account/recover` 会直接生成目标 Web 账号的二维码并通过机器人发送；E-Ink 可调用 `/api/weread/eink/login/start`，两者都不要求服务器安装 Android APK。
 
 ```bash
-curl -X POST http://localhost:5000/api/weread/account/recover \
+curl -X POST http://localhost:8001/api/weread/account/recover \
   -H 'Content-Type: application/json' \
   -d '{"vid":"目标 Web 账号 vid"}'
 
-curl -X POST http://localhost:5000/api/weread/eink/login/start
+curl -X POST http://localhost:8001/api/weread/eink/login/start
 ```
+
+当状态为 `HUMAN_VERIFY_REQUIRED` 时，可重新获取当前人工验证链接：
+
+```bash
+curl -X POST http://localhost:8001/api/weread/eink/verify/start
+curl http://localhost:8001/api/weread/eink/verify/status
+```
+
+生产公网入口使用 `server.site_url` 生成，当前为 `http://175.178.183.71:4001/weread/eink/verify/{nonce}`；4001 只代理验证页、验证提交接口和二维码静态路径，其他原有路径不变。
 
 ### 1. 配置
 
