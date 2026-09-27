@@ -248,7 +248,21 @@ object WeReadEinkRuntime {
 
     /** Uses one known public-account id for a real authenticated probe without advancing sync state. */
     fun probe(): Boolean {
+        val verificationProbe = WeReadEinkRequestGate.isVerificationProbeRequest()
         val snapshot = currentSnapshot() ?: return false
+        if (!verificationProbe) return probeWithSnapshot(snapshot)
+        // While the captcha probe runs, background E-Ink requests yield instead of competing for
+        // the gate. They wait and resume afterwards, so no task or sync cursor can be lost.
+        val vid = snapshot.session.credentials().vid
+        WeReadEinkRequestGate.beginVerification(vid)
+        return try {
+            probeWithSnapshot(snapshot)
+        } finally {
+            WeReadEinkRequestGate.endVerification(vid)
+        }
+    }
+
+    private fun probeWithSnapshot(snapshot: RuntimeSnapshot): Boolean {
         val service = snapshot.service
         val target = SubscriptionStore.list(limit = PROBE_SUBSCRIPTION_LIMIT).first
             .firstOrNull(service::canSync)

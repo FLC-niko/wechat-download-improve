@@ -5,7 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APK_PATH="${1:-$ROOT_DIR/../archive-system-crawling-android-master/app/build/outputs/apk/debug/app-debug.apk}"
 PACKAGE="com.topviewclub.crawling"
-SERVICE="$PACKAGE/com.topviewclub.crawling.service.wechat.weread.WeReadLoginOperationService"
+# 双无障碍服务：公众号采集 + 微信读书登录。安装 APK 后 MIUI 会重置无障碍授权，
+# 因此每次部署都必须重新启用，否则 weread_login 任务无人执行。
+SERVICES="$PACKAGE/com.topviewclub.crawling.wechat.official.OfficialOperationService:$PACKAGE/com.topviewclub.crawling.service.wechat.weread.WeReadLoginOperationService"
 
 devices=()
 while IFS= read -r serial; do
@@ -34,7 +36,7 @@ for serial in "${devices[@]}"; do
 
     for user_id in "${users[@]}"; do
         adb -s "$serial" shell pm install-existing --user "$user_id" "$PACKAGE" >/dev/null 2>&1 || true
-        adb -s "$serial" shell settings --user "$user_id" put secure enabled_accessibility_services "$SERVICE"
+        adb -s "$serial" shell settings --user "$user_id" put secure enabled_accessibility_services "$SERVICES"
         adb -s "$serial" shell settings --user "$user_id" put secure accessibility_enabled 1
         adb -s "$serial" shell cmd appops set --user "$user_id" com.tencent.mm RUN_IN_BACKGROUND allow || true
         # HyperOS 2 专属：赋予相册读取权限与后台弹出界面权限 (10021)
@@ -45,7 +47,7 @@ for serial in "${devices[@]}"; do
         echo "    user=$user_id accessibility=enabled, media/popup permissions granted"
     done
 
-    adb -s "$serial" shell svc power stayonusb true || true
+    adb -s "$serial" shell svc power stayon usb || true
     adb -s "$serial" shell dumpsys deviceidle disable || true
 done
 

@@ -75,6 +75,8 @@ adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启
   poll_interval_ms: 15000
   recovery_max_delay_ms: 900000
+  aaos_login_enabled: true   # 微信读书登录优先由 AAOS 无障碍链承接；false 回退服务端 ADB 坐标管线
+  aaos_login_poll_timeout: 120 # AAOS 登录链的凭证等待超时（秒）
 
 # 主微信接口返回 200013 后不会因降低频率而恢复，默认禁用。
 wx:

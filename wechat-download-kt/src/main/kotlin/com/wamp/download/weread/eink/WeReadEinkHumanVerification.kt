@@ -194,7 +194,9 @@ internal class WeReadEinkHumanVerificationCoordinator(
 }
 
 object WeReadEinkHumanVerification {
-    private val coordinator = WeReadEinkHumanVerificationCoordinator(probe = WeReadEinkRuntime::probe)
+    private val coordinator = WeReadEinkHumanVerificationCoordinator(
+        probe = { WeReadEinkRequestGate.asVerificationProbe { WeReadEinkRuntime.probe() } },
+    )
 
     fun createOrReuse(siteUrl: String): WeReadEinkVerificationStatus = coordinator.createOrReuse(siteUrl)
 
@@ -210,7 +212,13 @@ object WeReadEinkHumanVerification {
         return result.copy(nextUrl = replacement.verifyUrl)
     }
 
-    fun requestHeaders(): Map<String, String> = coordinator.requestHeaders()
+    /**
+     * Captcha ticket headers are one-shot and may be consumed by the first request that carries
+     * them. They are exposed only to the verification probe thread so concurrent background sync
+     * or task requests can never burn the ticket before the recovery probe uses it.
+     */
+    fun requestHeaders(): Map<String, String> =
+        if (WeReadEinkRequestGate.isVerificationProbeRequest()) coordinator.requestHeaders() else emptyMap()
 
     fun generateQrPng(url: String, size: Int = 600): ByteArray {
         require(url.isNotBlank()) { "url must not be blank" }

@@ -141,6 +141,13 @@ object AppConfig {
     val adbRecoveryMaxDelayMs: Long
         get() = getLong("adb.recovery_max_delay_ms", 15 * 60_000L).coerceAtLeast(adbPollIntervalMs)
 
+    /** 微信读书登录优先由 AAOS 无障碍责任链承接（服务端只推码 + 下发任务），关闭则回退服务端 ADB 坐标管线。 */
+    val adbAaosLoginEnabled: Boolean get() = getBool("adb.aaos_login_enabled", true)
+
+    /** AAOS 登录链的凭证等待超时（秒），需覆盖扫码页加载、选图与授权确认。 */
+    val adbAaosLoginPollTimeout: Long
+        get() = getLong("adb.aaos_login_poll_timeout", 120L).coerceAtLeast(60L)
+
     // 预热（拉文章前先调公众号信息接口触发关联）
     val wereadWarmupEnabled: Boolean get() = getBool("weread.warmup_enabled", true)
 

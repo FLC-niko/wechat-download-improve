@@ -1,0 +1,96 @@
+# wechat-download-kt 配置文件
+# 仿照 we-mp-rss 配置，包含飞书和企业微信通知机器人
+# 注意：此文件包含敏感信息，已在 .gitignore 中，请勿提交
+
+server:
+  host: 0.0.0.0
+  port: 8001                          # 与 we-mp-rss 后端端口一致
+  site_url: http://localhost:8001     # 用于飞书通知中的二维码访问链接
+
+store:
+  db_path: data/rss.db
+
+auth:
+  credentials_file: data/.credentials.json
+  auto_recovery_enabled: false
+
+rss:
+  enabled: false                      # MQ Worker 模式关闭后台轮询，避免争抢采集账号
+  poll_interval: 3600                 # 轮询间隔（秒），1 小时一次
+  articles_per_poll: 10               # 每次拉取文章数
+
+# RabbitMQ 配置（与 we-mp-rss-kotlin 生产环境一致）
+rabbitmq:
+  host: "rabbitmqamqp.topviewclub.cn"
+  port: 5672
+  username: "admin"
+  password: "Topview@123666rabbitmq"
+  pro_virtual_host: "pro"
+  test_virtual_host: "test"
+  xdag_virtual_host: "xdag"
+  thdag_virtual_host: "thdag"
+  reconnect_initial_delay_ms: 5000
+  reconnect_max_delay_ms: 60000
+  max_task_retry: 5                   # 任务最大重试次数，超过进死信队列
+  task_retry_delay_ms: 60000
+
+# 通知机器人配置（来自 we-mp-rss 实际配置）
+notification:
+  # 企业微信群机器人（来自 we-mp-rss-kotlin/config.yaml）
+  wecom_webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=4c8f34af-ef6b-415a-a447-99c83f1fc997"
+  # 飞书机器人（来自 we-mp-rss/we-mp-rss/config.yaml）
+  feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/d03101e9-50a2-41fc-8bff-1af8d8e428c8"
+  # 同一事件通知最小间隔（秒），避免重复推送
+  interval: 300
+
+# 适配壳鉴权密钥
+# 与 Worker 的 config.yaml 中 password 保持一致，Worker 无需修改任何配置
+# Worker 登录时传 username=admin password=admin@123，适配壳取 password 字段校验
+adapter:
+  api_key: "admin@123"
+
+# 微信读书回退通道（appmsgpublish 频控时的降级方案）
+# 官方直连 weread.qq.com，不依赖第三方代理（weread.111965.xyz 已废弃）
+weread:
+  web_base_url: "https://weread.qq.com"   # 官方 Web 接口
+  credentials_file: data/.weread_web_credentials.json   # 旧单账号文件（启动时自动迁移入账号池后删除）
+
+  # 多账号池
+  account_dir: data/weread_accounts        # 账号池存储目录（每账号一个 {vid}.json）
+  freq_control_cooldown: 300               # 频控冷却时长（秒），到期自动恢复可用
+
+  # wr_skey 双层刷新保活（wr_skey 有效期 5400s=1.5h，刷新间隔必须 < 5400s）
+  refresh_interval: 3000        # 主动刷新间隔（秒），50 分钟
+  refresh_fail_threshold: 3     # 连续刷新失败达到阈值才触发重新扫码
+  auto_relogin_enabled: false   # Worker 模式由运维手动触发扫码，避免启动时自动干扰
+
+  # 翻页控制（降低频率风控）
+  content_interval: 5           # 翻页基础间隔（秒）
+  content_jitter: 5             # 随机抖动（秒），实际 = base + random(0, jitter)
+  max_pages: 50                 # 最大翻页数
+  page_size: 10                 # 每页条数（官方默认 10）
+
+  # 请求节流（防多任务并发叠加触发风控踢登录）
+  max_concurrent_per_account: 1 # 单账号同时在途请求数（同账号完全串行）
+  min_request_interval: 2       # 同一账号两次实际请求最小间隔（秒），跨任务兜底
+
+  # 空页重试（频控会返回空数组，不能当成"没有更多文章"）
+  empty_retry_max: 3            # 连续空页达到该阈值才判定"没有更多"
+  empty_retry_backoff: 15       # 空页重试退避（秒）
+
+  # 预热（拉文章前先调公众号信息接口触发关联）
+  warmup_enabled: true
+
+# 主通道（appmsgpublish）重试策略
+wx:
+  main:
+    enabled: false              # 200013 已确认是永久失效标志；默认不再请求主微信接口
+    retry_max: 3                # 仅在人工启用主通道时生效
+    backoff_base: 5             # 退避基础（秒）：5 → 10 → 20 ...
+    backoff_max: 60             # 退避上限（秒）
+    degraded_duration: 60       # 未知临时限流的降级时间；200013 不会自动恢复
+
+# 当前上线版本不依赖 ADB。需要设备自动扫码恢复时再显式开启。
+adb:
+  enabled: false
+  poll_interval_ms: 15000

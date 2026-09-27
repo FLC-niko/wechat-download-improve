@@ -244,8 +244,15 @@ object WeReadWebAuth {
                         val logicCode = obj.get("logicCode")?.asString ?: ""
                         when (logicCode) {
                             "LOGIN_TIMEOUT" -> {
-                                logger.warn("微信读书扫码等待超时")
-                                return null
+                                // 单次 getLoginInfo 长轮询约 60s；AAOS 侧拉起微信、扫码并等
+                                // WebView 渲染经常需要更久。只要总 deadline 未到就继续下一轮，
+                                // 不要在第一轮 60s 边界就放弃（否则扫码稍慢就整体失败）。
+                                if (System.currentTimeMillis() + 1_000L < deadline) {
+                                    logger.info("微信读书本轮长轮询超时，继续等待扫码确认（剩余 ${(deadline - System.currentTimeMillis()) / 1000}s）")
+                                } else {
+                                    logger.warn("微信读书扫码等待超时")
+                                    return null
+                                }
                             }
                             "NEED_OTP", "OTP_EXPIRED", "OTP_NOT_MATCH" -> {
                                 logger.warn("微信读书需要双重验证(OTP): $logicCode，当前暂不支持自动处理")

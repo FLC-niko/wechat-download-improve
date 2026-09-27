@@ -353,9 +353,38 @@ class AdbUserOperations(
         return reset.exitCode == 0
     }
 
-    /** 辅助启动 AAOS 应用 */
+    /**
+     * AAOS 微信读书登录无障碍服务是否已启用。
+     *
+     * 登录链由 AAOS 承接时，服务端只负责推码和下发任务；若服务未在
+     * `enabled_accessibility_services` 中启用，任务会无人执行，必须回退坐标管线。
+     */
+    fun isAaosLoginServiceEnabled(slot: DeviceSlot): Boolean {
+        val result = run(listOf(
+            "-s", slot.serial, "shell", "settings", "get", "secure", "enabled_accessibility_services",
+        ))
+        if (result.exitCode != 0) return false
+        val service = "$aaosPackage/com.topviewclub.crawling.service.wechat.weread.WeReadLoginOperationService"
+        return result.stdout.split(':', '\n').any { it.trim() == service }
+    }
+
+    /**
+     * 辅助启动 AAOS 微信读书登录任务。
+     *
+     * 先用 adb shell 把微信扫一扫拉到前台（shell 拉起不受后台启动限制，无障碍服务
+     * 从桌面启动微信会被系统拦截）；随后 AAOS 的 StartWechatScanActivity 检测到
+     * 扫一扫已在微信栈顶后直接接力，CrawlingActivity 派发任务后会自行退到后台。
+     */
     fun startWeReadLogin(slot: DeviceSlot): Boolean {
         val wake = run(listOf("-s", slot.serial, "shell", "input", "keyevent", "224"))
+        run(listOf(
+            "-s", slot.serial, "shell", "am", "start", "--user", slot.userId.toString(),
+            "-a", "android.intent.action.VIEW",
+            "-n", "com.tencent.mm/.ui.LauncherUI",
+            "--ez", "LauncherUI.From.Scaner.Shortcut", "true",
+            "-f", "0x14000000",
+        ))
+        Thread.sleep(1200)
         val start = run(listOf(
             "-s", slot.serial, "shell", "am", "start", "--user", slot.userId.toString(),
             "-n", aaosActivity,

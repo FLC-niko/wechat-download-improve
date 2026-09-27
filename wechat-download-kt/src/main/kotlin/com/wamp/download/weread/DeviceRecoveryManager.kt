@@ -116,11 +116,16 @@ class DeviceRecoveryManager(
                     continue
                 }
 
+                // AAOS 优先：登录链由手机端无障碍服务执行，服务端只推码 + 下发任务，
+                // 从根上避免服务端 ADB 与 AAOS 任务同时操控微信造成冲突。
+                // 服务未安装/未启用/开关关闭时回退服务端 ADB 坐标穿透管线。
+                val aaosLoginAvailable = AppConfig.adbAaosLoginEnabled &&
+                    operations.isReady(slot) &&
+                    operations.isAaosLoginServiceEnabled(slot)
+
                 try {
-                    // 双轨调度：如果是老版本环境且安装了 AAOS，走经典 AAOS 无障碍全自动路线；
-                    // 现代环境（Android 14 / HyperOS / 微信 8.0.76+）走坐标穿透管线
-                    if (slot.isLegacyRoute && operations.isReady(slot)) {
-                        logger.info("设备命中经典 AAOS 路线，启动无障碍全自动登录: vid=$vid, serial=${slot.serial}")
+                    if (aaosLoginAvailable) {
+                        logger.info("AAOS 无障碍链承接登录，下发 weread_login 任务: vid=$vid, serial=${slot.serial}")
                         if (!operations.startWeReadLogin(slot)) {
                             logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
                             lastFailureReason = "自动扫码启动失败"
@@ -142,7 +147,10 @@ class DeviceRecoveryManager(
                         }
                     }
 
-                    val credentials = WeReadWebAuth.pollLoginCredentials(login.first, timeoutSeconds = 60)
+                    val credentials = WeReadWebAuth.pollLoginCredentials(
+                        login.first,
+                        timeoutSeconds = if (aaosLoginAvailable) AppConfig.adbAaosLoginPollTimeout else 60,
+                    )
                     if (credentials == null) {
                         logger.warn("微信读书自动恢复扫码超时: vid=$vid")
                         lastFailureReason = "ADB 扫码登录超时"

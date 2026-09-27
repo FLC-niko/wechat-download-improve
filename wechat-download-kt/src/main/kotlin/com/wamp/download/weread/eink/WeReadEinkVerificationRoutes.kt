@@ -119,6 +119,36 @@ internal fun einkVerificationHtml(nonce: String): String = """
         const button = document.getElementById('verify');
         const statusBox = document.getElementById('status');
         const completeUrl = '/api/weread/eink/verify/$nonce/complete';
+        const statusUrl = '/api/weread/eink/verify/status';
+        let pollTimer = null;
+
+        function stopPolling() {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        // The server-side probe can wait for background E-Ink sync to yield (up to ~2 minutes).
+        // Poll the status endpoint so the page reflects progress instead of appearing stuck.
+        function startPolling() {
+          stopPolling();
+          pollTimer = setInterval(async () => {
+            try {
+              const resp = await fetch(statusUrl, {cache: 'no-store', credentials: 'same-origin'});
+              const st = await resp.json();
+              if (st.state === 'SUCCEEDED') {
+                stopPolling();
+                statusBox.textContent = '验证成功，E-Ink 通道已恢复。';
+                button.disabled = true;
+              } else if (st.state === 'FAILED' || st.state === 'EXPIRED') {
+                stopPolling();
+                statusBox.textContent = st.lastError || '恢复探测未通过，请重新获取验证链接。';
+                button.disabled = false;
+              } else if (st.state === 'VERIFYING') {
+                statusBox.textContent = '服务器正在执行恢复探测（后台同步已让位，最多约 2 分钟）…';
+              }
+            } catch (_) { /* keep polling */ }
+          }, 3000);
+        }
+
         button.addEventListener('click', () => {
           statusBox.textContent = '正在打开验证码…';
           const captcha = new TencentCaptcha('2044038556', async (result) => {
@@ -127,7 +157,8 @@ internal fun einkVerificationHtml(nonce: String): String = """
               return;
             }
             button.disabled = true;
-            statusBox.textContent = '验证码通过，正在探测 E-Ink 通道…';
+            statusBox.textContent = '验证码通过，正在探测 E-Ink 通道（后台同步让位中）…';
+            startPolling();
             try {
               const response = await fetch(completeUrl, {
                 method: 'POST',
@@ -137,6 +168,7 @@ internal fun einkVerificationHtml(nonce: String): String = """
                 body: JSON.stringify({ticket: result.ticket, randstr: result.randstr})
               });
               const payload = await response.json();
+              stopPolling();
               statusBox.textContent = payload.message || (response.ok ? '恢复成功。' : '恢复失败。');
               if (!response.ok && payload.nextUrl) {
                 const link = document.createElement('a');
@@ -149,8 +181,8 @@ internal fun einkVerificationHtml(nonce: String): String = """
                 button.disabled = false;
               }
             } catch (_) {
-              statusBox.textContent = '提交失败，请检查网络后获取新链接重试。';
-              button.disabled = false;
+              // Do not abort the server-side probe; keep polling until the status settles.
+              statusBox.textContent = '提交响应中断，正在通过状态接口确认恢复结果…';
             }
           }, {});
           captcha.show();
