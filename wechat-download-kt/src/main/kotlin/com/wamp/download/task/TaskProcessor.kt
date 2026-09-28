@@ -49,8 +49,8 @@ class TaskProcessor(
     private val einkSyncService: WeReadEinkSyncService? = null,
     private val einkSyncServiceProvider: (() -> WeReadEinkSyncService?)? = null,
     private val einkRequestAllowed: () -> Boolean = WeReadEinkRuntime::canAttemptTaskSync,
-    private val einkRequestSucceeded: () -> Unit = WeReadEinkRuntime::recordTaskRequestSuccess,
-    private val einkRequestFailed: (Throwable) -> Unit = WeReadEinkRuntime::recordTaskRequestFailure,
+    private val einkRequestSucceeded: (WeReadEinkSyncService) -> Unit = WeReadEinkRuntime::recordTaskRequestSuccess,
+    private val einkRequestFailed: (WeReadEinkSyncService, Throwable) -> Unit = WeReadEinkRuntime::recordTaskRequestFailure,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(TaskProcessor::class.java)
@@ -364,7 +364,7 @@ class TaskProcessor(
         service ?: return null
         return try {
             val syncResult = service.syncIfNeeded(subscription, startTs, endTs)
-            if (!syncResult.cacheCovered) einkRequestSucceeded()
+            if (!syncResult.cacheCovered) einkRequestSucceeded(service)
 
             val (articles, total) = ArticleStore.getByFakeidAndRange(
                 subscription.fakeid,
@@ -384,7 +384,7 @@ class TaskProcessor(
                 detail = if (covered) "range-covered" else "sync-finished-without-range-coverage",
             )
         } catch (error: Exception) {
-            einkRequestFailed(error)
+            einkRequestFailed(service, error)
             logger.warn(
                 "【E-Ink】同步失败，转 Web 回退: fakeid=${subscription.fakeid.take(8)}..., ${error.message}",
                 error,

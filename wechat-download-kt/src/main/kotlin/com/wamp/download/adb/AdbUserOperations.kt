@@ -25,8 +25,11 @@ class AdbUserOperations(
     companion object {
         // 关键按钮的屏幕比率坐标（多机型自适应，对齐 1080x2460、1200x2670 等不同分辨率）
         // 1. 扫一扫右下角相册图标中心比率 (1080x2460 -> 956, 2098)
+        //    微信扫一扫存在两套 UI：标准版相册按钮 y≈0.853；
+        //    “拍照给AI”新版按钮更靠下 y≈0.928（AAOS 侧同款双坐标策略）。
         const val RATIO_ALBUM_ICON_X = 0.885f
         const val RATIO_ALBUM_ICON_Y = 0.853f
+        const val RATIO_ALBUM_ICON_FALLBACK_Y = 0.928f
 
         // 2. 相册选图第二格相片中心比率 (第一格固定为“拍摄照片”，1080x2460 -> 405, 365)
         const val RATIO_FIRST_PHOTO_X = 0.375f
@@ -293,9 +296,15 @@ class AdbUserOperations(
         if (startScan.exitCode != 0) return ScanConfirmResult.LAUNCH_FAILED
         Thread.sleep(1200)
 
-        // 3. 点击右下角相册图标 (自适应比率点击)
+        // 3. 点击右下角相册图标。先试标准版坐标；若仍停留在扫一扫，
+        //    改用“拍照给AI”新版的兜底坐标，避免在旧位置空点导致整轮超时。
         tapRatio(slot, RATIO_ALBUM_ICON_X, RATIO_ALBUM_ICON_Y)
         Thread.sleep(1500)
+        if (!isPhotoPickerOpen(slot)) {
+            logger.info("标准相册按钮未进入选择器，尝试新版扫一扫兜底坐标: slot=${slot.slotKey}")
+            tapRatio(slot, RATIO_ALBUM_ICON_X, RATIO_ALBUM_ICON_FALLBACK_Y)
+            Thread.sleep(1500)
+        }
 
         // 4. 选中第一张新鲜二维码（第二格相片自适应比率点击）
         tapRatio(slot, RATIO_FIRST_PHOTO_X, RATIO_FIRST_PHOTO_Y)
@@ -333,6 +342,16 @@ class AdbUserOperations(
         }
         Thread.sleep(1000)
         return ScanConfirmResult.SUCCESS
+    }
+
+    /** 当前前台是否已进入微信相册选择器（扫一扫两套 UI 的兜底判断）。 */
+    private fun isPhotoPickerOpen(slot: DeviceSlot): Boolean {
+        val result = run(listOf("-s", slot.serial, "shell", "dumpsys", "activity", "activities"))
+        if (result.exitCode != 0) return false
+        val resumed = result.stdout.lineSequence()
+            .firstOrNull { it.contains("mResumedActivity") }
+            .orEmpty()
+        return resumed.contains("AlbumPreviewUI") || resumed.contains("GalleryEntryUI")
     }
 
     /**

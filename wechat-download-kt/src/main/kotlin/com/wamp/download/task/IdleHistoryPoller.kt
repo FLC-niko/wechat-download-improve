@@ -91,7 +91,7 @@ object IdleHistoryPoller {
                     shouldContinue = RealtimeTaskActivity::isBackgroundWorkAllowed,
                 )
                 
-                WeReadEinkRuntime.recordTaskRequestSuccess()
+                WeReadEinkRuntime.recordTaskRequestSuccess(einkService)
                 
                 logger.info("闲时回源成功: fakeid=${sub.fakeid.take(8)}..., 获取 ${result.fetchedArticles} 篇")
                 
@@ -102,7 +102,7 @@ object IdleHistoryPoller {
                 break
             } catch (e: Exception) {
                 logger.warn("闲时回源异常: fakeid=${sub.fakeid.take(8)}..., ${e.message}")
-                WeReadEinkRuntime.recordTaskRequestFailure(e)
+                WeReadEinkRuntime.recordTaskRequestFailure(einkService, e)
                 // If it was a human verification error, break the entire poll loop
                 if (!WeReadEinkRuntime.canAttemptTaskSync()) {
                     logger.warn("E-Ink 进入熔断，暂停本轮闲时回源")

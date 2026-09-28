@@ -7,63 +7,82 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.io.IOException
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
-/** Owns the live E-Ink session and can reload it immediately after QR login. */
+/**
+ * E-Ink 多账号运行时。
+ *
+ * - 每个账号（vid）拥有独立的 session/service、鉴权状态、探测历史与人工验证提醒窗口；
+ * - 任务路径按 least_used 选号，`HUMAN_VERIFY_REQUIRED` / `REAUTH_*` 的账号自动熔断跳过，
+ *   多账号之间互不拖累；
+ * - 每个账号使用自己的设备身份（profile）请求，绝不共享指纹。
+ */
 object WeReadEinkRuntime {
     private val logger = LoggerFactory.getLogger(WeReadEinkRuntime::class.java)
     private val runtimeLock = Any()
     private val credentialWriteLock = Any()
 
-    @Volatile
-    private var activeSession: WeReadEinkSession? = null
+    /** 全部账号运行时（vid → runtime）。 */
+    private val accounts = ConcurrentHashMap<String, AccountRuntime>()
 
+    /** 主账号：状态接口的兼容视图与验证流程的目标账号。 */
     @Volatile
-    private var activeSyncService: WeReadEinkSyncService? = null
-
-    /** Monotonically changes whenever the live session is replaced or invalidated. */
-    @Volatile
-    private var sessionGeneration: Long = 0L
+    private var primaryVid: String? = null
 
     @Volatile
     private var recoveryScope: CoroutineScope? = null
 
+    /** 最近一次被任务/后台路径选中的账号（无 service 参数回传时的兜底定位）。 */
     @Volatile
-    private var authState: String = "UNINITIALIZED"
-
-    @Volatile
-    private var lastProbeAt: Long = 0L
-
-    @Volatile
-    private var lastProbeResult: String = "NEVER"
-
-    @Volatile
-    private var lastProbeError: String? = null
-
-    @Volatile
-    private var lastScheduledSyncAt: Long = 0L
-
-    @Volatile
-    private var lastScheduledSyncResult: String = "NEVER"
-
-    @Volatile
-    private var lastScheduledSyncTarget: String? = null
-
-    private val humanVerificationReported = AtomicBoolean(false)
-
-    /** 上一次 E-Ink 人工验证提醒时间；0 表示无静默（新封禁或已恢复会清零）。 */
-    private val lastHumanVerifyNotificationAt = AtomicLong(0L)
+    private var lastSelectedVid: String? = null
 
     /** 同一封禁期间人工验证提醒最小间隔（3 小时）；恢复成功后再次 -2041 会立即提醒。 */
     private const val HUMAN_VERIFY_REMINDER_INTERVAL_MS = 3 * 60 * 60 * 1000L
 
-    private data class RuntimeSnapshot(
-        val generation: Long,
+    /** 每个账号独立的运行时状态。 */
+    private class AccountRuntime(
+        val record: WeReadEinkAccountRecord,
         val session: WeReadEinkSession,
         val service: WeReadEinkSyncService,
-    )
+    ) {
+        val vid: String get() = record.vid
+
+        /** 每次 session 被替换时递增；用于让旧的异步回调失效。 */
+        @Volatile
+        var generation: Long = 1L
+
+        @Volatile
+        var authState: String = "UNKNOWN"
+
+        @Volatile
+        var lastProbeAt: Long = 0L
+
+        @Volatile
+        var lastProbeResult: String = "NEVER"
+
+        @Volatile
+        var lastProbeError: String? = null
+
+        @Volatile
+        var lastScheduledSyncAt: Long = 0L
+
+        @Volatile
+        var lastScheduledSyncResult: String = "NEVER"
+
+        @Volatile
+        var lastScheduledSyncTarget: String? = null
+
+        @Volatile
+        var lastUsedAt: Long = 0L
+
+        val humanVerificationReported = AtomicBoolean(false)
+
+        val lastHumanVerifyNotificationAt = AtomicLong(0L)
+    }
 
     fun initialize(scope: CoroutineScope? = null): WeReadEinkSyncService? {
         if (scope != null) recoveryScope = scope
@@ -73,46 +92,50 @@ object WeReadEinkRuntime {
     /** Backwards-compatible startup entry point. */
     fun createSyncService(): WeReadEinkSyncService? = initialize()
 
-    fun syncService(): WeReadEinkSyncService? = activeSyncService
+    /** 任务路径的选号入口：返回 least_used 可用账号的 service；全部熔断时返回 null。 */
+    fun syncService(): WeReadEinkSyncService? = selectForTask()?.service
 
-    fun session(): WeReadEinkSession? = activeSession
+    /** 兼容访问：主账号 session（健康检查等旧调用点使用）。 */
+    fun session(): WeReadEinkSession? = synchronized(runtimeLock) { primaryAccount()?.session }
 
-    /** Task requests must not keep replaying an account-side challenge or an active re-login. */
     fun canAttemptTaskSync(): Boolean = synchronized(runtimeLock) {
-        !taskSyncSuppressed(authState)
+        accounts.values.any { !taskSyncSuppressed(it.authState) }
     }
 
     fun requiresHumanVerification(): Boolean = synchronized(runtimeLock) {
-        authState == "HUMAN_VERIFY_REQUIRED"
+        primaryAccount()?.authState == "HUMAN_VERIFY_REQUIRED"
     }
 
     /** Keeps automatic recovery detection, but backs off aggressively while human action is required. */
     fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = synchronized(runtimeLock) {
-        !healthProbeSuppressed(
-            state = authState,
-            lastProbeAt = lastProbeAt,
-            now = now,
-            humanVerifyProbeIntervalMs = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L,
-        )
-    }
-
-    /** Feeds task-path outcomes back into the shared circuit breaker. */
-    fun recordTaskRequestSuccess() {
-        val snapshot = currentSnapshot() ?: return
-        if (updateIfCurrent(snapshot) { authState = "HEALTHY" }) {
-            humanVerificationReported.set(false)
-            lastHumanVerifyNotificationAt.set(0L)
+        accounts.values.any {
+            !healthProbeSuppressed(
+                state = it.authState,
+                lastProbeAt = it.lastProbeAt,
+                now = now,
+                humanVerifyProbeIntervalMs = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L,
+            )
         }
     }
 
-    fun recordTaskRequestFailure(error: Throwable) {
-        val snapshot = currentSnapshot() ?: return
-        val updated = updateIfCurrent(snapshot) {
-            authState = authStateAfterFailure(snapshot.session.refreshStatus().authExpired, error)
+    /** 任务请求成功：把结果记到对应账号（service 精确定位，缺失时回退最近选号/主账号）。 */
+    fun recordTaskRequestSuccess(service: WeReadEinkSyncService? = null) {
+        val account = accountFor(service) ?: return
+        updateAccount(account.vid) {
+            it.authState = "HEALTHY"
+            it.humanVerificationReported.set(false)
+            it.lastHumanVerifyNotificationAt.set(0L)
+        }
+    }
+
+    fun recordTaskRequestFailure(service: WeReadEinkSyncService?, error: Throwable) {
+        val account = accountFor(service) ?: return
+        val updated = updateAccount(account.vid) {
+            it.authState = authStateAfterFailure(it.session.refreshStatus().authExpired, error)
         }
         if (!updated) return
         if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
-            notifyHumanVerification(error)
+            notifyHumanVerification(account, error)
         } else {
             ensureAutoRecovery()
         }
@@ -128,9 +151,9 @@ object WeReadEinkRuntime {
         credentials: WeReadEinkCredentials,
         deviceModel: WeReadEinkDeviceModel? = null,
     ) {
-        // Invalidate the old session before writing the QR result. This closes the race where a
-        // task holding the old session could persist its rotated snapshot after QR login.
-        synchronized(runtimeLock) { sessionGeneration++ }
+        // Invalidate live sessions before writing the QR result. This closes the race where a
+        // task holding an old session could persist its rotated snapshot after QR login.
+        synchronized(runtimeLock) { accounts.values.forEach { it.generation++ } }
         synchronized(credentialWriteLock) {
             val store = accountStore()
             val existing = store.loadRecord(credentials.vid)
@@ -145,31 +168,27 @@ object WeReadEinkRuntime {
             "E-Ink credentials were saved but the runtime could not be reloaded"
         }
         synchronized(runtimeLock) {
-            if (activeSyncService === installedService) {
-                authState = "HEALTHY"
-                humanVerificationReported.set(false)
-                lastHumanVerifyNotificationAt.set(0L)
-                lastProbeAt = System.currentTimeMillis()
-                lastProbeResult = "QR_LOGIN_SUCCEEDED"
-                lastProbeError = null
-            }
+            val account = accounts.values.firstOrNull { it.service === installedService } ?: return@synchronized
+            account.authState = "HEALTHY"
+            account.humanVerificationReported.set(false)
+            account.lastHumanVerifyNotificationAt.set(0L)
+            account.lastProbeAt = System.currentTimeMillis()
+            account.lastProbeResult = "QR_LOGIN_SUCCEEDED"
+            account.lastProbeError = null
         }
     }
 
     fun reload(): WeReadEinkSyncService? = synchronized(runtimeLock) {
         WeReadEinkHumanVerification.reset()
-        val generation = ++sessionGeneration
         synchronized(credentialWriteLock) {
-            reloadLocked(generation)
+            reloadLocked()
         }
     }
 
-    private fun reloadLocked(generation: Long): WeReadEinkSyncService? {
-        resetRuntimeHistory()
+    private fun reloadLocked(): WeReadEinkSyncService? {
         if (!AppConfig.wereadEinkEnabled) {
-            activeSession = null
-            activeSyncService = null
-            authState = "DISABLED"
+            accounts.clear()
+            primaryVid = null
             logger.info("E-Ink 同步通道未启用")
             return null
         }
@@ -177,46 +196,75 @@ object WeReadEinkRuntime {
         val records = try {
             accountStore().loadAll()
         } catch (error: Exception) {
-            activeSession = null
-            activeSyncService = null
-            authState = "CREDENTIAL_LOAD_FAILED"
+            accounts.clear()
+            primaryVid = null
             logger.warn("E-Ink 凭证读取失败，仅使用本地缓存: ${error.message}")
             return null
         }
-        // 阶段一：多账号加载就绪，运行通道暂时使用第一个账号（后续阶段再做任务选号）。
-        val record = records.firstOrNull()
-        if (record == null) {
-            activeSession = null
-            activeSyncService = null
-            authState = "UNCONFIGURED"
+        if (records.isEmpty()) {
+            accounts.clear()
+            primaryVid = null
             logger.warn("未找到 E-Ink 凭证；可调用 /api/weread/eink/login/start 扫码登录")
             return null
         }
-        val credentials = record.credentials
-        val profile = record.profile()
 
+        val previousPrimary = primaryVid
+        val rebuilt = LinkedHashMap<String, AccountRuntime>(records.size)
+        for (record in records) {
+            val runtime = buildRuntime(record) ?: continue
+            rebuilt[record.vid] = runtime
+        }
+        if (rebuilt.isEmpty()) {
+            accounts.clear()
+            primaryVid = null
+            logger.warn("E-Ink 账号全部初始化失败，仅使用本地缓存")
+            return null
+        }
+
+        accounts.clear()
+        accounts.putAll(rebuilt)
+        primaryVid = when {
+            previousPrimary != null && rebuilt.containsKey(previousPrimary) -> previousPrimary
+            else -> rebuilt.keys.first()
+        }
+        val primary = rebuilt[primaryVid]!!
+        logger.info(
+            "E-Ink 同步通道已加载: active=${primary.vid}, model=${primary.record.deviceModel}, " +
+                "accounts=${rebuilt.size}, " +
+                "expiry=${primary.record.credentials.accessTokenExpiresAt?.let(Instant::ofEpochMilli) ?: "unknown/server-driven"}",
+        )
+        return primary.service
+    }
+
+    /** 为单个账号构建运行时；复用既有账号的统计状态，仅替换 session/service 并递增 generation。 */
+    private fun buildRuntime(record: WeReadEinkAccountRecord): AccountRuntime? {
+        val existing = accounts[record.vid]
+        val generation = (existing?.generation ?: 0L) + 1L
+        val profile = record.profile()
         return try {
+            lateinit var runtime: AccountRuntime
             val session = WeReadEinkSession(
-                initialCredentials = credentials,
+                initialCredentials = record.credentials,
                 credentialStore = accountStore().credentialSink(record.vid),
                 profile = profile,
                 baseUrl = AppConfig.wereadEinkBaseUrl,
-                isCurrentSession = { sessionGeneration == generation },
+                isCurrentSession = {
+                    val current = synchronized(runtimeLock) { accounts[record.vid] }
+                    current === runtime && runtime.generation == generation
+                },
                 persistenceLock = credentialWriteLock,
                 refreshRetryInitialDelayMs = AppConfig.wereadEinkRefreshRetryInitial * 1000L,
                 refreshRetryMaxDelayMs = AppConfig.wereadEinkRefreshRetryMax * 1000L,
                 refreshRequest = { vid, block -> WeReadEinkRequestGate.execute(vid, block) },
-                onRefreshFailure = { error -> handleRefreshFailure(error, generation) },
-                onRefreshSuccess = {
-                    updateAuthStateIfGeneration(generation, "HEALTHY")
-                },
+                onRefreshFailure = { error -> handleRefreshFailure(record.vid, generation, error) },
+                onRefreshSuccess = { updateAccount(record.vid, generation) { it.authState = "HEALTHY" } },
             )
             val service = WeReadEinkSyncService(
                 session = session,
                 baseUrl = AppConfig.wereadEinkBaseUrl,
                 pageSize = AppConfig.wereadEinkPageSize,
                 maxPages = AppConfig.wereadEinkMaxPages,
-                // 每个账号使用自己的设备身份请求，任何请求都不共享全局 profile。
+                // 每个账号使用自己的设备身份请求，绝不共享 profile。
                 clientFactory = { activeSession, url ->
                     WeReadEinkChaptersClient(
                         credentials = activeSession.credentials(),
@@ -226,20 +274,24 @@ object WeReadEinkRuntime {
                     )
                 },
             )
-            activeSession = session
-            activeSyncService = service
-            authState = if (session.refreshStatus().authExpired) "REAUTH_REQUIRED" else "UNKNOWN"
-            logger.info(
-                "E-Ink 同步通道已加载: vid=${credentials.vid}, model=${record.deviceModel}, " +
-                    "accounts=${records.size}, " +
-                    "expiry=${credentials.accessTokenExpiresAt?.let(Instant::ofEpochMilli) ?: "unknown/server-driven"}",
-            )
-            service
+            AccountRuntime(record = record, session = session, service = service).also { built ->
+                built.generation = generation
+                built.authState = when {
+                    existing != null -> existing.authState
+                    session.refreshStatus().authExpired -> "REAUTH_REQUIRED"
+                    else -> "UNKNOWN"
+                }
+                built.lastProbeAt = existing?.lastProbeAt ?: 0L
+                built.lastProbeResult = existing?.lastProbeResult ?: "NEVER"
+                built.lastProbeError = existing?.lastProbeError
+                built.lastScheduledSyncAt = existing?.lastScheduledSyncAt ?: 0L
+                built.lastScheduledSyncResult = existing?.lastScheduledSyncResult ?: "NEVER"
+                built.lastScheduledSyncTarget = existing?.lastScheduledSyncTarget
+                built.lastUsedAt = existing?.lastUsedAt ?: 0L
+                runtime = built
+            }
         } catch (error: Exception) {
-            activeSession = null
-            activeSyncService = null
-            authState = "INITIALIZATION_FAILED"
-            logger.warn("E-Ink 同步通道初始化失败，仅使用本地缓存: ${error.message}")
+            logger.warn("E-Ink 账号初始化失败，已跳过: vid=${record.vid}, ${error.message}")
             null
         }
     }
@@ -249,108 +301,112 @@ object WeReadEinkRuntime {
         now: Long = System.currentTimeMillis(),
         skewMs: Long = AppConfig.wereadEinkRefreshSkew * 1000L,
     ): Boolean {
-        val snapshot = currentSnapshot() ?: return false
-        val session = snapshot.session
-        if (!session.retryPendingPersistence()) {
-            if (isCurrent(snapshot)) {
+        val targets = synchronized(runtimeLock) { accounts.values.toList() }
+        var refreshedAny = false
+        for (account in targets) {
+            val session = account.session
+            if (!session.retryPendingPersistence()) {
                 WebhookNotifier.notify(
                     "weread_eink_persistence_failed",
                     mapOf(
                         "message" to "微信读书 E-Ink 新凭证已在内存生效，但尚未写入磁盘；请检查磁盘空间和目录权限，期间不要重启服务",
+                        "vid" to account.vid,
                         "error" to session.lastPersistenceError(),
                     ),
                 )
             }
-        }
-        if (!isCurrent(snapshot)) return false
-        val credentials = session.credentials()
-        if (session.refreshStatus().authExpired) {
-            if (isCurrent(snapshot)) ensureAutoRecovery()
-            return false
-        }
-        if (!credentials.accessTokenNeedsRefresh(now, skewMs)) return false
-        return try {
-            session.refresh()
-            if (!updateIfCurrent(snapshot) { authState = "HEALTHY" }) return false
-            humanVerificationReported.set(false)
-            lastHumanVerifyNotificationAt.set(0L)
-            logger.info("E-Ink accessToken 已按服务端过期时间续签")
-            true
-        } catch (_: WeReadEinkRefreshBackoffException) {
-            if (isCurrent(snapshot)) ensureAutoRecovery()
-            false
-        } catch (error: Exception) {
-            if (isCurrent(snapshot)) {
-                logger.warn("E-Ink accessToken 主动续签失败，将在鉴权拒绝时再次尝试: ${error.message}")
+            val credentials = session.credentials()
+            if (session.refreshStatus().authExpired) {
+                ensureAutoRecovery()
+                continue
             }
-            false
+            if (!credentials.accessTokenNeedsRefresh(now, skewMs)) continue
+            try {
+                session.refresh()
+                updateAccount(account.vid) {
+                    it.authState = "HEALTHY"
+                    it.humanVerificationReported.set(false)
+                    it.lastHumanVerifyNotificationAt.set(0L)
+                }
+                logger.info("E-Ink accessToken 已按服务端过期时间续签: vid=${account.vid}")
+                refreshedAny = true
+            } catch (_: WeReadEinkRefreshBackoffException) {
+                ensureAutoRecovery()
+            } catch (error: Exception) {
+                logger.warn("E-Ink accessToken 主动续签失败，将在鉴权拒绝时再次尝试: vid=${account.vid}, ${error.message}")
+            }
         }
+        return refreshedAny
     }
 
     /** Uses one known public-account id for a real authenticated probe without advancing sync state. */
     fun probe(): Boolean {
         val verificationProbe = WeReadEinkRequestGate.isVerificationProbeRequest()
-        val snapshot = currentSnapshot() ?: return false
-        if (!verificationProbe) return probeWithSnapshot(snapshot)
-        // While the captcha probe runs, background E-Ink requests yield instead of competing for
-        // the gate. They wait and resume afterwards, so no task or sync cursor can be lost.
-        val vid = snapshot.session.credentials().vid
-        WeReadEinkRequestGate.beginVerification(vid)
-        return try {
-            probeWithSnapshot(snapshot)
-        } finally {
-            WeReadEinkRequestGate.endVerification(vid)
+        val targets = synchronized(runtimeLock) {
+            if (verificationProbe) {
+                // 人工验证票据只属于主账号：验证后只探测目标账号，避免票据被其他账号消耗。
+                listOfNotNull(primaryAccount())
+            } else {
+                accounts.values.sortedBy { it.vid }
+            }
         }
+        if (targets.isEmpty()) return false
+        var anySucceeded = false
+        for (account in targets) {
+            if (probeAccount(account)) anySucceeded = true
+        }
+        return anySucceeded
     }
 
-    private fun probeWithSnapshot(snapshot: RuntimeSnapshot): Boolean {
-        val service = snapshot.service
-        val target = SubscriptionStore.list(limit = PROBE_SUBSCRIPTION_LIMIT).first
-            .firstOrNull(service::canSync)
-        if (target == null) {
-            updateIfCurrent(snapshot) {
-                lastProbeAt = System.currentTimeMillis()
-                lastProbeResult = "NO_TARGET"
-                lastProbeError = null
+    private fun probeAccount(account: AccountRuntime): Boolean {
+        val vid = account.vid
+        val verificationProbe = WeReadEinkRequestGate.isVerificationProbeRequest()
+        if (verificationProbe) WeReadEinkRequestGate.beginVerification(vid)
+        try {
+            val target = SubscriptionStore.list(limit = PROBE_SUBSCRIPTION_LIMIT).first
+                .firstOrNull(account.service::canSync)
+            if (target == null) {
+                updateAccount(vid) {
+                    it.lastProbeAt = System.currentTimeMillis()
+                    it.lastProbeResult = "NO_TARGET"
+                    it.lastProbeError = null
+                }
+                return false
             }
-            return false
-        }
-
-        return try {
-            if (!isCurrent(snapshot)) return false
-            service.probe(target)
-            val updated = updateIfCurrent(snapshot) {
-                authState = "HEALTHY"
-                lastProbeAt = System.currentTimeMillis()
-                lastProbeResult = "SUCCESS"
-                lastProbeError = null
+            account.service.probe(target)
+            val updated = updateAccount(vid) {
+                it.authState = "HEALTHY"
+                it.lastProbeAt = System.currentTimeMillis()
+                it.lastProbeResult = "SUCCESS"
+                it.lastProbeError = null
             }
             if (updated) {
-                humanVerificationReported.set(false)
-                lastHumanVerifyNotificationAt.set(0L)
+                account.humanVerificationReported.set(false)
+                account.lastHumanVerifyNotificationAt.set(0L)
             }
-            updated
+            return updated
         } catch (error: Exception) {
-            val updated = updateIfCurrent(snapshot) {
-                val refresh = snapshot.session.refreshStatus()
-                authState = authStateAfterFailure(refresh.authExpired, error)
-                lastProbeAt = System.currentTimeMillis()
-                lastProbeResult = when (error) {
+            val updated = updateAccount(vid) {
+                it.authState = authStateAfterFailure(it.session.refreshStatus().authExpired, error)
+                it.lastProbeAt = System.currentTimeMillis()
+                it.lastProbeResult = when (error) {
                     is WeReadEinkApiException -> error.kind.name
                     is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
                     is WeReadEinkParseException -> "PARSE_ERROR"
                     else -> "ERROR"
                 }
-                lastProbeError = error.message.orEmpty().take(500)
+                it.lastProbeError = error.message.orEmpty().take(500)
             }
             if (updated) {
                 if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
-                    notifyHumanVerification(error)
+                    notifyHumanVerification(account, error)
                 } else {
                     ensureAutoRecovery()
                 }
             }
-            false
+            return false
+        } finally {
+            if (verificationProbe) WeReadEinkRequestGate.endVerification(vid)
         }
     }
 
@@ -362,45 +418,52 @@ object WeReadEinkRuntime {
         // -2041 is an account-side challenge. Replaying a different subscription every minute
         // cannot solve it and only adds risk; the slower health probe remains responsible for
         // observing recovery after the user completes verification in the official client.
-        if (scheduledSyncSuppressed(authState) || !backgroundWorkAllowed()) return false
-        val snapshot = currentSnapshot() ?: return false
-        val service = snapshot.service
-        if (snapshot.session.refreshStatus().authExpired) {
-            if (isCurrent(snapshot)) ensureAutoRecovery()
+        if (!backgroundWorkAllowed()) return false
+        val account = synchronized(runtimeLock) {
+            accounts.values
+                .filter { !scheduledSyncSuppressed(it.authState) }
+                .minWithOrNull(compareBy<AccountRuntime> { it.lastUsedAt }.thenBy { it.vid })
+                ?.also {
+                    it.lastUsedAt = System.currentTimeMillis()
+                    lastSelectedVid = it.vid
+                }
+        } ?: return false
+        if (account.session.refreshStatus().authExpired) {
+            ensureAutoRecovery()
             return false
         }
+        val service = account.service
         val target = SubscriptionStore.list(limit = SCHEDULED_SYNC_SUBSCRIPTION_LIMIT).first
             .asSequence()
             .filter(service::canSync)
             .firstOrNull { service.isSyncDue(it, AppConfig.wereadEinkSyncInterval, now) }
             ?: return false
 
-        if (!updateIfCurrent(snapshot) {
-                lastScheduledSyncAt = System.currentTimeMillis()
-                lastScheduledSyncTarget = target.fakeid
-            }
-        ) return false
+        updateAccount(account.vid) {
+            it.lastScheduledSyncAt = System.currentTimeMillis()
+            it.lastScheduledSyncTarget = target.fakeid
+        }
         return try {
             service.sync(target, backgroundWorkAllowed)
-            val updated = updateIfCurrent(snapshot) {
-                authState = "HEALTHY"
-                lastScheduledSyncResult = "SUCCESS"
+            val updated = updateAccount(account.vid) {
+                it.authState = "HEALTHY"
+                it.lastScheduledSyncResult = "SUCCESS"
             }
             if (updated) {
-                humanVerificationReported.set(false)
-                lastHumanVerifyNotificationAt.set(0L)
+                account.humanVerificationReported.set(false)
+                account.lastHumanVerifyNotificationAt.set(0L)
             }
             updated
         } catch (_: WeReadEinkBackgroundYieldException) {
-            updateIfCurrent(snapshot) { lastScheduledSyncResult = "YIELDED_TO_REALTIME_TASK" }
-            logger.info("E-Ink 后台增量同步已让出给实时任务")
+            updateAccount(account.vid) { it.lastScheduledSyncResult = "YIELDED_TO_REALTIME_TASK" }
+            logger.info("E-Ink 后台增量同步已让出给实时任务: vid=${account.vid}")
             false
         } catch (error: Exception) {
-            val updated = updateIfCurrent(snapshot) {
+            val updated = updateAccount(account.vid) {
                 if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
-                    authState = "HUMAN_VERIFY_REQUIRED"
+                    it.authState = "HUMAN_VERIFY_REQUIRED"
                 }
-                lastScheduledSyncResult = when (error) {
+                it.lastScheduledSyncResult = when (error) {
                     is WeReadEinkApiException -> error.kind.name
                     is WeReadEinkRefreshBackoffException -> "REFRESH_BACKOFF"
                     else -> "FAILED"
@@ -408,48 +471,47 @@ object WeReadEinkRuntime {
             }
             if (updated) {
                 if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
-                    notifyHumanVerification(error)
+                    notifyHumanVerification(account, error)
                 } else {
                     ensureAutoRecovery()
                 }
-                logger.warn("E-Ink 后台增量同步失败: fakeid=${target.fakeid.take(8)}..., ${error.message}")
+                logger.warn("E-Ink 后台增量同步失败: vid=${account.vid}, fakeid=${target.fakeid.take(8)}..., ${error.message}")
             }
             false
         }
     }
 
     fun ensureAutoRecovery(): Boolean {
-        val snapshot = currentSnapshot() ?: return false
-        if (!snapshot.session.refreshStatus().authExpired) return false
         val scope = recoveryScope ?: return false
         return synchronized(runtimeLock) {
-            if (!matchesCurrent(snapshot)) return@synchronized false
-            authState = if (WeReadEinkLoginCoordinator.isInProgress()) {
+            val expired = accounts.values.firstOrNull { it.session.refreshStatus().authExpired }
+                ?: return@synchronized false
+            expired.authState = if (WeReadEinkLoginCoordinator.isInProgress()) {
                 "REAUTH_IN_PROGRESS"
             } else {
                 "REAUTH_REQUIRED"
             }
             if (!AppConfig.wereadEinkAutoQrNotificationEnabled) return@synchronized false
             val started = WeReadEinkLoginCoordinator.start(scope, automatic = true)
-            if (started || WeReadEinkLoginCoordinator.isInProgress()) authState = "REAUTH_IN_PROGRESS"
+            if (started || WeReadEinkLoginCoordinator.isInProgress()) expired.authState = "REAUTH_IN_PROGRESS"
             started
         }
     }
 
-    private fun handleRefreshFailure(error: Throwable, generation: Long) {
+    private fun handleRefreshFailure(vid: String, generation: Long, error: Throwable) {
         val authExpired = error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.AUTH_EXPIRED
         val humanVerify = error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY
-        if (!updateAuthStateIfGeneration(
-                generation,
-                when {
-                    humanVerify -> "HUMAN_VERIFY_REQUIRED"
-                    authExpired -> "REAUTH_REQUIRED"
-                    else -> "REFRESH_BACKOFF"
-                },
-            )
-        ) return
+        val updated = updateAccount(vid, generation) {
+            it.authState = when {
+                humanVerify -> "HUMAN_VERIFY_REQUIRED"
+                authExpired -> "REAUTH_REQUIRED"
+                else -> "REFRESH_BACKOFF"
+            }
+        }
+        if (!updated) return
+        val account = synchronized(runtimeLock) { accounts[vid] } ?: return
         if (humanVerify) {
-            notifyHumanVerification(error as WeReadEinkApiException)
+            notifyHumanVerification(account, error as WeReadEinkApiException)
             return
         }
         if (authExpired) {
@@ -459,11 +521,13 @@ object WeReadEinkRuntime {
                 "微信读书 E-Ink refreshToken 已失效，自动二维码通知已关闭，请调用 /api/weread/eink/login/start 人工恢复"
             }
             recoveryScope?.launch {
-                if (sessionGeneration != generation) return@launch
+                val current = synchronized(runtimeLock) { accounts[vid] }
+                if (current !== account) return@launch
                 WebhookNotifier.notify(
                     "weread_eink_expired",
                     mapOf(
                         "message" to message,
+                        "vid" to vid,
                         "error" to error.message,
                     ),
                 )
@@ -472,27 +536,28 @@ object WeReadEinkRuntime {
         }
     }
 
-    private fun notifyHumanVerification(error: WeReadEinkApiException) {
+    private fun notifyHumanVerification(account: AccountRuntime, error: WeReadEinkApiException) {
         // 同一封禁期间最多每 3 小时提醒一次（防止机器人刷屏）；恢复成功后窗口清零，
         // 新的 -2041 封禁会立即提醒。CAS 保证并发下只有一条提醒发出。
         val now = System.currentTimeMillis()
         while (true) {
-            val last = lastHumanVerifyNotificationAt.get()
+            val last = account.lastHumanVerifyNotificationAt.get()
             if (last > 0L && now - last < HUMAN_VERIFY_REMINDER_INTERVAL_MS) {
                 logger.info(
-                    "E-Ink 人工验证提醒静默中（每 3 小时最多一条），跳过本次: 距上次 ${(now - last) / 60_000} 分钟",
+                    "E-Ink 人工验证提醒静默中（每 3 小时最多一条），跳过本次: vid=${account.vid}, 距上次 ${(now - last) / 60_000} 分钟",
                 )
                 return
             }
-            if (lastHumanVerifyNotificationAt.compareAndSet(last, now)) break
+            if (account.lastHumanVerifyNotificationAt.compareAndSet(last, now)) break
         }
-        humanVerificationReported.set(true)
+        account.humanVerificationReported.set(true)
         val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
         recoveryScope?.launch {
             val textSent = WebhookNotifier.notify(
                 "weread_eink_human_verify",
                 mapOf(
                     "message" to "微信读书 E-Ink 触发 -2041；请点击验证链接或扫描随后发送的二维码",
+                    "vid" to account.vid,
                     "verify_url" to verification.verifyUrl,
                     "expires_at" to verification.expiresAt?.let(Instant::ofEpochMilli)?.toString(),
                     "error" to error.message,
@@ -522,16 +587,18 @@ object WeReadEinkRuntime {
                 }.getOrDefault(false)
             } ?: false
             if (!textSent && !qrSent) {
-                humanVerificationReported.set(false)
+                account.humanVerificationReported.set(false)
             }
         } ?: run {
-            humanVerificationReported.set(false)
+            account.humanVerificationReported.set(false)
             logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")
         }
     }
 
     internal fun allowHumanVerificationNotificationRetry() {
-        humanVerificationReported.set(false)
+        synchronized(runtimeLock) {
+            primaryAccount()?.humanVerificationReported?.set(false)
+        }
     }
 
     internal fun authStateAfterFailure(refreshAuthExpired: Boolean, error: Throwable): String = when {
@@ -561,23 +628,28 @@ object WeReadEinkRuntime {
         now - lastProbeAt < humanVerifyProbeIntervalMs
 
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
-        val snapshot = currentSnapshot()
-        val credentials = snapshot?.session?.credentials()
-            ?: runCatching { accountStore().loadAll().firstOrNull()?.credentials }.getOrNull()
-        val refreshStatus = snapshot?.session?.refreshStatus()
-        val currentAuthState = if (WeReadEinkLoginCoordinator.isInProgress()) {
-            "REAUTH_IN_PROGRESS"
-        } else {
-            authState
+        val primary = synchronized(runtimeLock) { primaryAccount() }
+        val accountViews = synchronized(runtimeLock) {
+            accounts.values.sortedBy { it.vid }.map { accountStatus(it, now) }
         }
-        val runtimeReady = snapshot != null
+        val credentials = primary?.session?.credentials()
+            ?: runCatching { accountStore().loadAll().firstOrNull()?.credentials }.getOrNull()
+        val refreshStatus = primary?.session?.refreshStatus()
+        val currentAuthState = when {
+            primary == null -> "UNINITIALIZED"
+            WeReadEinkLoginCoordinator.isInProgress() -> "REAUTH_IN_PROGRESS"
+            else -> primary.authState
+        }
+        val runtimeReady = primary != null
         val humanVerifyProbeIntervalMs = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L
-        val probeSuppressed = healthProbeSuppressed(
-            state = currentAuthState,
-            lastProbeAt = lastProbeAt,
-            now = now,
-            humanVerifyProbeIntervalMs = humanVerifyProbeIntervalMs,
-        )
+        val probeSuppressed = primary?.let {
+            healthProbeSuppressed(
+                state = currentAuthState,
+                lastProbeAt = it.lastProbeAt,
+                now = now,
+                humanVerifyProbeIntervalMs = humanVerifyProbeIntervalMs,
+            )
+        } ?: false
         return mapOf(
             "enabled" to AppConfig.wereadEinkEnabled,
             "auto_qr_notification_enabled" to AppConfig.wereadEinkAutoQrNotificationEnabled,
@@ -589,8 +661,14 @@ object WeReadEinkRuntime {
             "health_probe_suppressed" to probeSuppressed,
             "human_verify_probe_interval_seconds" to AppConfig.wereadEinkHumanVerifyProbeInterval,
             "human_verification" to WeReadEinkHumanVerification.status(AppConfig.siteUrl),
-            "next_health_probe_at" to if (probeSuppressed) lastProbeAt + humanVerifyProbeIntervalMs else null,
+            "next_health_probe_at" to if (probeSuppressed) {
+                (primary?.lastProbeAt ?: 0L) + humanVerifyProbeIntervalMs
+            } else {
+                null
+            },
             "vid" to credentials?.vid,
+            "active_vid" to primary?.vid,
+            "accounts" to accountViews,
             "has_access_token" to credentials?.hasAccessToken(),
             "has_refresh_token" to (credentials?.refreshToken?.isNotBlank() == true),
             "access_token_issued_at" to credentials?.accessTokenIssuedAt,
@@ -598,22 +676,36 @@ object WeReadEinkRuntime {
             "access_token_expires_at_iso" to credentials?.accessTokenExpiresAt?.let(Instant::ofEpochMilli)?.toString(),
             "seconds_until_expiry" to credentials?.secondsUntilExpiry(now),
             "expiry_source" to if (credentials?.accessTokenExpiresAt == null) "server-rejection" else "server-response",
-            "credentials_persistence_pending" to (activeSession?.hasPendingPersistence() == true),
-            "credentials_persistence_error" to activeSession?.lastPersistenceError(),
-            "last_probe_at" to lastProbeAt.takeIf { it > 0L },
-            "last_probe_result" to lastProbeResult,
-            "last_probe_error" to lastProbeError,
+            "credentials_persistence_pending" to (primary?.session?.hasPendingPersistence() == true),
+            "credentials_persistence_error" to primary?.session?.lastPersistenceError(),
+            "last_probe_at" to primary?.lastProbeAt?.takeIf { it > 0L },
+            "last_probe_result" to (primary?.lastProbeResult ?: "NEVER"),
+            "last_probe_error" to primary?.lastProbeError,
             "last_refresh_attempt_at" to refreshStatus?.lastAttemptAt?.takeIf { it > 0L },
             "last_refresh_success_at" to refreshStatus?.lastSuccessAt?.takeIf { it > 0L },
             "refresh_consecutive_failures" to (refreshStatus?.consecutiveFailures ?: 0),
             "refresh_last_error_kind" to refreshStatus?.lastErrorKind,
             "refresh_last_error" to refreshStatus?.lastError,
             "refresh_next_retry_at" to refreshStatus?.nextRetryAt,
-            "last_scheduled_sync_at" to lastScheduledSyncAt.takeIf { it > 0L },
-            "last_scheduled_sync_result" to lastScheduledSyncResult,
-            "last_scheduled_sync_target" to lastScheduledSyncTarget,
+            "last_scheduled_sync_at" to primary?.lastScheduledSyncAt?.takeIf { it > 0L },
+            "last_scheduled_sync_result" to (primary?.lastScheduledSyncResult ?: "NEVER"),
+            "last_scheduled_sync_target" to primary?.lastScheduledSyncTarget,
         )
     }
+
+    private fun accountStatus(account: AccountRuntime, now: Long): Map<String, Any?> = mapOf(
+        "vid" to account.vid,
+        "device_model" to account.record.deviceModel,
+        "auth_state" to account.authState,
+        "operational" to (account.authState == "HEALTHY"),
+        "task_sync_suppressed" to taskSyncSuppressed(account.authState),
+        "last_used_at" to account.lastUsedAt.takeIf { it > 0L },
+        "last_probe_at" to account.lastProbeAt.takeIf { it > 0L },
+        "last_probe_result" to account.lastProbeResult,
+        "last_probe_error" to account.lastProbeError,
+        "last_scheduled_sync_result" to account.lastScheduledSyncResult,
+        "seconds_until_expiry" to account.session.credentials().secondsUntilExpiry(now),
+    )
 
     /** 多账号存储：旧单文件仅作为首次迁移来源。 */
     private fun accountStore(): WeReadEinkAccountStore =
@@ -622,45 +714,36 @@ object WeReadEinkRuntime {
             legacyFile = File(AppConfig.wereadEinkCredentialsFile),
         )
 
-    private fun currentSnapshot(): RuntimeSnapshot? = synchronized(runtimeLock) {
-        val session = activeSession ?: return@synchronized null
-        val service = activeSyncService ?: return@synchronized null
-        RuntimeSnapshot(sessionGeneration, session, service)
-    }
+    private fun primaryAccount(): AccountRuntime? = primaryVid?.let { accounts[it] }
 
-    private fun isCurrent(snapshot: RuntimeSnapshot): Boolean = synchronized(runtimeLock) {
-        matchesCurrent(snapshot)
-    }
-
-    private fun updateIfCurrent(snapshot: RuntimeSnapshot, update: () -> Unit): Boolean =
-        synchronized(runtimeLock) {
-            if (!matchesCurrent(snapshot)) return@synchronized false
-            update()
-            true
-        }
-
-    private fun matchesCurrent(snapshot: RuntimeSnapshot): Boolean =
-        sessionGeneration == snapshot.generation &&
-            activeSession === snapshot.session &&
-            activeSyncService === snapshot.service
-
-    private fun updateAuthStateIfGeneration(generation: Long, state: String): Boolean =
-        synchronized(runtimeLock) {
-            if (sessionGeneration != generation || activeSession == null || activeSyncService == null) {
-                return@synchronized false
+    /** 任务路径选号：过滤熔断账号后取 least_used，保证多账号分摊与故障隔离。 */
+    private fun selectForTask(): AccountRuntime? = synchronized(runtimeLock) {
+        accounts.values
+            .filter { !taskSyncSuppressed(it.authState) }
+            .minWithOrNull(compareBy<AccountRuntime> { it.lastUsedAt }.thenBy { it.vid })
+            ?.also {
+                it.lastUsedAt = System.currentTimeMillis()
+                lastSelectedVid = it.vid
             }
-            authState = state
-            true
-        }
+    }
 
-    private fun resetRuntimeHistory() {
-        humanVerificationReported.set(false)
-        lastProbeAt = 0L
-        lastProbeResult = "NEVER"
-        lastProbeError = null
-        lastScheduledSyncAt = 0L
-        lastScheduledSyncResult = "NEVER"
-        lastScheduledSyncTarget = null
+    /** 通过 service 实例精确定位账号；缺失时回退最近选号或主账号。 */
+    private fun accountFor(service: WeReadEinkSyncService?): AccountRuntime? = synchronized(runtimeLock) {
+        if (service != null) {
+            accounts.values.firstOrNull { it.service === service }?.let { return@synchronized it }
+        }
+        lastSelectedVid?.let { accounts[it] } ?: primaryAccount()
+    }
+
+    private fun updateAccount(
+        vid: String,
+        generation: Long? = null,
+        update: (AccountRuntime) -> Unit,
+    ): Boolean = synchronized(runtimeLock) {
+        val account = accounts[vid] ?: return@synchronized false
+        if (generation != null && account.generation != generation) return@synchronized false
+        update(account)
+        true
     }
 
     private const val PROBE_SUBSCRIPTION_LIMIT = 1_000
