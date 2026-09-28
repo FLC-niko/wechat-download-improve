@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory
 import java.io.File
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /** Owns the live E-Ink session and can reload it immediately after QR login. */
 object WeReadEinkRuntime {
@@ -52,6 +53,12 @@ object WeReadEinkRuntime {
 
     private val humanVerificationReported = AtomicBoolean(false)
 
+    /** 上一次 E-Ink 人工验证提醒时间；0 表示无静默（新封禁或已恢复会清零）。 */
+    private val lastHumanVerifyNotificationAt = AtomicLong(0L)
+
+    /** 同一封禁期间人工验证提醒最小间隔（3 小时）；恢复成功后再次 -2041 会立即提醒。 */
+    private const val HUMAN_VERIFY_REMINDER_INTERVAL_MS = 3 * 60 * 60 * 1000L
+
     private data class RuntimeSnapshot(
         val generation: Long,
         val session: WeReadEinkSession,
@@ -94,6 +101,7 @@ object WeReadEinkRuntime {
         val snapshot = currentSnapshot() ?: return
         if (updateIfCurrent(snapshot) { authState = "HEALTHY" }) {
             humanVerificationReported.set(false)
+            lastHumanVerifyNotificationAt.set(0L)
         }
     }
 
@@ -124,6 +132,7 @@ object WeReadEinkRuntime {
             if (activeSyncService === installedService) {
                 authState = "HEALTHY"
                 humanVerificationReported.set(false)
+                lastHumanVerifyNotificationAt.set(0L)
                 lastProbeAt = System.currentTimeMillis()
                 lastProbeResult = "QR_LOGIN_SUCCEEDED"
                 lastProbeError = null
@@ -233,6 +242,7 @@ object WeReadEinkRuntime {
             session.refresh()
             if (!updateIfCurrent(snapshot) { authState = "HEALTHY" }) return false
             humanVerificationReported.set(false)
+            lastHumanVerifyNotificationAt.set(0L)
             logger.info("E-Ink accessToken 已按服务端过期时间续签")
             true
         } catch (_: WeReadEinkRefreshBackoffException) {
@@ -284,7 +294,10 @@ object WeReadEinkRuntime {
                 lastProbeResult = "SUCCESS"
                 lastProbeError = null
             }
-            if (updated) humanVerificationReported.set(false)
+            if (updated) {
+                humanVerificationReported.set(false)
+                lastHumanVerifyNotificationAt.set(0L)
+            }
             updated
         } catch (error: Exception) {
             val updated = updateIfCurrent(snapshot) {
@@ -342,7 +355,10 @@ object WeReadEinkRuntime {
                 authState = "HEALTHY"
                 lastScheduledSyncResult = "SUCCESS"
             }
-            if (updated) humanVerificationReported.set(false)
+            if (updated) {
+                humanVerificationReported.set(false)
+                lastHumanVerifyNotificationAt.set(0L)
+            }
             updated
         } catch (_: WeReadEinkBackgroundYieldException) {
             updateIfCurrent(snapshot) { lastScheduledSyncResult = "YIELDED_TO_REALTIME_TASK" }
@@ -426,7 +442,20 @@ object WeReadEinkRuntime {
     }
 
     private fun notifyHumanVerification(error: WeReadEinkApiException) {
-        if (!humanVerificationReported.compareAndSet(false, true)) return
+        // 同一封禁期间最多每 3 小时提醒一次（防止机器人刷屏）；恢复成功后窗口清零，
+        // 新的 -2041 封禁会立即提醒。CAS 保证并发下只有一条提醒发出。
+        val now = System.currentTimeMillis()
+        while (true) {
+            val last = lastHumanVerifyNotificationAt.get()
+            if (last > 0L && now - last < HUMAN_VERIFY_REMINDER_INTERVAL_MS) {
+                logger.info(
+                    "E-Ink 人工验证提醒静默中（每 3 小时最多一条），跳过本次: 距上次 ${(now - last) / 60_000} 分钟",
+                )
+                return
+            }
+            if (lastHumanVerifyNotificationAt.compareAndSet(last, now)) break
+        }
+        humanVerificationReported.set(true)
         val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
         recoveryScope?.launch {
             val textSent = WebhookNotifier.notify(

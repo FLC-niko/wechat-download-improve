@@ -8,6 +8,7 @@ import io.ktor.server.application.call
 import io.ktor.server.request.receive
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondRedirect
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -19,10 +20,12 @@ fun Route.weReadEinkVerificationRoutes() {
     get("/weread/eink/verify/{nonce}") {
         val nonce = call.parameters["nonce"].orEmpty()
         if (!WeReadEinkHumanVerification.canOpen(nonce)) {
+            // 链接过期/已使用后不再返回纯文本死路：页面保留“获取新的验证链接”入口，
+            // 与探测失败后的 nextUrl 体验一致，机器人里点开的旧链接也能一键换新。
             call.respondText(
-                "验证链接不存在、已过期或已经使用，请获取最新链接。",
+                einkVerificationExpiredHtml(),
                 status = HttpStatusCode.Gone,
-                contentType = ContentType.Text.Plain,
+                contentType = ContentType.parse("text/html; charset=UTF-8"),
             )
             return@get
         }
@@ -67,6 +70,41 @@ fun Route.weReadEinkVerificationRoutes() {
     get("/api/weread/eink/verify/status") {
         call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
         call.respond(WeReadEinkHumanVerification.status(AppConfig.siteUrl))
+    }
+
+    get("/weread/eink/verify/refresh") {
+        call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
+        val current = WeReadEinkHumanVerification.status(AppConfig.siteUrl)
+        when (current.state) {
+            WeReadEinkVerificationState.WAITING -> {
+                // 已有未过期的等待链接：直接复用，避免不断生成新挑战。
+                val url = current.verifyUrl
+                if (!url.isNullOrBlank()) {
+                    call.respondRedirect(url)
+                    return@get
+                }
+            }
+            WeReadEinkVerificationState.VERIFYING -> {
+                call.respondText(
+                    einkVerificationNoticeHtml("上一次验证正在处理中，请稍候片刻再打开链接查看结果。"),
+                    contentType = ContentType.parse("text/html; charset=UTF-8"),
+                )
+                return@get
+            }
+            else -> Unit
+        }
+        // IDLE / EXPIRED / FAILED / SUCCEEDED 均允许生成新链接：过期后一键续期。
+        val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
+        val verifyUrl = verification.verifyUrl
+        if (verifyUrl.isNullOrBlank()) {
+            call.respondText(
+                einkVerificationNoticeHtml("暂时无法生成新的验证链接，请稍后再试。"),
+                status = HttpStatusCode.ServiceUnavailable,
+                contentType = ContentType.parse("text/html; charset=UTF-8"),
+            )
+            return@get
+        }
+        call.respondRedirect(verifyUrl)
     }
 
     post("/api/weread/eink/verify/start") {
@@ -188,6 +226,60 @@ internal fun einkVerificationHtml(nonce: String): String = """
           captcha.show();
         });
       </script>
+    </body>
+    </html>
+""".trimIndent()
+
+/**
+ * 链接过期/已使用后的落地页：保留“获取新的验证链接”入口，避免机器人里的旧链接点开即死。
+ */
+internal fun einkVerificationExpiredHtml(): String = """
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>微信读书 E-Ink 人工验证</title>
+      <style>
+        body { margin: 0; background: #f5f7fa; color: #172033; font-family: system-ui, sans-serif; }
+        main { max-width: 520px; margin: 10vh auto; padding: 32px; background: white; border-radius: 16px; box-shadow: 0 10px 35px #17203318; }
+        h1 { font-size: 20px; }
+        .hint { color: #667085; line-height: 1.7; }
+        a.button { display: block; margin-top: 18px; padding: 14px; border-radius: 10px; text-align: center; color: white; background: #07c160; font-size: 17px; text-decoration: none; }
+      </style>
+    </head>
+    <body>
+      <main>
+        <h1>微信读书 E-Ink 人工验证</h1>
+        <p class="hint">该验证链接已过期或已经使用。</p>
+        <a class="button" href="/weread/eink/verify/refresh">获取新的验证链接</a>
+      </main>
+    </body>
+    </html>
+""".trimIndent()
+
+/** 通用提示页（验证处理中 / 暂时无法生成链接等），同样保留续期入口。 */
+internal fun einkVerificationNoticeHtml(message: String): String = """
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>微信读书 E-Ink 人工验证</title>
+      <style>
+        body { margin: 0; background: #f5f7fa; color: #172033; font-family: system-ui, sans-serif; }
+        main { max-width: 520px; margin: 10vh auto; padding: 32px; background: white; border-radius: 16px; box-shadow: 0 10px 35px #17203318; }
+        h1 { font-size: 20px; }
+        .hint { color: #667085; line-height: 1.7; }
+        a.button { display: block; margin-top: 18px; padding: 14px; border-radius: 10px; text-align: center; color: white; background: #07c160; font-size: 17px; text-decoration: none; }
+      </style>
+    </head>
+    <body>
+      <main>
+        <h1>微信读书 E-Ink 人工验证</h1>
+        <p class="hint">$message</p>
+        <a class="button" href="/weread/eink/verify/refresh">获取新的验证链接</a>
+      </main>
     </body>
     </html>
 """.trimIndent()
