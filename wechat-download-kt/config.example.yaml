@@ -54,6 +54,7 @@ weread:
     enabled: true               # 真实 accessToken/refreshToken 续签通道，不依赖 ADB
     base_url: "https://i.weread.qq.com"
     credentials_file: "data/.weread_eink_credentials.json"
+    accounts_dir: "data/weread_eink_accounts"    # E-Ink 多账号目录（每账号独立设备身份）；为空时自动迁移旧单账号文件
     sync_interval: 86400       # E-Ink 增量同步最小间隔（秒）
     page_size: 50
     max_pages: 1000

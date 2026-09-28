@@ -8,12 +8,23 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 
+/**
+ * 凭证持久化抽象：单文件存储与多账号目录存储都实现它。
+ *
+ * Session 刷新令牌后会通过该接口回写凭证；多账号实现负责把凭证合并回
+ * 对应账号的记录，保留该账号的设备身份元数据。
+ */
+interface WeReadEinkCredentialSink {
+    fun load(): WeReadEinkCredentials?
+    fun save(credentials: WeReadEinkCredentials)
+}
+
 /** Stores E-Ink credentials independently from the legacy Web cookie credentials. */
 class WeReadEinkCredentialStore(
     private val file: File,
     private val gson: Gson = GsonBuilder().setPrettyPrinting().create(),
-) {
-    fun load(): WeReadEinkCredentials? {
+) : WeReadEinkCredentialSink {
+    override fun load(): WeReadEinkCredentials? {
         if (!file.exists()) return null
         return try {
             gson.fromJson(file.readText(), WeReadEinkCredentials::class.java)
@@ -24,7 +35,7 @@ class WeReadEinkCredentialStore(
 
     /** Writes a complete credential snapshot without exposing secrets in logs or errors. */
     @Synchronized
-    fun save(credentials: WeReadEinkCredentials) {
+    override fun save(credentials: WeReadEinkCredentials) {
         file.parentFile?.mkdirs()
         val temp = Files.createTempFile(file.parentFile?.toPath(), ".${file.name}.", ".tmp").toFile()
         try {

@@ -33,7 +33,7 @@ data class WeReadEinkRefreshStatus(
 class WeReadEinkSession(
     initialCredentials: WeReadEinkCredentials,
     transport: WeReadEinkTransport = OkHttpWeReadEinkTransport(),
-    private val credentialStore: WeReadEinkCredentialStore? = null,
+    private val credentialStore: WeReadEinkCredentialSink? = null,
     baseUrl: String = DEFAULT_BASE_URL,
     profile: WeReadEinkProfile = DefaultWeReadEinkProfile,
     private val clock: () -> Long = { System.currentTimeMillis() },

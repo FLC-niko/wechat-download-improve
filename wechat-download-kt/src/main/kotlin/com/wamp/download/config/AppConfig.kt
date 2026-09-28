@@ -67,6 +67,10 @@ object AppConfig {
     val wereadEinkBaseUrl: String get() = getString("weread.eink.base_url", "https://i.weread.qq.com")
     val wereadEinkCredentialsFile: String
         get() = getString("weread.eink.credentials_file", "data/.weread_eink_credentials.json")
+
+    /** E-Ink 多账号目录；目录为空时自动迁移旧单文件凭证。 */
+    val wereadEinkAccountsDir: String
+        get() = getString("weread.eink.accounts_dir", "data/weread_eink_accounts")
     val wereadEinkSyncInterval: Long
         get() = getLong("weread.eink.sync_interval", 86_400L).coerceAtLeast(60L)
     val wereadEinkPageSize: Int

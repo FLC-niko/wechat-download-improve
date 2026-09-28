@@ -118,12 +118,28 @@ object WeReadEinkRuntime {
         }
     }
 
-    fun installCredentials(credentials: WeReadEinkCredentials) {
+    /**
+     * 安装/更新一个 E-Ink 账号凭证。
+     *
+     * @param deviceModel 新账号首次登录时分配的设备型号（不共享 profile）；
+     *   已存在的账号保持原设备身份，避免指纹漂移。
+     */
+    fun installCredentials(
+        credentials: WeReadEinkCredentials,
+        deviceModel: WeReadEinkDeviceModel? = null,
+    ) {
         // Invalidate the old session before writing the QR result. This closes the race where a
         // task holding the old session could persist its rotated snapshot after QR login.
         synchronized(runtimeLock) { sessionGeneration++ }
         synchronized(credentialWriteLock) {
-            credentialStore().save(credentials)
+            val store = accountStore()
+            val existing = store.loadRecord(credentials.vid)
+            val record = when {
+                existing != null -> existing.copy(credentials = credentials)
+                deviceModel != null -> WeReadEinkAccountRecord.forNewAccount(credentials, deviceModel)
+                else -> WeReadEinkAccountRecord.migrated(credentials)
+            }
+            store.save(record)
         }
         val installedService = checkNotNull(reload()) {
             "E-Ink credentials were saved but the runtime could not be reloaded"
@@ -158,8 +174,8 @@ object WeReadEinkRuntime {
             return null
         }
 
-        val credentials = try {
-            credentialStore().load()
+        val records = try {
+            accountStore().loadAll()
         } catch (error: Exception) {
             activeSession = null
             activeSyncService = null
@@ -167,18 +183,23 @@ object WeReadEinkRuntime {
             logger.warn("E-Ink 凭证读取失败，仅使用本地缓存: ${error.message}")
             return null
         }
-        if (credentials == null) {
+        // 阶段一：多账号加载就绪，运行通道暂时使用第一个账号（后续阶段再做任务选号）。
+        val record = records.firstOrNull()
+        if (record == null) {
             activeSession = null
             activeSyncService = null
             authState = "UNCONFIGURED"
-            logger.warn("未找到 E-Ink 凭证文件；可调用 /api/weread/eink/login/start 扫码登录")
+            logger.warn("未找到 E-Ink 凭证；可调用 /api/weread/eink/login/start 扫码登录")
             return null
         }
+        val credentials = record.credentials
+        val profile = record.profile()
 
         return try {
             val session = WeReadEinkSession(
                 initialCredentials = credentials,
-                credentialStore = credentialStore(),
+                credentialStore = accountStore().credentialSink(record.vid),
+                profile = profile,
                 baseUrl = AppConfig.wereadEinkBaseUrl,
                 isCurrentSession = { sessionGeneration == generation },
                 persistenceLock = credentialWriteLock,
@@ -195,12 +216,22 @@ object WeReadEinkRuntime {
                 baseUrl = AppConfig.wereadEinkBaseUrl,
                 pageSize = AppConfig.wereadEinkPageSize,
                 maxPages = AppConfig.wereadEinkMaxPages,
+                // 每个账号使用自己的设备身份请求，任何请求都不共享全局 profile。
+                clientFactory = { activeSession, url ->
+                    WeReadEinkChaptersClient(
+                        credentials = activeSession.credentials(),
+                        baseUrl = url,
+                        session = activeSession,
+                        profile = profile,
+                    )
+                },
             )
             activeSession = session
             activeSyncService = service
             authState = if (session.refreshStatus().authExpired) "REAUTH_REQUIRED" else "UNKNOWN"
             logger.info(
-                "E-Ink 同步通道已加载: vid=${credentials.vid}, " +
+                "E-Ink 同步通道已加载: vid=${credentials.vid}, model=${record.deviceModel}, " +
+                    "accounts=${records.size}, " +
                     "expiry=${credentials.accessTokenExpiresAt?.let(Instant::ofEpochMilli) ?: "unknown/server-driven"}",
             )
             service
@@ -532,7 +563,7 @@ object WeReadEinkRuntime {
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
         val snapshot = currentSnapshot()
         val credentials = snapshot?.session?.credentials()
-            ?: runCatching { credentialStore().load() }.getOrNull()
+            ?: runCatching { accountStore().loadAll().firstOrNull()?.credentials }.getOrNull()
         val refreshStatus = snapshot?.session?.refreshStatus()
         val currentAuthState = if (WeReadEinkLoginCoordinator.isInProgress()) {
             "REAUTH_IN_PROGRESS"
@@ -584,8 +615,12 @@ object WeReadEinkRuntime {
         )
     }
 
-    private fun credentialStore(): WeReadEinkCredentialStore =
-        WeReadEinkCredentialStore(File(AppConfig.wereadEinkCredentialsFile))
+    /** 多账号存储：旧单文件仅作为首次迁移来源。 */
+    private fun accountStore(): WeReadEinkAccountStore =
+        WeReadEinkAccountStore(
+            dir = File(AppConfig.wereadEinkAccountsDir),
+            legacyFile = File(AppConfig.wereadEinkCredentialsFile),
+        )
 
     private fun currentSnapshot(): RuntimeSnapshot? = synchronized(runtimeLock) {
         val session = activeSession ?: return@synchronized null

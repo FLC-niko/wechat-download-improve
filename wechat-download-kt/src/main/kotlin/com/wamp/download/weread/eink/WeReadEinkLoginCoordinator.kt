@@ -68,7 +68,16 @@ object WeReadEinkLoginCoordinator {
             var adbSlot: DeviceSlot? = null
             var adbPushPath: String = ""
             try {
-                val client = WeReadEinkQrLoginClient(baseUrl = AppConfig.wereadEinkBaseUrl)
+                // 新账号独立设备身份：从未被占用的型号池中分配，绝不与既有账号共享 profile。
+                val accountStore = WeReadEinkAccountStore(
+                    dir = File(AppConfig.wereadEinkAccountsDir),
+                    legacyFile = File(AppConfig.wereadEinkCredentialsFile),
+                )
+                val deviceModel = WeReadEinkDeviceModels.pickUnused(accountStore.usedDeviceModels())
+                val client = WeReadEinkQrLoginClient(
+                    baseUrl = AppConfig.wereadEinkBaseUrl,
+                    profile = WeReadEinkAccountProfile(deviceModel),
+                )
                 val credentials = client.login(
                     onQr = { qr ->
                         state = "WAITING_SCAN"
@@ -139,7 +148,7 @@ object WeReadEinkLoginCoordinator {
                         updatedAt = System.currentTimeMillis()
                     },
                 )
-                WeReadEinkRuntime.installCredentials(credentials)
+                WeReadEinkRuntime.installCredentials(credentials, deviceModel = deviceModel)
                 state = "SUCCEEDED"
                 updatedAt = System.currentTimeMillis()
                 automaticAttemptCount = 0
