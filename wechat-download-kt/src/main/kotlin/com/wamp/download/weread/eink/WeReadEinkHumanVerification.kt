@@ -37,14 +37,18 @@ data class WeReadEinkVerificationResult(
 /**
  * Holds the Tencent CAPTCHA result only for the duration of one authenticated recovery probe.
  * The ticket and randstr are deliberately never exposed by status(), logged, or persisted.
+ *
+ * 验证挑战按账号（vid）隔离：一个账号被封禁需要人工验证时，不会覆盖或影响其他账号的
+ * 验证状态；验证链接也带 vid，才能把票据准确交给对应账号的探测。
  */
 internal class WeReadEinkHumanVerificationCoordinator(
     private val ttlMs: Long = DEFAULT_TTL_MS,
     private val clock: () -> Long = System::currentTimeMillis,
     private val nonceGenerator: () -> String = ::secureNonce,
-    private val probe: () -> Boolean,
+    private val probe: (String) -> Boolean,
 ) {
-    private data class Challenge(
+    private class Challenge(
+        val vid: String,
         val nonce: String,
         val createdAt: Long,
         val expiresAt: Long,
@@ -53,55 +57,66 @@ internal class WeReadEinkHumanVerificationCoordinator(
     )
 
     private val lock = Any()
-    private var challenge: Challenge? = null
+
+    /** 票据是进程内单值：同一时刻只允许一个账号的验证探测持有，避免票据被并发消耗。 */
+    private val completionLock = Any()
+
+    private val challenges = LinkedHashMap<String, Challenge>()
+
     private var transientHeaders: Map<String, String> = emptyMap()
 
     init {
         require(ttlMs > 0L) { "ttlMs must be positive" }
     }
 
-    fun createOrReuse(siteUrl: String): WeReadEinkVerificationStatus = synchronized(lock) {
-        expireIfNeeded()
-        val current = challenge
+    fun createOrReuse(vid: String, siteUrl: String): WeReadEinkVerificationStatus = synchronized(lock) {
+        require(vid.isNotBlank()) { "vid must not be blank" }
+        expireIfNeededLocked(vid)
+        val current = challenges[vid]
         val active = if (current != null && current.state == WeReadEinkVerificationState.WAITING) {
             current
         } else {
             val now = clock()
             Challenge(
+                vid = vid,
                 nonce = nonceGenerator(),
                 createdAt = now,
                 expiresAt = now + ttlMs,
-            ).also { challenge = it }
+            ).also { challenges[vid] = it }
         }
         active.toStatus(siteUrl)
     }
 
-    fun status(siteUrl: String): WeReadEinkVerificationStatus = synchronized(lock) {
-        expireIfNeeded()
-        challenge?.toStatus(siteUrl) ?: WeReadEinkVerificationStatus(WeReadEinkVerificationState.IDLE)
+    fun status(vid: String, siteUrl: String): WeReadEinkVerificationStatus = synchronized(lock) {
+        expireIfNeededLocked(vid)
+        challenges[vid]?.toStatus(siteUrl) ?: WeReadEinkVerificationStatus(WeReadEinkVerificationState.IDLE)
     }
 
-    fun canOpen(nonce: String): Boolean = synchronized(lock) {
-        expireIfNeeded()
-        challenge?.let { it.nonce == nonce && it.state == WeReadEinkVerificationState.WAITING } == true
+    fun canOpen(vid: String, nonce: String): Boolean = synchronized(lock) {
+        expireIfNeededLocked(vid)
+        challenges[vid]?.let { it.nonce == nonce && it.state == WeReadEinkVerificationState.WAITING } == true
     }
 
-    fun requestHeaders(): Map<String, String> = synchronized(lock) {
-        if (challenge?.state == WeReadEinkVerificationState.VERIFYING) transientHeaders else emptyMap()
+    /** 兼容旧版不含 vid 的链接：按 nonce 反查账号。 */
+    fun findVidByNonce(nonce: String): String? = synchronized(lock) {
+        challenges.entries.firstOrNull { it.value.nonce == nonce }?.key
     }
 
-    fun complete(nonce: String, ticket: String?, randstr: String?): WeReadEinkVerificationResult {
+    fun requestHeaders(): Map<String, String> = synchronized(lock) { transientHeaders }
+
+    fun complete(
+        vid: String,
+        nonce: String,
+        ticket: String?,
+        randstr: String?,
+    ): WeReadEinkVerificationResult {
         if (!validValue(ticket, MAX_TICKET_LENGTH) || !validValue(randstr, MAX_RANDSTR_LENGTH)) {
-            return WeReadEinkVerificationResult(
-                ok = false,
-                code = "INVALID_CAPTCHA_RESULT",
-                message = "验证码结果无效，请刷新页面后重试",
-            )
+            return result(false, "INVALID_CAPTCHA_RESULT", "验证码结果无效，请刷新页面后重试")
         }
 
         synchronized(lock) {
-            expireIfNeeded()
-            val current = challenge
+            expireIfNeededLocked(vid)
+            val current = challenges[vid]
                 ?: return result(false, "NOT_FOUND", "验证链接不存在或已失效")
             if (current.nonce != nonce) {
                 return result(false, "NOT_FOUND", "验证链接不存在或已失效")
@@ -121,7 +136,8 @@ internal class WeReadEinkHumanVerificationCoordinator(
         }
 
         val probeSucceeded = try {
-            probe()
+            // 串行化探测：票据为进程单值，同一时刻只允许一个账号的验证探测使用它。
+            synchronized(completionLock) { probe(vid) }
         } catch (_: Exception) {
             false
         } finally {
@@ -129,7 +145,7 @@ internal class WeReadEinkHumanVerificationCoordinator(
         }
 
         return synchronized(lock) {
-            val current = challenge
+            val current = challenges[vid]
             if (current == null || current.nonce != nonce) {
                 return@synchronized result(false, "SESSION_CHANGED", "E-Ink 会话已变化，请使用最新验证链接")
             }
@@ -147,11 +163,11 @@ internal class WeReadEinkHumanVerificationCoordinator(
 
     fun reset() = synchronized(lock) {
         transientHeaders = emptyMap()
-        challenge = null
+        challenges.clear()
     }
 
-    private fun expireIfNeeded() {
-        val current = challenge ?: return
+    private fun expireIfNeededLocked(vid: String) {
+        val current = challenges[vid] ?: return
         if (current.state == WeReadEinkVerificationState.WAITING && clock() >= current.expiresAt) {
             current.state = WeReadEinkVerificationState.EXPIRED
             current.lastError = "验证链接已过期"
@@ -161,7 +177,7 @@ internal class WeReadEinkHumanVerificationCoordinator(
 
     private fun Challenge.toStatus(siteUrl: String): WeReadEinkVerificationStatus {
         val publicUrl = if (state == WeReadEinkVerificationState.WAITING) {
-            "${siteUrl.trimEnd('/')}/weread/eink/verify/$nonce"
+            "${siteUrl.trimEnd('/')}/weread/eink/verify/$vid/$nonce"
         } else {
             null
         }
@@ -195,20 +211,33 @@ internal class WeReadEinkHumanVerificationCoordinator(
 
 object WeReadEinkHumanVerification {
     private val coordinator = WeReadEinkHumanVerificationCoordinator(
-        probe = { WeReadEinkRequestGate.asVerificationProbe { WeReadEinkRuntime.probe() } },
+        probe = { vid ->
+            WeReadEinkRequestGate.asVerificationProbe { WeReadEinkRuntime.probeAccount(vid) }
+        },
     )
 
-    fun createOrReuse(siteUrl: String): WeReadEinkVerificationStatus = coordinator.createOrReuse(siteUrl)
+    fun createOrReuse(vid: String, siteUrl: String): WeReadEinkVerificationStatus =
+        coordinator.createOrReuse(vid, siteUrl)
 
-    fun status(siteUrl: String): WeReadEinkVerificationStatus = coordinator.status(siteUrl)
+    fun status(vid: String, siteUrl: String): WeReadEinkVerificationStatus =
+        coordinator.status(vid, siteUrl)
 
-    fun canOpen(nonce: String): Boolean = coordinator.canOpen(nonce)
+    fun statusForVidOrIdle(vid: String?, siteUrl: String): WeReadEinkVerificationStatus =
+        if (vid == null) {
+            WeReadEinkVerificationStatus(WeReadEinkVerificationState.IDLE)
+        } else {
+            coordinator.status(vid, siteUrl)
+        }
 
-    fun complete(nonce: String, ticket: String?, randstr: String?): WeReadEinkVerificationResult {
-        val result = coordinator.complete(nonce, ticket, randstr)
+    fun canOpen(vid: String, nonce: String): Boolean = coordinator.canOpen(vid, nonce)
+
+    fun findVidByNonce(nonce: String): String? = coordinator.findVidByNonce(nonce)
+
+    fun complete(vid: String, nonce: String, ticket: String?, randstr: String?): WeReadEinkVerificationResult {
+        val result = coordinator.complete(vid, nonce, ticket, randstr)
         if (result.code != "PROBE_FAILED") return result
-        val replacement = coordinator.createOrReuse(AppConfig.siteUrl)
-        WeReadEinkRuntime.allowHumanVerificationNotificationRetry()
+        val replacement = coordinator.createOrReuse(vid, AppConfig.siteUrl)
+        WeReadEinkRuntime.allowHumanVerificationNotificationRetry(vid)
         return result.copy(nextUrl = replacement.verifyUrl)
     }
 

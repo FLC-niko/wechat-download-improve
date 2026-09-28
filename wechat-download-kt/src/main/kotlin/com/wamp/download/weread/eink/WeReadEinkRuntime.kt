@@ -79,6 +79,11 @@ object WeReadEinkRuntime {
         @Volatile
         var lastUsedAt: Long = 0L
 
+        /** 后台同步成功/失败计数：供状态面板展示每账号成功率（YIELDED 不算失败）。 */
+        val scheduledSyncSuccessCount = AtomicLong(0L)
+
+        val scheduledSyncFailureCount = AtomicLong(0L)
+
         val humanVerificationReported = AtomicBoolean(false)
 
         val lastHumanVerifyNotificationAt = AtomicLong(0L)
@@ -102,9 +107,23 @@ object WeReadEinkRuntime {
         accounts.values.any { !taskSyncSuppressed(it.authState) }
     }
 
+    /** 任意账号等待人工验证即为 true（多账号下不再只看主账号）。 */
     fun requiresHumanVerification(): Boolean = synchronized(runtimeLock) {
-        primaryAccount()?.authState == "HUMAN_VERIFY_REQUIRED"
+        accounts.values.any { it.authState == "HUMAN_VERIFY_REQUIRED" }
     }
+
+    fun requiresHumanVerification(vid: String): Boolean = synchronized(runtimeLock) {
+        accounts[vid]?.authState == "HUMAN_VERIFY_REQUIRED"
+    }
+
+    /** 人工验证链接的定位：优先正在等待验证的账号，否则主账号。 */
+    fun verificationTargetVid(): String? = synchronized(runtimeLock) {
+        accounts.values.firstOrNull { it.authState == "HUMAN_VERIFY_REQUIRED" }?.vid ?: primaryVid
+    }
+
+    fun hasAccount(vid: String): Boolean = synchronized(runtimeLock) { accounts.containsKey(vid) }
+
+    fun primaryVidOrNull(): String? = synchronized(runtimeLock) { primaryVid }
 
     /** Keeps automatic recovery detection, but backs off aggressively while human action is required. */
     fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = synchronized(runtimeLock) {
@@ -344,7 +363,8 @@ object WeReadEinkRuntime {
         val verificationProbe = WeReadEinkRequestGate.isVerificationProbeRequest()
         val targets = synchronized(runtimeLock) {
             if (verificationProbe) {
-                // 人工验证票据只属于主账号：验证后只探测目标账号，避免票据被其他账号消耗。
+                // 无 vid 上下文的验证探测（旧调用）只允许主账号，避免票据被其他账号消耗。
+                // 人工验证的正式路径使用 probeAccount(vid)，票据只交给目标账号。
                 listOfNotNull(primaryAccount())
             } else {
                 accounts.values.sortedBy { it.vid }
@@ -353,12 +373,18 @@ object WeReadEinkRuntime {
         if (targets.isEmpty()) return false
         var anySucceeded = false
         for (account in targets) {
-            if (probeAccount(account)) anySucceeded = true
+            if (probeAccountInternal(account)) anySucceeded = true
         }
         return anySucceeded
     }
 
-    private fun probeAccount(account: AccountRuntime): Boolean {
+    /** 对指定账号执行恢复探测：人工验证票据按 vid 精确交付给对应账号。 */
+    fun probeAccount(vid: String): Boolean {
+        val account = synchronized(runtimeLock) { accounts[vid] } ?: return false
+        return probeAccountInternal(account)
+    }
+
+    private fun probeAccountInternal(account: AccountRuntime): Boolean {
         val vid = account.vid
         val verificationProbe = WeReadEinkRequestGate.isVerificationProbeRequest()
         if (verificationProbe) WeReadEinkRequestGate.beginVerification(vid)
@@ -445,6 +471,7 @@ object WeReadEinkRuntime {
         }
         return try {
             service.sync(target, backgroundWorkAllowed)
+            account.scheduledSyncSuccessCount.incrementAndGet()
             val updated = updateAccount(account.vid) {
                 it.authState = "HEALTHY"
                 it.lastScheduledSyncResult = "SUCCESS"
@@ -459,6 +486,7 @@ object WeReadEinkRuntime {
             logger.info("E-Ink 后台增量同步已让出给实时任务: vid=${account.vid}")
             false
         } catch (error: Exception) {
+            account.scheduledSyncFailureCount.incrementAndGet()
             val updated = updateAccount(account.vid) {
                 if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
                     it.authState = "HUMAN_VERIFY_REQUIRED"
@@ -551,7 +579,7 @@ object WeReadEinkRuntime {
             if (account.lastHumanVerifyNotificationAt.compareAndSet(last, now)) break
         }
         account.humanVerificationReported.set(true)
-        val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
+        val verification = WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
         recoveryScope?.launch {
             val textSent = WebhookNotifier.notify(
                 "weread_eink_human_verify",
@@ -566,7 +594,8 @@ object WeReadEinkRuntime {
             val qrSent = verification.verifyUrl?.let { verifyUrl ->
                 runCatching {
                     val png = WeReadEinkHumanVerification.generateQrPng(verifyUrl)
-                    val qrFile = File("qrcode/weread_eink_human_verify.png")
+                    // 账号隔离：每个账号的二维码存成独立文件，通知并发时不会相互覆盖。
+                    val qrFile = File("qrcode/weread_eink_human_verify_${account.vid}.png")
                     val saved = runCatching {
                         qrFile.parentFile?.mkdirs()
                         qrFile.writeBytes(png)
@@ -575,11 +604,11 @@ object WeReadEinkRuntime {
                     }.isSuccess
                     WebhookNotifier.pushQrcode(
                         imageBytes = png,
-                        message = "二维码 5 分钟内有效；扫码完成后服务器会自动探测并恢复 E-Ink 通道",
+                        message = "二维码 5 分钟内有效；扫码完成后服务器会自动探测并恢复该账号的 E-Ink 通道",
                         fileName = qrFile.name,
                         localFileAvailable = saved,
                         title = "微信读书 E-Ink 人工验证",
-                        heading = "请扫描二维码完成人工验证",
+                        heading = "请扫描二维码完成人工验证（账号 ${account.vid}）",
                         targetUrl = verifyUrl,
                     ).anySuccess
                 }.onFailure { qrError ->
@@ -598,6 +627,12 @@ object WeReadEinkRuntime {
     internal fun allowHumanVerificationNotificationRetry() {
         synchronized(runtimeLock) {
             primaryAccount()?.humanVerificationReported?.set(false)
+        }
+    }
+
+    internal fun allowHumanVerificationNotificationRetry(vid: String) {
+        synchronized(runtimeLock) {
+            accounts[vid]?.humanVerificationReported?.set(false)
         }
     }
 
@@ -660,7 +695,7 @@ object WeReadEinkRuntime {
             "task_sync_suppressed" to taskSyncSuppressed(currentAuthState),
             "health_probe_suppressed" to probeSuppressed,
             "human_verify_probe_interval_seconds" to AppConfig.wereadEinkHumanVerifyProbeInterval,
-            "human_verification" to WeReadEinkHumanVerification.status(AppConfig.siteUrl),
+            "human_verification" to WeReadEinkHumanVerification.statusForVidOrIdle(primary?.vid, AppConfig.siteUrl),
             "next_health_probe_at" to if (probeSuppressed) {
                 (primary?.lastProbeAt ?: 0L) + humanVerifyProbeIntervalMs
             } else {
@@ -693,19 +728,29 @@ object WeReadEinkRuntime {
         )
     }
 
-    private fun accountStatus(account: AccountRuntime, now: Long): Map<String, Any?> = mapOf(
-        "vid" to account.vid,
-        "device_model" to account.record.deviceModel,
-        "auth_state" to account.authState,
-        "operational" to (account.authState == "HEALTHY"),
-        "task_sync_suppressed" to taskSyncSuppressed(account.authState),
-        "last_used_at" to account.lastUsedAt.takeIf { it > 0L },
-        "last_probe_at" to account.lastProbeAt.takeIf { it > 0L },
-        "last_probe_result" to account.lastProbeResult,
-        "last_probe_error" to account.lastProbeError,
-        "last_scheduled_sync_result" to account.lastScheduledSyncResult,
-        "seconds_until_expiry" to account.session.credentials().secondsUntilExpiry(now),
-    )
+    private fun accountStatus(account: AccountRuntime, now: Long): Map<String, Any?> {
+        val successCount = account.scheduledSyncSuccessCount.get()
+        val failureCount = account.scheduledSyncFailureCount.get()
+        val total = successCount + failureCount
+        return mapOf(
+            "vid" to account.vid,
+            "device_model" to account.record.deviceModel,
+            "auth_state" to account.authState,
+            "operational" to (account.authState == "HEALTHY"),
+            "task_sync_suppressed" to taskSyncSuppressed(account.authState),
+            "last_used_at" to account.lastUsedAt.takeIf { it > 0L },
+            "last_probe_at" to account.lastProbeAt.takeIf { it > 0L },
+            "last_probe_result" to account.lastProbeResult,
+            "last_probe_error" to account.lastProbeError,
+            "last_scheduled_sync_result" to account.lastScheduledSyncResult,
+            "scheduled_sync_success_count" to successCount,
+            "scheduled_sync_failure_count" to failureCount,
+            "scheduled_sync_success_rate" to if (total == 0L) null else {
+                (successCount.toDouble() / total * 1000).toLong() / 1000.0
+            },
+            "seconds_until_expiry" to account.session.credentials().secondsUntilExpiry(now),
+        )
+    }
 
     /** 多账号存储：旧单文件仅作为首次迁移来源。 */
     private fun accountStore(): WeReadEinkAccountStore =

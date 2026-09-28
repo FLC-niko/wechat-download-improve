@@ -4,6 +4,7 @@ import com.wamp.download.config.AppConfig
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.request.receive
 import io.ktor.server.response.header
@@ -17,98 +18,103 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 fun Route.weReadEinkVerificationRoutes() {
-    get("/weread/eink/verify/{nonce}") {
+    get("/weread/eink/verify/{vid}/{nonce}") {
+        val vid = call.parameters["vid"].orEmpty()
         val nonce = call.parameters["nonce"].orEmpty()
-        if (!WeReadEinkHumanVerification.canOpen(nonce)) {
+        if (!WeReadEinkHumanVerification.canOpen(vid, nonce)) {
             // 链接过期/已使用后不再返回纯文本死路：页面保留“获取新的验证链接”入口，
             // 与探测失败后的 nextUrl 体验一致，机器人里点开的旧链接也能一键换新。
             call.respondText(
-                einkVerificationExpiredHtml(),
+                einkVerificationExpiredHtml(refreshPathForVid(vid)),
                 status = HttpStatusCode.Gone,
                 contentType = ContentType.parse("text/html; charset=UTF-8"),
             )
             return@get
         }
-        call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
-        call.response.header("Pragma", "no-cache")
-        call.response.header("Referrer-Policy", "no-referrer")
-        call.response.header("X-Content-Type-Options", "nosniff")
-        call.response.header(
-            "Content-Security-Policy",
-            "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; " +
-                "style-src 'self' 'unsafe-inline'; frame-src https:; connect-src 'self' https:; img-src 'self' data: https:",
-        )
+        applyVerificationPageHeaders(call)
         call.respondText(
-            einkVerificationHtml(nonce),
+            einkVerificationHtml(vid, nonce),
             contentType = ContentType.parse("text/html; charset=UTF-8"),
         )
     }
 
+    // 兼容阶段三之前发出的旧链接（不含 vid）：按 nonce 反查账号后跳转到带 vid 的新链接。
+    get("/weread/eink/verify/{nonce}") {
+        val nonce = call.parameters["nonce"].orEmpty()
+        val vid = WeReadEinkHumanVerification.findVidByNonce(nonce)
+        if (vid != null) {
+            call.respondRedirect("/weread/eink/verify/$vid/$nonce")
+            return@get
+        }
+        call.respondText(
+            einkVerificationExpiredHtml("/weread/eink/verify/refresh"),
+            status = HttpStatusCode.Gone,
+            contentType = ContentType.parse("text/html; charset=UTF-8"),
+        )
+    }
+
+    post("/api/weread/eink/verify/{vid}/{nonce}/complete") {
+        completeVerification(call, call.parameters["vid"].orEmpty(), call.parameters["nonce"].orEmpty())
+    }
+
+    // 兼容旧版不带 vid 的提交地址。
     post("/api/weread/eink/verify/{nonce}/complete") {
         val nonce = call.parameters["nonce"].orEmpty()
-        val body = runCatching { call.receive<Map<String, String>>() }.getOrElse {
+        val vid = WeReadEinkHumanVerification.findVidByNonce(nonce)
+        if (vid == null) {
             call.respond(
-                HttpStatusCode.BadRequest,
-                mapOf("ok" to false, "code" to "INVALID_BODY", "message" to "请求格式无效"),
+                HttpStatusCode.NotFound,
+                mapOf("ok" to false, "code" to "NOT_FOUND", "message" to "验证链接不存在或已失效"),
             )
             return@post
         }
-        val result = withContext(Dispatchers.IO) {
-            WeReadEinkHumanVerification.complete(nonce, body["ticket"], body["randstr"])
-        }
-        val status = when (result.code) {
-            "RECOVERED" -> HttpStatusCode.OK
-            "INVALID_CAPTCHA_RESULT" -> HttpStatusCode.BadRequest
-            "NOT_FOUND" -> HttpStatusCode.NotFound
-            "EXPIRED" -> HttpStatusCode.Gone
-            "ALREADY_USED", "SESSION_CHANGED" -> HttpStatusCode.Conflict
-            else -> HttpStatusCode.UnprocessableEntity
-        }
-        call.respond(status, result)
+        completeVerification(call, vid, nonce)
     }
 
+    // 兼容查询：主账号的验证状态。
     get("/api/weread/eink/verify/status") {
         call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
-        call.respond(WeReadEinkHumanVerification.status(AppConfig.siteUrl))
+        call.respond(
+            WeReadEinkHumanVerification.statusForVidOrIdle(
+                WeReadEinkRuntime.primaryVidOrNull(),
+                AppConfig.siteUrl,
+            ),
+        )
     }
 
-    get("/weread/eink/verify/refresh") {
+    get("/api/weread/eink/verify/{vid}/status") {
         call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
-        val current = WeReadEinkHumanVerification.status(AppConfig.siteUrl)
-        when (current.state) {
-            WeReadEinkVerificationState.WAITING -> {
-                // 已有未过期的等待链接：直接复用，避免不断生成新挑战。
-                val url = current.verifyUrl
-                if (!url.isNullOrBlank()) {
-                    call.respondRedirect(url)
-                    return@get
-                }
-            }
-            WeReadEinkVerificationState.VERIFYING -> {
-                call.respondText(
-                    einkVerificationNoticeHtml("上一次验证正在处理中，请稍候片刻再打开链接查看结果。"),
-                    contentType = ContentType.parse("text/html; charset=UTF-8"),
-                )
-                return@get
-            }
-            else -> Unit
-        }
-        // IDLE / EXPIRED / FAILED / SUCCEEDED 均允许生成新链接：过期后一键续期。
-        val verification = WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl)
-        val verifyUrl = verification.verifyUrl
-        if (verifyUrl.isNullOrBlank()) {
+        call.respond(WeReadEinkHumanVerification.status(call.parameters["vid"].orEmpty(), AppConfig.siteUrl))
+    }
+
+    get("/weread/eink/verify/{vid}/refresh") {
+        respondVerificationRefresh(call, call.parameters["vid"].orEmpty())
+    }
+
+    // 兼容旧版不带 vid 的续期入口：定位到需要验证的账号（否则主账号）。
+    get("/weread/eink/verify/refresh") {
+        val vid = WeReadEinkRuntime.verificationTargetVid()
+        if (vid == null) {
             call.respondText(
-                einkVerificationNoticeHtml("暂时无法生成新的验证链接，请稍后再试。"),
+                einkVerificationNoticeHtml(
+                    message = "当前没有需要人工验证的 E-Ink 账号。",
+                    refreshPath = "/weread/eink/verify/refresh",
+                ),
                 status = HttpStatusCode.ServiceUnavailable,
                 contentType = ContentType.parse("text/html; charset=UTF-8"),
             )
             return@get
         }
-        call.respondRedirect(verifyUrl)
+        respondVerificationRefresh(call, vid)
     }
 
     post("/api/weread/eink/verify/start") {
-        if (!WeReadEinkRuntime.requiresHumanVerification()) {
+        val requested = call.request.queryParameters["vid"]?.takeIf { it.isNotBlank() }
+        val vid = when {
+            requested != null && WeReadEinkRuntime.hasAccount(requested) -> requested
+            else -> WeReadEinkRuntime.verificationTargetVid()
+        }
+        if (vid == null || !WeReadEinkRuntime.requiresHumanVerification(vid)) {
             call.respond(
                 HttpStatusCode.Conflict,
                 mapOf(
@@ -123,13 +129,105 @@ fun Route.weReadEinkVerificationRoutes() {
         call.respond(
             mapOf(
                 "ok" to true,
-                "verification" to WeReadEinkHumanVerification.createOrReuse(AppConfig.siteUrl),
+                "vid" to vid,
+                "verification" to WeReadEinkHumanVerification.createOrReuse(vid, AppConfig.siteUrl),
             ),
         )
     }
 }
 
-internal fun einkVerificationHtml(nonce: String): String = """
+private suspend fun completeVerification(call: ApplicationCall, vid: String, nonce: String) {
+    val body = runCatching { call.receive<Map<String, String>>() }.getOrElse {
+        call.respond(
+            HttpStatusCode.BadRequest,
+            mapOf("ok" to false, "code" to "INVALID_BODY", "message" to "请求格式无效"),
+        )
+        return
+    }
+    val result = withContext(Dispatchers.IO) {
+        WeReadEinkHumanVerification.complete(vid, nonce, body["ticket"], body["randstr"])
+    }
+    val status = when (result.code) {
+        "RECOVERED" -> HttpStatusCode.OK
+        "INVALID_CAPTCHA_RESULT" -> HttpStatusCode.BadRequest
+        "NOT_FOUND" -> HttpStatusCode.NotFound
+        "EXPIRED" -> HttpStatusCode.Gone
+        "ALREADY_USED", "SESSION_CHANGED" -> HttpStatusCode.Conflict
+        else -> HttpStatusCode.UnprocessableEntity
+    }
+    call.respond(status, result)
+}
+
+private suspend fun respondVerificationRefresh(call: ApplicationCall, vid: String) {
+    call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
+    val refreshPath = refreshPathForVid(vid)
+    if (vid.isBlank() || !WeReadEinkRuntime.hasAccount(vid)) {
+        call.respondText(
+            einkVerificationNoticeHtml(
+                message = "该 E-Ink 账号不存在或已移除。",
+                refreshPath = "/weread/eink/verify/refresh",
+            ),
+            status = HttpStatusCode.NotFound,
+            contentType = ContentType.parse("text/html; charset=UTF-8"),
+        )
+        return
+    }
+    val current = WeReadEinkHumanVerification.status(vid, AppConfig.siteUrl)
+    when (current.state) {
+        WeReadEinkVerificationState.WAITING -> {
+            // 已有未过期的等待链接：直接复用，避免不断生成新挑战。
+            val url = current.verifyUrl
+            if (!url.isNullOrBlank()) {
+                call.respondRedirect(url)
+                return
+            }
+        }
+        WeReadEinkVerificationState.VERIFYING -> {
+            call.respondText(
+                einkVerificationNoticeHtml("上一次验证正在处理中，请稍候片刻再打开链接查看结果。", refreshPath),
+                contentType = ContentType.parse("text/html; charset=UTF-8"),
+            )
+            return
+        }
+        else -> Unit
+    }
+    // IDLE / EXPIRED / FAILED / SUCCEEDED 均允许生成新链接：过期后一键续期。
+    val verification = WeReadEinkHumanVerification.createOrReuse(vid, AppConfig.siteUrl)
+    val verifyUrl = verification.verifyUrl
+    if (verifyUrl.isNullOrBlank()) {
+        call.respondText(
+            einkVerificationNoticeHtml("暂时无法生成新的验证链接，请稍后再试。", refreshPath),
+            status = HttpStatusCode.ServiceUnavailable,
+            contentType = ContentType.parse("text/html; charset=UTF-8"),
+        )
+        return
+    }
+    call.respondRedirect(verifyUrl)
+}
+
+private fun applyVerificationPageHeaders(call: ApplicationCall) {
+    call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
+    call.response.header("Pragma", "no-cache")
+    call.response.header("Referrer-Policy", "no-referrer")
+    call.response.header("X-Content-Type-Options", "nosniff")
+    call.response.header(
+        "Content-Security-Policy",
+        "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; " +
+            "style-src 'self' 'unsafe-inline'; frame-src https:; connect-src 'self' https:; img-src 'self' data: https:",
+    )
+}
+
+internal fun refreshPathForVid(vid: String): String =
+    if (vid.isBlank()) "/weread/eink/verify/refresh" else "/weread/eink/verify/${htmlEscape(vid)}/refresh"
+
+internal fun htmlEscape(value: String): String = value
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+    .replace("\"", "&quot;")
+    .replace("'", "&#39;")
+
+internal fun einkVerificationHtml(vid: String, nonce: String): String = """
     <!doctype html>
     <html lang="zh-CN">
     <head>
@@ -149,15 +247,15 @@ internal fun einkVerificationHtml(nonce: String): String = """
     <body>
       <main>
         <h1>微信读书 E-Ink 人工验证</h1>
-        <p class="hint">点击后完成腾讯验证码。成功结果会直接交给当前服务器的 E-Ink 会话，并立即执行恢复探测。</p>
+        <p class="hint">账号：${htmlEscape(vid)}<br>点击后完成腾讯验证码。成功结果会直接交给该账号的 E-Ink 会话，并立即执行恢复探测。</p>
         <button id="verify" type="button">开始验证</button>
         <div id="status" role="status"></div>
       </main>
       <script>
         const button = document.getElementById('verify');
         const statusBox = document.getElementById('status');
-        const completeUrl = '/api/weread/eink/verify/$nonce/complete';
-        const statusUrl = '/api/weread/eink/verify/status';
+        const completeUrl = '/api/weread/eink/verify/${htmlEscape(vid)}/${htmlEscape(nonce)}/complete';
+        const statusUrl = '/api/weread/eink/verify/${htmlEscape(vid)}/status';
         let pollTimer = null;
 
         function stopPolling() {
@@ -233,7 +331,7 @@ internal fun einkVerificationHtml(nonce: String): String = """
 /**
  * 链接过期/已使用后的落地页：保留“获取新的验证链接”入口，避免机器人里的旧链接点开即死。
  */
-internal fun einkVerificationExpiredHtml(): String = """
+internal fun einkVerificationExpiredHtml(refreshPath: String): String = """
     <!doctype html>
     <html lang="zh-CN">
     <head>
@@ -252,14 +350,14 @@ internal fun einkVerificationExpiredHtml(): String = """
       <main>
         <h1>微信读书 E-Ink 人工验证</h1>
         <p class="hint">该验证链接已过期或已经使用。</p>
-        <a class="button" href="/weread/eink/verify/refresh">获取新的验证链接</a>
+        <a class="button" href="${htmlEscape(refreshPath)}">获取新的验证链接</a>
       </main>
     </body>
     </html>
 """.trimIndent()
 
 /** 通用提示页（验证处理中 / 暂时无法生成链接等），同样保留续期入口。 */
-internal fun einkVerificationNoticeHtml(message: String): String = """
+internal fun einkVerificationNoticeHtml(message: String, refreshPath: String): String = """
     <!doctype html>
     <html lang="zh-CN">
     <head>
@@ -277,8 +375,8 @@ internal fun einkVerificationNoticeHtml(message: String): String = """
     <body>
       <main>
         <h1>微信读书 E-Ink 人工验证</h1>
-        <p class="hint">$message</p>
-        <a class="button" href="/weread/eink/verify/refresh">获取新的验证链接</a>
+        <p class="hint">${htmlEscape(message)}</p>
+        <a class="button" href="${htmlEscape(refreshPath)}">获取新的验证链接</a>
       </main>
     </body>
     </html>
