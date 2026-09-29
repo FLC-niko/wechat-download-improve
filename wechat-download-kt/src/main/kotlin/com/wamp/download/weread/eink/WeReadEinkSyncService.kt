@@ -227,7 +227,7 @@ class WeReadEinkSyncService(
                     ensureShouldContinue(shouldContinue)
                     article.toArticle(fakeid, client, cachedArticles[article.reviewId]) ?: run {
                         logger.warn(
-                            "跳过无效的 E-Ink 文章: fakeid=${fakeid.take(8)}..., " +
+                            "跳过无效的 E-Ink 文章: vid=$accountVid, fakeid=${fakeid.take(8)}..., " +
                                 "reviewId=${article.reviewId.orEmpty().take(32)}",
                         )
                         null
@@ -296,7 +296,8 @@ class WeReadEinkSyncService(
             SubscriptionStore.updateLastPoll(fakeid)
 
             logger.info(
-                "E-Ink 同步完成: fakeid=${fakeid.take(8)}..., pages=$pages, " +
+                // 多账号下成功日志必须带 vid，与失败日志对齐，便于按账号归属统计成功率
+                "E-Ink 同步完成: vid=$accountVid, fakeid=${fakeid.take(8)}..., pages=$pages, " +
                     "fetched=$fetchedArticles, skipped=$skippedArticles, saved=$savedArticles, " +
                     "targetCovered=$targetedRangeComplete, fullCycle=$completedFullCycle",
             )

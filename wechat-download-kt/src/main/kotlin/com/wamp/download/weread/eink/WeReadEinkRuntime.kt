@@ -12,6 +12,7 @@ import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * E-Ink 多账号运行时。
@@ -21,6 +22,13 @@ import java.util.concurrent.atomic.AtomicLong
  *   多账号之间互不拖累；
  * - 每个账号使用自己的设备身份（profile）请求，绝不共享指纹。
  */
+/** 调度选号的账号快照：只携带选号所需字段，配合 [WeReadEinkRuntime.leastUsedEinkAccount] 做纯函数决策。 */
+internal data class WeReadEinkAccountCandidate(
+    val vid: String,
+    val lastUsedAt: Long,
+    val authState: String,
+)
+
 object WeReadEinkRuntime {
     private val logger = LoggerFactory.getLogger(WeReadEinkRuntime::class.java)
     private val runtimeLock = Any()
@@ -261,7 +269,10 @@ object WeReadEinkRuntime {
         val generation = (existing?.generation ?: 0L) + 1L
         val profile = record.profile()
         return try {
-            lateinit var runtime: AccountRuntime
+            // 构建期句柄：isCurrentSession 闭包经 AtomicReference 读取构建结果，
+            // 不捕获未初始化的 lateinit；构建完成前误触发只会安全地判为“非当前会话”，
+            // 该会话的待写回凭证随即被跳过，绝不会抛未初始化异常。
+            val runtimeRef = AtomicReference<AccountRuntime>()
             val session = WeReadEinkSession(
                 initialCredentials = record.credentials,
                 credentialStore = accountStore().credentialSink(record.vid),
@@ -273,7 +284,8 @@ object WeReadEinkRuntime {
                     // 顺序持锁,反向嵌套会构成 AB-BA 死锁。accounts 是 ConcurrentHashMap,
                     // 单次 get 本身线程安全,generation 为 volatile。
                     val current = accounts[record.vid]
-                    current === runtime && runtime.generation == generation
+                    val self = runtimeRef.get()
+                    current != null && current === self && self.generation == generation
                 },
                 persistenceLock = credentialWriteLock,
                 refreshRetryInitialDelayMs = AppConfig.wereadEinkRefreshRetryInitial * 1000L,
@@ -311,7 +323,7 @@ object WeReadEinkRuntime {
                 built.lastScheduledSyncResult = existing?.lastScheduledSyncResult ?: "NEVER"
                 built.lastScheduledSyncTarget = existing?.lastScheduledSyncTarget
                 built.lastUsedAt = existing?.lastUsedAt ?: 0L
-                runtime = built
+                runtimeRef.set(built)
             }
         } catch (error: Exception) {
             logger.warn("E-Ink 账号初始化失败，已跳过: vid=${record.vid}, ${error.message}")
@@ -450,13 +462,10 @@ object WeReadEinkRuntime {
         // observing recovery after the user completes verification in the official client.
         if (!backgroundWorkAllowed()) return false
         val account = synchronized(runtimeLock) {
-            accounts.values
-                .filter { !scheduledSyncSuppressed(it.authState) }
-                .minWithOrNull(compareBy<AccountRuntime> { it.lastUsedAt }.thenBy { it.vid })
-                ?.also {
-                    it.lastUsedAt = System.currentTimeMillis()
-                    lastSelectedVid = it.vid
-                }
+            pickLeastUsedAccount(::scheduledSyncSuppressed)?.also {
+                it.lastUsedAt = System.currentTimeMillis()
+                lastSelectedVid = it.vid
+            }
         } ?: return false
         if (account.session.refreshStatus().authExpired) {
             ensureAutoRecovery()
@@ -666,6 +675,18 @@ object WeReadEinkRuntime {
         now >= lastProbeAt &&
         now - lastProbeAt < humanVerifyProbeIntervalMs
 
+    /**
+     * 调度选号核心（纯函数，便于单测）：过滤熔断账号后取 least_used；
+     * lastUsedAt 相同时按 vid 升序保证确定性。任务路径与后台同步共用，
+     * 差异只在传入的熔断判定（taskSyncSuppressed / scheduledSyncSuppressed）。
+     */
+    internal fun leastUsedEinkAccount(
+        candidates: List<WeReadEinkAccountCandidate>,
+        suppressed: (String) -> Boolean,
+    ): WeReadEinkAccountCandidate? = candidates
+        .filter { !suppressed(it.authState) }
+        .minWithOrNull(compareBy<WeReadEinkAccountCandidate> { it.lastUsedAt }.thenBy { it.vid })
+
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
         val primary = synchronized(runtimeLock) { primaryAccount() }
         val accountViews = synchronized(runtimeLock) {
@@ -767,14 +788,18 @@ object WeReadEinkRuntime {
 
     /** 任务路径选号：过滤熔断账号后取 least_used，保证多账号分摊与故障隔离。 */
     private fun selectForTask(): AccountRuntime? = synchronized(runtimeLock) {
-        accounts.values
-            .filter { !taskSyncSuppressed(it.authState) }
-            .minWithOrNull(compareBy<AccountRuntime> { it.lastUsedAt }.thenBy { it.vid })
-            ?.also {
-                it.lastUsedAt = System.currentTimeMillis()
-                lastSelectedVid = it.vid
-            }
+        pickLeastUsedAccount(::taskSyncSuppressed)?.also {
+            it.lastUsedAt = System.currentTimeMillis()
+            lastSelectedVid = it.vid
+        }
     }
+
+    /** 在 accounts 视图上执行选号；调用方必须已持有 runtimeLock。 */
+    private fun pickLeastUsedAccount(suppressed: (String) -> Boolean): AccountRuntime? =
+        leastUsedEinkAccount(
+            accounts.values.map { WeReadEinkAccountCandidate(it.vid, it.lastUsedAt, it.authState) },
+            suppressed,
+        )?.let { pick -> accounts[pick.vid] }
 
     /** 通过 service 实例精确定位账号；缺失时回退最近选号或主账号。 */
     private fun accountFor(service: WeReadEinkSyncService?): AccountRuntime? = synchronized(runtimeLock) {
