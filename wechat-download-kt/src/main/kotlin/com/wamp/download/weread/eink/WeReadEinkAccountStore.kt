@@ -13,7 +13,8 @@ import java.nio.file.attribute.PosixFilePermissions
  * E-Ink 多账号存储：`data/weread_eink_accounts/{vid}.json`，每个账号一个文件，
  * 内含凭证与该账号专属的设备身份。
  *
- * - 首次启动且目录为空时，自动迁移旧单账号文件（保留旧文件作为备份）；
+ * - 首次启动且目录为空时，自动迁移旧单账号文件（迁移后旧文件改名为 `.migrated`
+ *   保留为历史备份，不会被二次导入，防止账号目录清空后复活已删除账号）；
  * - 写入采用临时文件 + 原子替换，并收紧文件权限（仅属主可读写）。
  */
 class WeReadEinkAccountStore(
@@ -42,10 +43,21 @@ class WeReadEinkAccountStore(
             val credentials = WeReadEinkCredentialStore(legacy).load() ?: return@runCatching emptyList()
             val record = WeReadEinkAccountRecord.migrated(credentials)
             save(record)
-            logger.info(
-                "E-Ink 旧单账号凭证已迁移到多账号目录: vid=${record.vid}, model=${record.deviceModel}, " +
-                    "legacy=${legacy.name}（旧文件保留为备份）",
-            )
+            // 迁移成功后立即给旧文件改名：账号目录日后被清空（例如账号全部删除）时，
+            // loadAll 不得再次从未改名的旧文件复活已删除的账号。改名后的文件仍留在
+            // 原目录，继续充当迁移前的历史备份。
+            val backup = File(legacy.parentFile, "${legacy.name}.migrated")
+            if (legacy.renameTo(backup)) {
+                logger.info(
+                    "E-Ink 旧单账号凭证已迁移到多账号目录: vid=${record.vid}, model=${record.deviceModel}, " +
+                        "legacy=${legacy.name} 已改名为 ${backup.name}（保留为历史备份）",
+                )
+            } else {
+                logger.warn(
+                    "E-Ink 旧单账号凭证已迁移到多账号目录: vid=${record.vid}, model=${record.deviceModel}, " +
+                        "但旧文件改名失败（不影响运行；账号目录清空前请手动处理）: ${legacy.name}",
+                )
+            }
             listOf(record)
         }.onFailure {
             logger.warn("E-Ink 旧单账号凭证迁移失败: ${it.message}")

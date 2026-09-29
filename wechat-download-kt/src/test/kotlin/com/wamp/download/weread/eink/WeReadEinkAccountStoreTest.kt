@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
@@ -33,7 +34,30 @@ class WeReadEinkAccountStoreTest {
         assertTrue(record.installId.isNotBlank(), "迁移账号必须补一个专属 installId")
         assertEquals(WeReadEinkDeviceModels.DEFAULT_MODEL, record.deviceModel)
         assertTrue(File(accountsDir, "909705585.json").isFile, "迁移后必须写入多账号目录")
-        assertTrue(legacy.isFile, "旧文件必须保留为备份")
+        val backup = File(root, "legacy.json.migrated")
+        assertTrue(backup.isFile, "迁移后旧文件必须改名为 .migrated 备份")
+        assertFalse(legacy.isFile, "改名后不得残留未改名的旧文件（否则目录清空时会二次导入）")
+    }
+
+    @Test
+    fun `migrated legacy backup is not re-imported after accounts are removed`() {
+        val root = tempDir()
+        val legacy = File(root, "legacy.json")
+        val credentials = WeReadEinkCredentials(
+            vid = "909705585",
+            accessToken = "token",
+            refreshToken = "refresh",
+            deviceId = "eink3346912250000000001",
+        )
+        WeReadEinkCredentialStore(legacy).save(credentials)
+        val accountsDir = File(root, "accounts")
+
+        val store = WeReadEinkAccountStore(dir = accountsDir, legacyFile = legacy)
+        assertEquals(1, store.loadAll().size)
+
+        // 账号目录被清空（例如账号被删除）后，loadAll 不得再次从旧单文件备份复活已删除账号
+        File(accountsDir, "909705585.json").delete()
+        assertTrue(store.loadAll().isEmpty(), "目录清空后不得从未改名的旧文件二次导入")
     }
 
     @Test
