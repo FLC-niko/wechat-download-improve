@@ -95,6 +95,10 @@ object WeReadEinkRuntime {
         val humanVerificationReported = AtomicBoolean(false)
 
         val lastHumanVerifyNotificationAt = AtomicLong(0L)
+
+        /** 连续被 -2041 的次数：探测退避按 1h→2h→4h→8h→12h 递增，成功后清零。 */
+        @Volatile
+        var humanVerifyCycleCount: Int = 0
     }
 
     fun initialize(scope: CoroutineScope? = null): WeReadEinkSyncService? {
@@ -135,14 +139,31 @@ object WeReadEinkRuntime {
 
     /** Keeps automatic recovery detection, but backs off aggressively while human action is required. */
     fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = synchronized(runtimeLock) {
-        accounts.values.any {
+        accounts.values.any { account ->
             !healthProbeSuppressed(
-                state = it.authState,
-                lastProbeAt = it.lastProbeAt,
+                state = account.authState,
+                lastProbeAt = account.lastProbeAt,
                 now = now,
-                humanVerifyProbeIntervalMs = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L,
+                humanVerifyProbeIntervalMs = humanVerifyProbeIntervalMs(account.humanVerifyCycleCount),
             )
         }
+    }
+
+    /**
+     * -2041 后探测退避：1h→2h→4h→8h→12h 递增。
+     * 固定 1 小时探测会让已风控账号每小时都产生一次 -2041（以及重复验证通知），
+     * 指数退避在保持恢复检测的同时显著减少无效请求与通知刷屏。
+     */
+    private fun humanVerifyProbeIntervalMs(cycle: Int): Long {
+        val base = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L
+        val multiplier = when {
+            cycle <= 1 -> 1L
+            cycle == 2 -> 2L
+            cycle == 3 -> 4L
+            cycle == 4 -> 8L
+            else -> 12L
+        }
+        return base * multiplier
     }
 
     /** 任务请求成功：把结果记到对应账号（service 精确定位，缺失时回退最近选号/主账号）。 */
@@ -152,7 +173,9 @@ object WeReadEinkRuntime {
         updateAccount(account.vid) {
             it.authState = "HEALTHY"
             it.humanVerificationReported.set(false)
-            it.lastHumanVerifyNotificationAt.set(0L)
+            // 恢复后重新起算 3 小时提醒窗口：短时间再次 -2041 不重复发送验证页。
+            it.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
+            it.humanVerifyCycleCount = 0
         }
         noteHumanVerifyRecovery(account, previousState)
     }
@@ -207,7 +230,8 @@ object WeReadEinkRuntime {
             val account = accounts.values.firstOrNull { it.service === installedService } ?: return@synchronized
             account.authState = "HEALTHY"
             account.humanVerificationReported.set(false)
-            account.lastHumanVerifyNotificationAt.set(0L)
+            account.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
+            account.humanVerifyCycleCount = 0
             account.lastProbeAt = System.currentTimeMillis()
             account.lastProbeResult = "QR_LOGIN_SUCCEEDED"
             account.lastProbeError = null
@@ -431,16 +455,20 @@ object WeReadEinkRuntime {
                 it.lastProbeAt = System.currentTimeMillis()
                 it.lastProbeResult = "SUCCESS"
                 it.lastProbeError = null
+                it.humanVerifyCycleCount = 0
+                it.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
             }
             if (updated) {
                 account.humanVerificationReported.set(false)
-                account.lastHumanVerifyNotificationAt.set(0L)
                 noteHumanVerifyRecovery(account, previousState)
             }
             return updated
         } catch (error: Exception) {
+            val humanVerify = error is WeReadEinkApiException &&
+                error.kind == WeReadEinkResponseKind.HUMAN_VERIFY
             val updated = updateAccount(vid) {
                 it.authState = authStateAfterFailure(it.session.refreshStatus().authExpired, error)
+                if (humanVerify) it.humanVerifyCycleCount++
                 it.lastProbeAt = System.currentTimeMillis()
                 it.lastProbeResult = when (error) {
                     is WeReadEinkApiException -> error.kind.name
@@ -500,10 +528,11 @@ object WeReadEinkRuntime {
             val updated = updateAccount(account.vid) {
                 it.authState = "HEALTHY"
                 it.lastScheduledSyncResult = "SUCCESS"
+                it.humanVerifyCycleCount = 0
+                it.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
             }
             if (updated) {
                 account.humanVerificationReported.set(false)
-                account.lastHumanVerifyNotificationAt.set(0L)
                 noteHumanVerifyRecovery(account, previousState)
             }
             updated
@@ -516,6 +545,7 @@ object WeReadEinkRuntime {
             val updated = updateAccount(account.vid) {
                 if (error is WeReadEinkApiException && error.kind == WeReadEinkResponseKind.HUMAN_VERIFY) {
                     it.authState = "HUMAN_VERIFY_REQUIRED"
+                    it.humanVerifyCycleCount++
                 }
                 it.lastScheduledSyncResult = when (error) {
                     is WeReadEinkApiException -> error.kind.name
@@ -591,8 +621,8 @@ object WeReadEinkRuntime {
     }
 
     private fun notifyHumanVerification(account: AccountRuntime, error: WeReadEinkApiException) {
-        // 同一封禁期间最多每 3 小时提醒一次（防止机器人刷屏）；恢复成功后窗口清零，
-        // 新的 -2041 封禁会立即提醒。CAS 保证并发下只有一条提醒发出。
+        // 同一封禁期间最多每 3 小时提醒一次（防止机器人刷屏）；恢复成功后从恢复时刻
+        // 重新起算，短时间内再次 -2041 不重复发送验证页。CAS 保证并发下只有一条提醒发出。
         val now = System.currentTimeMillis()
         while (true) {
             val last = account.lastHumanVerifyNotificationAt.get()
@@ -781,6 +811,7 @@ object WeReadEinkRuntime {
             "last_probe_result" to account.lastProbeResult,
             "last_probe_error" to account.lastProbeError,
             "last_scheduled_sync_result" to account.lastScheduledSyncResult,
+            "human_verify_cycle" to account.humanVerifyCycleCount,
             "scheduled_sync_success_count" to successCount,
             "scheduled_sync_failure_count" to failureCount,
             "scheduled_sync_success_rate" to if (total == 0L) null else {
