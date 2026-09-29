@@ -220,6 +220,51 @@ class WeReadEinkSessionTest {
         }
     }
 
+    /**
+     * 锁序契约回归测试（2026-09 死锁事故）：
+     *
+     * `persistPendingCredentialsLocked` 会在 `persistenceLock`（运行时传入的
+     * credentialWriteLock）临界区内回调 `isCurrentSession`。运行时侧的
+     * `reload()` 以 runtimeLock → credentialWriteLock 顺序持锁，因此校验器
+     * 一旦在此回调里再获取 runtimeLock，两条路径就会以相反顺序互相等待，
+     * 构成 AB-BA 死锁并挂死整个 E-Ink 通道与状态接口。
+     *
+     * 本用例断言该回调确实在 persistenceLock 临界区内被调用——以此固定
+     * “isCurrentSession 必须无锁、非阻塞”的契约，防止未来实现再次引入
+     * 反向锁序。
+     */
+    @Test
+    fun `isCurrentSession is invoked under persistenceLock and therefore must stay lock-free`() {
+        val persistenceLock = Any()
+        var callbackHeldPersistenceLock = false
+        var persisted = 0
+        val session = WeReadEinkSession(
+            initialCredentials = credentials(),
+            transport = WeReadEinkTransport {
+                WeReadEinkResponse(200, "{\"accessToken\":\"access-2\",\"refreshToken\":\"refresh-2\"}")
+            },
+            credentialStore = object : WeReadEinkCredentialSink {
+                override fun load(): WeReadEinkCredentials? = null
+
+                override fun save(credentials: WeReadEinkCredentials) {
+                    persisted++
+                }
+            },
+            baseUrl = "https://eink.example.test",
+            persistenceLock = persistenceLock,
+            isCurrentSession = {
+                callbackHeldPersistenceLock = Thread.holdsLock(persistenceLock)
+                true
+            },
+        )
+
+        val refreshed = session.refresh()
+
+        assertEquals("access-2", refreshed.accessToken)
+        assertTrue(callbackHeldPersistenceLock, "isCurrentSession 必须在 persistenceLock 临界区内被调用")
+        assertEquals(1, persisted, "校验通过后待持久化凭证必须恰好写回一次")
+    }
+
     private fun credentials() = WeReadEinkCredentials(
         vid = "vid-1",
         accessToken = "access-1",

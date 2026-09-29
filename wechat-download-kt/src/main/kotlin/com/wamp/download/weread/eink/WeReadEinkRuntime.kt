@@ -268,7 +268,11 @@ object WeReadEinkRuntime {
                 profile = profile,
                 baseUrl = AppConfig.wereadEinkBaseUrl,
                 isCurrentSession = {
-                    val current = synchronized(runtimeLock) { accounts[record.vid] }
+                    // 无锁校验:该回调在 credentialWriteLock(persistenceLock)临界区内被回调,
+                    // 绝不能再获取 runtimeLock——reload() 以 runtimeLock→credentialWriteLock
+                    // 顺序持锁,反向嵌套会构成 AB-BA 死锁。accounts 是 ConcurrentHashMap,
+                    // 单次 get 本身线程安全,generation 为 volatile。
+                    val current = accounts[record.vid]
                     current === runtime && runtime.generation == generation
                 },
                 persistenceLock = credentialWriteLock,
