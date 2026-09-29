@@ -148,11 +148,20 @@ object WeReadEinkRuntime {
     /** 任务请求成功：把结果记到对应账号（service 精确定位，缺失时回退最近选号/主账号）。 */
     fun recordTaskRequestSuccess(service: WeReadEinkSyncService? = null) {
         val account = accountFor(service) ?: return
+        val previousState = account.authState
         updateAccount(account.vid) {
             it.authState = "HEALTHY"
             it.humanVerificationReported.set(false)
             it.lastHumanVerifyNotificationAt.set(0L)
         }
+        noteHumanVerifyRecovery(account, previousState)
+    }
+
+    /** 人工验证恢复后进入温和请求窗口，避免刚恢复就再次触发 -2041。 */
+    private fun noteHumanVerifyRecovery(account: AccountRuntime, previousState: String) {
+        if (previousState != "HUMAN_VERIFY_REQUIRED" || account.authState != "HEALTHY") return
+        WeReadEinkRequestGate.markHumanVerifyRecovered(account.vid)
+        logger.info("E-Ink 账号人工验证已恢复，进入 30 分钟温和请求期: vid=${account.vid}")
     }
 
     fun recordTaskRequestFailure(service: WeReadEinkSyncService?, error: Throwable) {
@@ -416,6 +425,7 @@ object WeReadEinkRuntime {
                 return false
             }
             account.service.probe(target)
+            val previousState = account.authState
             val updated = updateAccount(vid) {
                 it.authState = "HEALTHY"
                 it.lastProbeAt = System.currentTimeMillis()
@@ -425,6 +435,7 @@ object WeReadEinkRuntime {
             if (updated) {
                 account.humanVerificationReported.set(false)
                 account.lastHumanVerifyNotificationAt.set(0L)
+                noteHumanVerifyRecovery(account, previousState)
             }
             return updated
         } catch (error: Exception) {
@@ -485,6 +496,7 @@ object WeReadEinkRuntime {
         return try {
             service.sync(target, backgroundWorkAllowed)
             account.scheduledSyncSuccessCount.incrementAndGet()
+            val previousState = account.authState
             val updated = updateAccount(account.vid) {
                 it.authState = "HEALTHY"
                 it.lastScheduledSyncResult = "SUCCESS"
@@ -492,6 +504,7 @@ object WeReadEinkRuntime {
             if (updated) {
                 account.humanVerificationReported.set(false)
                 account.lastHumanVerifyNotificationAt.set(0L)
+                noteHumanVerifyRecovery(account, previousState)
             }
             updated
         } catch (_: WeReadEinkBackgroundYieldException) {

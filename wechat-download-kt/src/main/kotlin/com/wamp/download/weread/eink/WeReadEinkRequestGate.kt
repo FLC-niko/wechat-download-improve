@@ -40,6 +40,22 @@ internal object WeReadEinkRequestGate {
     private const val VERIFICATION_WAIT_SLICE_MS = 500L
     private const val MAX_RESERVE_ATTEMPTS = 10
 
+    /**
+     * 请求节奏下限（毫秒）。
+     *
+     * 2026-09-29 风控复盘：原 2 秒/请求 + 每 10~19 次一次 30~120 秒长停顿仍会触发 -2041。
+     * 调整为 4 秒/请求、每 6~11 次一次 45~180 秒长停顿，并给每次请求附加最多 1.2 秒抖动，
+     * 让请求间隔更接近人工操作，降低被判定为自动化行为的概率。
+     */
+    private const val MIN_REQUEST_INTERVAL_FLOOR_MS = 4_000L
+
+    /** 人工验证恢复后的温和请求窗口：节奏减半、长停顿更频繁，避免刚恢复就被再次击中。 */
+    private const val HUMAN_VERIFY_WARMUP_MS = 30 * 60 * 1000L
+    private const val WARMUP_INTERVAL_MULTIPLIER = 2L
+
+    /** 人工验证恢复后的温和窗口截止时间（vid → epoch ms）。 */
+    private val warmupUntil = ConcurrentHashMap<String, Long>()
+
     /** Marks the current thread as the captcha recovery probe; nested safely. */
     fun <T> asVerificationProbe(block: () -> T): T {
         val previous = verificationProbeThread.get()
@@ -52,6 +68,14 @@ internal object WeReadEinkRequestGate {
     }
 
     fun isVerificationProbeRequest(): Boolean = verificationProbeThread.get()
+
+    /** 账号完成人工验证恢复健康后调用：进入温和请求窗口。 */
+    fun markHumanVerifyRecovered(vid: String, warmupMs: Long = HUMAN_VERIFY_WARMUP_MS) {
+        warmupUntil[vid] = System.currentTimeMillis() + warmupMs
+    }
+
+    private fun isWarmingUp(vid: String): Boolean =
+        (warmupUntil[vid] ?: 0L) > System.currentTimeMillis()
 
     fun beginVerification(vid: String) {
         verificationActive.add(vid)
@@ -105,20 +129,27 @@ internal object WeReadEinkRequestGate {
      */
     private fun reserveRequestSlot(vid: String): Long {
         val configuredMinIntervalMs = AppConfig.wereadEinkMinRequestInterval * 1000L
-        val minIntervalMs = maxOf(configuredMinIntervalMs, 2000L) // Force at least 2 seconds for E-Ink requests
+        val warmingUp = isWarmingUp(vid)
+        val baseIntervalMs = maxOf(configuredMinIntervalMs, MIN_REQUEST_INTERVAL_FLOOR_MS)
+        val minIntervalMs = if (warmingUp) baseIntervalMs * WARMUP_INTERVAL_MULTIPLIER else baseIntervalMs
 
         while (true) {
             val now = System.currentTimeMillis()
             val previous = lastRequestAt[vid] ?: 0L
             val waitMs = previous + minIntervalMs - now
             if (waitMs > 0L) {
-                return waitMs + Random.nextLong(0L, 250L)
+                return waitMs + Random.nextLong(0L, 1_200L)
             }
             if (lastRequestAt.replace(vid, previous, now) || lastRequestAt.putIfAbsent(vid, now) == null) {
                 val count = requestCounts.compute(vid) { _, current -> (current ?: 0) + 1 } ?: 1
-                if (count >= Random.nextInt(10, 20)) {
+                val jitterTrigger = if (warmingUp) Random.nextInt(3, 6) else Random.nextInt(6, 12)
+                if (count >= jitterTrigger) {
                     requestCounts[vid] = 0
-                    val jitterMs = Random.nextLong(30_000L, 120_000L)
+                    val jitterMs = if (warmingUp) {
+                        Random.nextLong(30_000L, 90_000L)
+                    } else {
+                        Random.nextLong(45_000L, 180_000L)
+                    }
                     lastRequestAt[vid] = now + jitterMs
                     return jitterMs
                 }
