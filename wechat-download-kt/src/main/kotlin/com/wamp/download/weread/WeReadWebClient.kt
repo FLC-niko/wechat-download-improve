@@ -220,7 +220,20 @@ class WeReadWebClient {
                         WeReadAccountPool.markFreqControl(account.vid)
                     }
                     PageKind.HUMAN_VERIFY -> {
-                        logger.warn("微信读书要求人工验证，停止自动重试: vid=${account.vid}, mpId=$mpId")
+                        // -2041 是账号级风控：同一账号继续请求只会重复失败并加重风控
+                        // （2026-09-29 复盘：任务洪峰下同一账号被反复取号，-2041 日志达
+                        // 56+ 条/小时）。这里把账号标记为失效并只触发一次恢复，其余任务
+                        // 直接走缓存/其他账号，不再形成请求风暴。
+                        logger.warn("微信读书要求人工验证，标记账号并停止自动重试: vid=${account.vid}, mpId=$mpId")
+                        val recoveryCount = WeReadAccountPool.markAuthExpired(account.vid, "人工验证(-2041)")
+                        if (recoveryCount <= 1) {
+                            WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
+                        } else {
+                            logger.info(
+                                "微信读书账号已因人工验证进入恢复流程，跳过重复重登请求: " +
+                                    "vid=${account.vid}, count=$recoveryCount",
+                            )
+                        }
                         return WeReadPage(emptyList(), account.vid, PageOutcome.HUMAN_VERIFY)
                     }
                     PageKind.RETRYABLE_ERROR -> return WeReadPage(emptyList(), account.vid, PageOutcome.RETRYABLE_ERROR)
