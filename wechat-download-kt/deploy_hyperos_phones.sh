@@ -42,8 +42,11 @@ for serial in "${devices[@]}"; do
         # HyperOS 2 专属：赋予相册读取权限与后台弹出界面权限 (10021)
         adb -s "$serial" shell pm grant --user "$user_id" com.tencent.mm android.permission.READ_MEDIA_IMAGES >/dev/null 2>&1 || true
         adb -s "$serial" shell pm grant --user "$user_id" com.tencent.mm android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true
+        # 安装 APK 后 MIUI 会重置以下 appops；缺少时 OfficialIMMActivityCompat 读剪贴板
+        # 会被静默拦截（表现为采集链停在 CopyOfficialArticleURL 之后不再推进）。
         adb -s "$serial" shell cmd appops set --user "$user_id" "$PACKAGE" 10021 allow >/dev/null 2>&1 || true
         adb -s "$serial" shell cmd appops set --user "$user_id" "$PACKAGE" SYSTEM_ALERT_WINDOW allow >/dev/null 2>&1 || true
+        adb -s "$serial" shell cmd appops set --user "$user_id" "$PACKAGE" RUN_IN_BACKGROUND allow >/dev/null 2>&1 || true
         echo "    user=$user_id accessibility=enabled, media/popup permissions granted"
     done
 
