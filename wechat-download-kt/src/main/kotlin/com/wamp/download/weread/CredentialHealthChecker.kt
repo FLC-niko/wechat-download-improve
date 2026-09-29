@@ -99,8 +99,23 @@ object CredentialHealthChecker {
                 "凭证检测: ${expired.size} 个微信读书 Web 账号等待恢复: " +
                     expired.joinToString { "${it.first}=${it.second}" },
             )
+            val deviceRecoveryHandlesLogin = WeReadWebAuth.isDeviceRecoveryConfigured()
             expired.forEach { (vid, result) ->
-                if (reportedExpiredAccounts.add(vid)) {
+                // 设备（ADB/AAOS）已承接登录时不再重复发送机器人扫码提醒：
+                // 之前每次健康检查/重启都会推一条，运维侧收到大量重复登录提示。
+                val handledByDevice = deviceRecoveryHandlesLogin && when (result) {
+                    WeReadWebAuth.ReloginRequestResult.STARTED,
+                    WeReadWebAuth.ReloginRequestResult.ALREADY_RUNNING,
+                    WeReadWebAuth.ReloginRequestResult.BACKOFF,
+                    -> true
+                    else -> false
+                }
+                if (handledByDevice) {
+                    logger.info(
+                        "凭证检测: Web 账号已由设备(AAOS)自动登录承接，跳过机器人扫码提醒: " +
+                            "vid=$vid, result=$result",
+                    )
+                } else if (reportedExpiredAccounts.add(vid)) {
                     WebhookNotifier.notify(
                         "weread_accounts_expired",
                         mapOf(

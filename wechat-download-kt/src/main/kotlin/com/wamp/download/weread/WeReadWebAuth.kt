@@ -74,6 +74,9 @@ object WeReadWebAuth {
         deviceRecoveryHandler = handler
     }
 
+    /** 是否已配置设备（ADB/AAOS）自动登录接管。 */
+    fun isDeviceRecoveryConfigured(): Boolean = deviceRecoveryHandler != null
+
     /** 达到重新扫码阈值时异步发起登录（操作主账号，兼容入口） */
     fun requestReloginIfNeeded(): ReloginRequestResult {
         val vid = WeReadAccountPool.primaryAccount()?.vid ?: return ReloginRequestResult.NO_ACCOUNT
