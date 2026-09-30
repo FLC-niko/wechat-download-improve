@@ -29,6 +29,13 @@ internal data class WeReadEinkAccountCandidate(
     val authState: String,
 )
 
+internal data class WeReadEinkHealthProbeCandidate(
+    val vid: String,
+    val authState: String,
+    val lastProbeAt: Long,
+    val humanVerifyCycleCount: Int,
+)
+
 object WeReadEinkRuntime {
     private val logger = LoggerFactory.getLogger(WeReadEinkRuntime::class.java)
     private val runtimeLock = Any()
@@ -137,17 +144,35 @@ object WeReadEinkRuntime {
 
     fun primaryVidOrNull(): String? = synchronized(runtimeLock) { primaryVid }
 
-    /** Keeps automatic recovery detection, but backs off aggressively while human action is required. */
-    fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = synchronized(runtimeLock) {
-        accounts.values.any { account ->
-            !healthProbeSuppressed(
+    /** 仅在至少一个账号的独立退避到期时执行健康检查。 */
+    fun shouldRunHealthProbe(now: Long = System.currentTimeMillis()): Boolean = dueHealthProbeAccounts(now).isNotEmpty()
+
+    private fun dueHealthProbeAccounts(now: Long): List<AccountRuntime> = synchronized(runtimeLock) {
+        val ordered = accounts.values.sortedBy { it.vid }
+        val dueVids = dueHealthProbeVids(ordered.map { account ->
+            WeReadEinkHealthProbeCandidate(
+                vid = account.vid,
+                authState = account.authState,
+                lastProbeAt = account.lastProbeAt,
+                humanVerifyCycleCount = account.humanVerifyCycleCount,
+            )
+        }, now)
+        ordered.filter { it.vid in dueVids }
+    }
+
+    internal fun dueHealthProbeVids(
+        candidates: List<WeReadEinkHealthProbeCandidate>,
+        now: Long,
+    ): Set<String> = candidates.asSequence()
+        .filterNot { account ->
+            healthProbeSuppressed(
                 state = account.authState,
                 lastProbeAt = account.lastProbeAt,
                 now = now,
                 humanVerifyProbeIntervalMs = humanVerifyProbeIntervalMs(account.humanVerifyCycleCount),
             )
         }
-    }
+        .mapTo(mutableSetOf()) { it.vid }
 
     /**
      * -2041 后探测退避：1h→2h→4h→8h→12h 递增。
@@ -407,17 +432,17 @@ object WeReadEinkRuntime {
         return refreshedAny
     }
 
-    /** Uses one known public-account id for a real authenticated probe without advancing sync state. */
-    fun probe(): Boolean {
+    /** 只探测各自退避已到期的账号，不因其中一个账号到期而提前请求其他账号。 */
+    fun probe(now: Long = System.currentTimeMillis()): Boolean {
         val verificationProbe = WeReadEinkRequestGate.isVerificationProbeRequest()
-        val targets = synchronized(runtimeLock) {
-            if (verificationProbe) {
+        val targets = if (verificationProbe) {
+            synchronized(runtimeLock) {
                 // 无 vid 上下文的验证探测（旧调用）只允许主账号，避免票据被其他账号消耗。
                 // 人工验证的正式路径使用 probeAccount(vid)，票据只交给目标账号。
                 listOfNotNull(primaryAccount())
-            } else {
-                accounts.values.sortedBy { it.vid }
             }
+        } else {
+            dueHealthProbeAccounts(now)
         }
         if (targets.isEmpty()) return false
         var anySucceeded = false

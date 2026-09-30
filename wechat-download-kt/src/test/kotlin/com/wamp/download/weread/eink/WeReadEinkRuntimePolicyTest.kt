@@ -55,6 +55,18 @@ class WeReadEinkRuntimePolicyTest {
     }
 
     @Test
+    fun `一个账号到期不提前探测另一个仍在退避的账号`() {
+        val now = 10_000_000L
+        val candidates = listOf(
+            WeReadEinkHealthProbeCandidate("due", "HUMAN_VERIFY_REQUIRED", now - 7_200_000L, 2),
+            WeReadEinkHealthProbeCandidate("waiting", "HUMAN_VERIFY_REQUIRED", now - 7_200_000L, 3),
+            WeReadEinkHealthProbeCandidate("unknown", "UNKNOWN", 0L, 0),
+        )
+
+        assertEquals(setOf("due", "unknown"), WeReadEinkRuntime.dueHealthProbeVids(candidates, now))
+    }
+
+    @Test
     fun `least_used 选号过滤熔断账号并取最久未用`() {
         val candidates = listOf(
             WeReadEinkAccountCandidate("vid-a", lastUsedAt = 300L, authState = "HEALTHY"),
