@@ -198,8 +198,9 @@ object WeReadEinkRuntime {
         updateAccount(account.vid) {
             it.authState = "HEALTHY"
             it.humanVerificationReported.set(false)
-            // 恢复后重新起算 3 小时提醒窗口：短时间再次 -2041 不重复发送验证页。
-            it.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
+            it.lastHumanVerifyNotificationAt.set(
+                humanVerifyNotificationAtAfterSuccess(previousState, it.lastHumanVerifyNotificationAt.get()),
+            )
             it.humanVerifyCycleCount = 0
         }
         noteHumanVerifyRecovery(account, previousState)
@@ -211,6 +212,13 @@ object WeReadEinkRuntime {
         WeReadEinkRequestGate.markHumanVerifyRecovered(account.vid)
         logger.info("E-Ink 账号人工验证已恢复，进入 30 分钟温和请求期: vid=${account.vid}")
     }
+
+    /** 真正脱离人工验证状态后，下一次 -2041 是新的验证事件，应立即提醒。 */
+    internal fun humanVerifyNotificationAtAfterSuccess(previousState: String, lastNotifiedAt: Long): Long =
+        if (previousState == "HUMAN_VERIFY_REQUIRED") 0L else lastNotifiedAt
+
+    internal fun humanVerifyNotificationSuppressed(lastNotifiedAt: Long, now: Long): Boolean =
+        lastNotifiedAt > 0L && now - lastNotifiedAt < HUMAN_VERIFY_REMINDER_INTERVAL_MS
 
     fun recordTaskRequestFailure(service: WeReadEinkSyncService?, error: Throwable) {
         val account = accountFor(service) ?: return
@@ -255,7 +263,7 @@ object WeReadEinkRuntime {
             val account = accounts.values.firstOrNull { it.service === installedService } ?: return@synchronized
             account.authState = "HEALTHY"
             account.humanVerificationReported.set(false)
-            account.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
+            account.lastHumanVerifyNotificationAt.set(0L)
             account.humanVerifyCycleCount = 0
             account.lastProbeAt = System.currentTimeMillis()
             account.lastProbeResult = "QR_LOGIN_SUCCEEDED"
@@ -481,7 +489,9 @@ object WeReadEinkRuntime {
                 it.lastProbeResult = "SUCCESS"
                 it.lastProbeError = null
                 it.humanVerifyCycleCount = 0
-                it.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
+                it.lastHumanVerifyNotificationAt.set(
+                    humanVerifyNotificationAtAfterSuccess(previousState, it.lastHumanVerifyNotificationAt.get()),
+                )
             }
             if (updated) {
                 account.humanVerificationReported.set(false)
@@ -554,7 +564,9 @@ object WeReadEinkRuntime {
                 it.authState = "HEALTHY"
                 it.lastScheduledSyncResult = "SUCCESS"
                 it.humanVerifyCycleCount = 0
-                it.lastHumanVerifyNotificationAt.set(System.currentTimeMillis())
+                it.lastHumanVerifyNotificationAt.set(
+                    humanVerifyNotificationAtAfterSuccess(previousState, it.lastHumanVerifyNotificationAt.get()),
+                )
             }
             if (updated) {
                 account.humanVerificationReported.set(false)
@@ -646,12 +658,12 @@ object WeReadEinkRuntime {
     }
 
     private fun notifyHumanVerification(account: AccountRuntime, error: WeReadEinkApiException) {
-        // 同一封禁期间最多每 3 小时提醒一次（防止机器人刷屏）；恢复成功后从恢复时刻
-        // 重新起算，短时间内再次 -2041 不重复发送验证页。CAS 保证并发下只有一条提醒发出。
+        // 同一次封禁期间最多每 3 小时提醒一次；成功恢复后再次 -2041 属于新事件。
+        // CAS 保证并发下只有一条提醒发出。
         val now = System.currentTimeMillis()
         while (true) {
             val last = account.lastHumanVerifyNotificationAt.get()
-            if (last > 0L && now - last < HUMAN_VERIFY_REMINDER_INTERVAL_MS) {
+            if (humanVerifyNotificationSuppressed(last, now)) {
                 logger.info(
                     "E-Ink 人工验证提醒静默中（每 3 小时最多一条），跳过本次: vid=${account.vid}, 距上次 ${(now - last) / 60_000} 分钟",
                 )

@@ -8,6 +8,30 @@ import kotlin.test.assertTrue
 
 class WeReadEinkRuntimePolicyTest {
     @Test
+    fun `验证恢复后再次受限立即提醒 同一次受限仍按三小时限频`() {
+        val firstNoticeAt = 1_000_000L
+        val blockedAgainAt = firstNoticeAt + 6 * 60_000L
+        val afterRecovery = WeReadEinkRuntime.humanVerifyNotificationAtAfterSuccess(
+            "HUMAN_VERIFY_REQUIRED",
+            firstNoticeAt,
+        )
+
+        assertFalse(WeReadEinkRuntime.humanVerifyNotificationSuppressed(afterRecovery, blockedAgainAt))
+        assertTrue(WeReadEinkRuntime.humanVerifyNotificationSuppressed(blockedAgainAt, blockedAgainAt + 60_000L))
+        assertFalse(
+            WeReadEinkRuntime.humanVerifyNotificationSuppressed(
+                blockedAgainAt,
+                blockedAgainAt + 3 * 60 * 60_000L,
+            ),
+        )
+        assertEquals(
+            firstNoticeAt,
+            WeReadEinkRuntime.humanVerifyNotificationAtAfterSuccess("HEALTHY", firstNoticeAt),
+            "普通成功请求不应重置同一次验证事件的提醒窗口",
+        )
+    }
+
+    @Test
     fun `人工验证状态阻止任务继续请求 E-Ink`() {
         assertTrue(WeReadEinkRuntime.taskSyncSuppressed("HUMAN_VERIFY_REQUIRED"))
         assertTrue(WeReadEinkRuntime.taskSyncSuppressed("REAUTH_REQUIRED"))
