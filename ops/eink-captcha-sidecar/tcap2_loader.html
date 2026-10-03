@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+<meta charset="utf-8">
+<title>E-Ink -2041 本地联调验证页（mock sidecar）</title>
+<!--
+  本地联调用页，界面参考 hailan09/crackTCaptcha 的 examples/tcap2_loader.html，
+  但脚本源改为同目录的 mock-tcaptcha.js：不拉取腾讯 TJCaptcha.js，也不发起真实验证码求解。
+  打开方式：http://127.0.0.1:8765/tcap2_loader.html?appid=2044038556
+-->
+<script src="./TCaptcha.js"></script>
+<style>
+  body { font-family: sans-serif; padding: 24px; background: #fafafa; }
+  #tcaptcha { width: 360px; height: 56px; border: 1px solid #ddd; margin: 12px 0; line-height: 56px; text-align: center; color: #667085; }
+  #trigger { padding: 12px 24px; font-size: 16px; }
+  pre { background: #fff; padding: 12px; border: 1px solid #eee; white-space: pre-wrap; max-width: 720px; }
+  .ok { color: #0a7b34; font-weight: bold; font-size: 18px; }
+  .fail { color: #b40000; font-weight: bold; font-size: 18px; }
+</style>
+</head>
+<body>
+<h1>E-Ink -2041 本地联调验证页</h1>
+<div id="tcaptcha"></div>
+<button id="trigger">触发验证码（本地 sidecar）</button>
+<h3>callback result</h3>
+<div id="status">(waiting)</div>
+<pre id="out">(waiting)</pre>
+
+<script>
+var params = new URLSearchParams(location.search);
+var appid = params.get('appid') || '2044038556';
+
+function cb(res) {
+  document.getElementById('out').textContent = JSON.stringify(res, null, 2);
+  var st = document.getElementById('status');
+  if (res && res.ret === 0 && res.ticket && !String(res.ticket).startsWith('trerror')) {
+    st.className = 'ok';
+    st.textContent = '本地 sidecar 返回 ticket=' + String(res.ticket).slice(0, 40) + '...';
+  } else {
+    st.className = 'fail';
+    st.textContent = '失败：ret=' + (res && res.ret) + ' msg=' + ((res && res.errorMessage) || '');
+  }
+}
+
+var cap = new TencentCaptcha(
+  document.getElementById('tcaptcha'),
+  appid,
+  cb,
+  {}
+);
+document.getElementById('trigger').addEventListener('click', function () {
+  cap.show();
+});
+</script>
+</body>
+</html>

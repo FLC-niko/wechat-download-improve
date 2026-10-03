@@ -1,0 +1,51 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama-local/qwen36-vibeforged-local:latest",
+  "provider": {
+    "ollama-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama 本地",
+      "options": {
+        "baseURL": "http://127.0.0.1:11434/v1",
+        "timeout": 600000,
+        "chunkTimeout": 600000
+      },
+      "models": {
+        "qwen36-vibeforged-local:latest": {
+          "name": "Qwen3.6 14B-A3B VibeForged 64K",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          },
+          "options": {
+            "reasoningEffort": "none",
+            "temperature": 0.3,
+            "top_p": 0.95,
+            "presence_penalty": 0
+          }
+        }
+      }
+    }
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true
+  },
+  "permission": {
+    "edit": "allow",
+    "bash": {
+      "*": "ask",
+      "pwd": "allow",
+      "ls*": "allow",
+      "find *": "allow",
+      "rg *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "./wechat-download-kt/gradlew test*": "allow",
+      "./wechat-download-kt/gradlew clean test installDist --no-daemon*": "allow",
+      "git commit*": "ask",
+      "git push*": "deny"
+    }
+  }
+}

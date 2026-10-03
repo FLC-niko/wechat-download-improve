@@ -8,6 +8,7 @@ import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.security.SecureRandom
 import java.util.Base64
+import java.util.UUID
 import javax.imageio.ImageIO
 
 enum class WeReadEinkVerificationState {
@@ -52,6 +53,8 @@ internal class WeReadEinkHumanVerificationCoordinator(
         val nonce: String,
         val createdAt: Long,
         val expiresAt: Long,
+        val evaluationId: String = UUID.randomUUID().toString(),
+        var verificationStartedAt: Long? = null,
         var state: WeReadEinkVerificationState = WeReadEinkVerificationState.WAITING,
         var lastError: String? = null,
     )
@@ -62,6 +65,7 @@ internal class WeReadEinkHumanVerificationCoordinator(
     private val completionLock = Any()
 
     private val challenges = LinkedHashMap<String, Challenge>()
+    private val evaluationRecorder = WeReadEinkVerificationEvaluationRecorder()
 
     private var transientHeaders: Map<String, String> = emptyMap()
 
@@ -82,7 +86,10 @@ internal class WeReadEinkHumanVerificationCoordinator(
                 nonce = nonceGenerator(),
                 createdAt = now,
                 expiresAt = now + ttlMs,
-            ).also { challenges[vid] = it }
+            ).also {
+                challenges[vid] = it
+                recordEvaluationLocked(it, now)
+            }
         }
         active.toStatus(siteUrl)
     }
@@ -90,6 +97,11 @@ internal class WeReadEinkHumanVerificationCoordinator(
     fun status(vid: String, siteUrl: String): WeReadEinkVerificationStatus = synchronized(lock) {
         expireIfNeededLocked(vid)
         challenges[vid]?.toStatus(siteUrl) ?: WeReadEinkVerificationStatus(WeReadEinkVerificationState.IDLE)
+    }
+
+    fun evaluation(vid: String): WeReadEinkVerificationEvaluationSnapshot = synchronized(lock) {
+        expireIfNeededLocked(vid)
+        evaluationRecorder.snapshot(vid, clock())
     }
 
     fun canOpen(vid: String, nonce: String): Boolean = synchronized(lock) {
@@ -114,7 +126,7 @@ internal class WeReadEinkHumanVerificationCoordinator(
             return result(false, "INVALID_CAPTCHA_RESULT", "验证码结果无效，请刷新页面后重试")
         }
 
-        synchronized(lock) {
+        val verificationSessionId = synchronized(lock) {
             expireIfNeededLocked(vid)
             val current = challenges[vid]
                 ?: return result(false, "NOT_FOUND", "验证链接不存在或已失效")
@@ -129,33 +141,48 @@ internal class WeReadEinkHumanVerificationCoordinator(
             }
             current.state = WeReadEinkVerificationState.VERIFYING
             current.lastError = null
-            transientHeaders = mapOf(
-                "wr_ticket" to ticket!!,
-                "wr_randstr" to randstr!!,
-            )
+            current.verificationStartedAt = clock()
+            recordEvaluationLocked(current, current.verificationStartedAt!!)
+            current.evaluationId
         }
 
         val probeSucceeded = try {
             // 串行化探测：票据为进程单值，同一时刻只允许一个账号的验证探测使用它。
-            synchronized(completionLock) { probe(vid) }
+            synchronized(completionLock) {
+                val activeSession = synchronized(lock) {
+                    val current = challenges[vid]
+                    if (current?.evaluationId == verificationSessionId &&
+                        current.state == WeReadEinkVerificationState.VERIFYING) {
+                        transientHeaders = mapOf("wr_ticket" to ticket!!, "wr_randstr" to randstr!!)
+                        true
+                    } else false
+                }
+                if (activeSession) {
+                    try {
+                        probe(vid)
+                    } finally {
+                        synchronized(lock) { transientHeaders = emptyMap() }
+                    }
+                } else false
+            }
         } catch (_: Exception) {
             false
-        } finally {
-            synchronized(lock) { transientHeaders = emptyMap() }
         }
 
         return synchronized(lock) {
             val current = challenges[vid]
-            if (current == null || current.nonce != nonce) {
+            if (current == null || current.nonce != nonce || current.evaluationId != verificationSessionId) {
                 return@synchronized result(false, "SESSION_CHANGED", "E-Ink 会话已变化，请使用最新验证链接")
             }
             if (probeSucceeded) {
                 current.state = WeReadEinkVerificationState.SUCCEEDED
                 current.lastError = null
+                recordEvaluationLocked(current)
                 result(true, "RECOVERED", "验证成功，E-Ink 通道已恢复")
             } else {
                 current.state = WeReadEinkVerificationState.FAILED
                 current.lastError = "恢复探测未通过"
+                recordEvaluationLocked(current)
                 result(false, "PROBE_FAILED", "验证码已提交，但 E-Ink 恢复探测未通过，请获取新链接重试")
             }
         }
@@ -164,6 +191,7 @@ internal class WeReadEinkHumanVerificationCoordinator(
     fun reset() = synchronized(lock) {
         transientHeaders = emptyMap()
         challenges.clear()
+        evaluationRecorder.reset()
     }
 
     private fun expireIfNeededLocked(vid: String) {
@@ -171,8 +199,19 @@ internal class WeReadEinkHumanVerificationCoordinator(
         if (current.state == WeReadEinkVerificationState.WAITING && clock() >= current.expiresAt) {
             current.state = WeReadEinkVerificationState.EXPIRED
             current.lastError = "验证链接已过期"
-            transientHeaders = emptyMap()
+            recordEvaluationLocked(current)
         }
+    }
+
+    private fun recordEvaluationLocked(challenge: Challenge, at: Long = clock()) {
+        evaluationRecorder.record(
+            vid = challenge.vid,
+            sessionId = challenge.evaluationId,
+            state = challenge.state,
+            createdAt = challenge.createdAt,
+            verificationStartedAt = challenge.verificationStartedAt,
+            at = at,
+        )
     }
 
     private fun Challenge.toStatus(siteUrl: String): WeReadEinkVerificationStatus {
@@ -221,6 +260,11 @@ object WeReadEinkHumanVerification {
 
     fun status(vid: String, siteUrl: String): WeReadEinkVerificationStatus =
         coordinator.status(vid, siteUrl)
+
+    fun evaluation(vid: String): WeReadEinkVerificationEvaluationSnapshot = coordinator.evaluation(vid)
+
+    fun evaluationForVidOrEmpty(vid: String?): WeReadEinkVerificationEvaluationSnapshot =
+        coordinator.evaluation(vid.orEmpty())
 
     fun statusForVidOrIdle(vid: String?, siteUrl: String): WeReadEinkVerificationStatus =
         if (vid == null) {

@@ -135,12 +135,28 @@ class WeReadEinkHumanVerificationTest {
         val html = einkVerificationHtml("vid-safe", "safe-nonce")
 
         assertTrue(html.contains("https://ssl.captcha.qq.com/TCaptcha.js"))
-        assertTrue(html.contains("TencentCaptcha('2044038556'"))
+        assertTrue(html.contains("const captchaAppId = \"2044038556\";"))
+        assertTrue(html.contains("new TencentCaptcha(captchaAppId"))
         assertTrue(html.contains("/api/weread/eink/verify/vid-safe/safe-nonce/complete"))
         assertTrue(html.contains("/api/weread/eink/verify/vid-safe/status"))
         assertTrue(html.contains("vid-safe"))
         assertFalse(html.contains("accessToken"))
         assertFalse(html.contains("refreshToken"))
+    }
+
+    @Test
+    fun `verification page can load a sidecar captcha script without breaking escaping`() {
+        val html = einkVerificationHtml(
+            vid = "vid\"safe",
+            nonce = "nonce</script>",
+            captchaScriptUrl = "http://127.0.0.1:8765/TCaptcha.js",
+            captchaAppId = "local-appid",
+        )
+
+        assertTrue(html.contains("src=\"http://127.0.0.1:8765/TCaptcha.js\""))
+        assertTrue(html.contains("const captchaAppId = \"local-appid\";"))
+        assertTrue(html.contains("\\u003c/script\\u003e"))
+        assertFalse(html.contains("\"nonce</script>\""))
     }
 
     @Test

@@ -106,6 +106,18 @@ object AppConfig {
         get() = getBool("weread.eink.auto_qr_notification_enabled", true)
     val wereadEinkReloginRetryBackoff: Long
         get() = getLong("weread.eink.relogin_retry_backoff", 300L).coerceAtLeast(30L)
+
+    /**
+     * 人工验证页加载的验证码脚本与 appid：默认腾讯官方。
+     * 联调时可指向本地 sidecar（如 http://127.0.0.1:8765/TCaptcha.js），不改变生产默认行为。
+     */
+    val wereadEinkCaptchaScriptUrl: String
+        get() = getString(
+            "weread.eink.human_verify.captcha_script_url",
+            "https://ssl.captcha.qq.com/TCaptcha.js",
+        )
+    val wereadEinkCaptchaAppId: String
+        get() = getString("weread.eink.human_verify.captcha_appid", "2044038556")
     val wereadWebHealthCheckInterval: Long
         get() = getLong("weread.health_check_interval", 300L).coerceAtLeast(30L)
     val wereadWebProbeFreshness: Long

@@ -16,6 +16,7 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 fun Route.weReadEinkVerificationRoutes() {
     get("/weread/eink/verify/{vid}/{nonce}") {
@@ -31,7 +32,7 @@ fun Route.weReadEinkVerificationRoutes() {
             )
             return@get
         }
-        applyVerificationPageHeaders(call)
+        applyVerificationPageHeaders(call, AppConfig.wereadEinkCaptchaScriptUrl)
         call.respondText(
             einkVerificationHtml(vid, nonce),
             contentType = ContentType.parse("text/html; charset=UTF-8"),
@@ -85,6 +86,16 @@ fun Route.weReadEinkVerificationRoutes() {
     get("/api/weread/eink/verify/{vid}/status") {
         call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
         call.respond(WeReadEinkHumanVerification.status(call.parameters["vid"].orEmpty(), AppConfig.siteUrl))
+    }
+
+    get("/api/weread/eink/verify/evaluation") {
+        call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
+        call.respond(WeReadEinkHumanVerification.evaluationForVidOrEmpty(WeReadEinkRuntime.primaryVidOrNull()))
+    }
+
+    get("/api/weread/eink/verify/{vid}/evaluation") {
+        call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
+        call.respond(WeReadEinkHumanVerification.evaluation(call.parameters["vid"].orEmpty()))
     }
 
     get("/weread/eink/verify/{vid}/refresh") {
@@ -205,15 +216,20 @@ private suspend fun respondVerificationRefresh(call: ApplicationCall, vid: Strin
     call.respondRedirect(verifyUrl)
 }
 
-private fun applyVerificationPageHeaders(call: ApplicationCall) {
+private fun applyVerificationPageHeaders(call: ApplicationCall, captchaScriptUrl: String) {
     call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
     call.response.header("Pragma", "no-cache")
     call.response.header("Referrer-Policy", "no-referrer")
     call.response.header("X-Content-Type-Options", "nosniff")
+    val captchaOrigin = captchaScriptUrl.toHttpUrlOrNull()
+        ?.let { "${it.scheme}://${it.host}:${it.port}" }
+        .orEmpty()
+    val scriptSrc = "script-src 'self' 'unsafe-inline' https: $captchaOrigin".trim()
+    val connectSrc = "connect-src 'self' https: $captchaOrigin".trim()
     call.response.header(
         "Content-Security-Policy",
-        "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; " +
-            "style-src 'self' 'unsafe-inline'; frame-src https:; connect-src 'self' https:; img-src 'self' data: https:",
+        "default-src 'self' https:; $scriptSrc; $connectSrc; " +
+            "style-src 'self' 'unsafe-inline'; frame-src https:; img-src 'self' data: https:",
     )
 }
 
@@ -227,7 +243,34 @@ internal fun htmlEscape(value: String): String = value
     .replace("\"", "&quot;")
     .replace("'", "&#39;")
 
-internal fun einkVerificationHtml(vid: String, nonce: String): String = """
+/** 把值安全嵌入 <script> 内的 JS 字符串字面量，避免配置值或 vid/nonce 破坏页面脚本。 */
+internal fun jsStringLiteral(value: String): String {
+    val escaped = buildString(value.length + 8) {
+        for (ch in value) {
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '<' -> append("\\u003c")
+                '>' -> append("\\u003e")
+                '&' -> append("\\u0026")
+                '\u2028' -> append("\\u2028")
+                '\u2029' -> append("\\u2029")
+                else -> append(ch)
+            }
+        }
+    }
+    return "\"$escaped\""
+}
+
+internal fun einkVerificationHtml(
+    vid: String,
+    nonce: String,
+    captchaScriptUrl: String = AppConfig.wereadEinkCaptchaScriptUrl,
+    captchaAppId: String = AppConfig.wereadEinkCaptchaAppId,
+): String = """
     <!doctype html>
     <html lang="zh-CN">
     <head>
@@ -242,7 +285,7 @@ internal fun einkVerificationHtml(vid: String, nonce: String): String = """
         #status { min-height: 24px; margin-top: 18px; line-height: 1.6; }
         .hint { color: #667085; line-height: 1.7; }
       </style>
-      <script src="https://ssl.captcha.qq.com/TCaptcha.js"></script>
+      <script src="${htmlEscape(captchaScriptUrl)}"></script>
     </head>
     <body>
       <main>
@@ -254,12 +297,24 @@ internal fun einkVerificationHtml(vid: String, nonce: String): String = """
       <script>
         const button = document.getElementById('verify');
         const statusBox = document.getElementById('status');
-        const completeUrl = '/api/weread/eink/verify/${htmlEscape(vid)}/${htmlEscape(nonce)}/complete';
-        const statusUrl = '/api/weread/eink/verify/${htmlEscape(vid)}/status';
+        const captchaAppId = ${jsStringLiteral(captchaAppId)};
+        const completeUrl = ${jsStringLiteral("/api/weread/eink/verify/$vid/$nonce/complete")};
+        const statusUrl = ${jsStringLiteral("/api/weread/eink/verify/$vid/status")};
+        const verifyPagePath = ${jsStringLiteral("/weread/eink/verify/$vid/$nonce")};
+        const refreshPath = ${jsStringLiteral(refreshPathForVid(vid))};
         let pollTimer = null;
 
         function stopPolling() {
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        function showRenewLink(url) {
+          const link = document.createElement('a');
+          link.href = url;
+          link.textContent = '打开新的验证链接';
+          link.style.display = 'block';
+          link.style.marginTop = '12px';
+          statusBox.appendChild(link);
         }
 
         // The server-side probe can wait for background E-Ink sync to yield (up to ~2 minutes).
@@ -277,7 +332,14 @@ internal fun einkVerificationHtml(vid: String, nonce: String): String = """
               } else if (st.state === 'FAILED' || st.state === 'EXPIRED') {
                 stopPolling();
                 statusBox.textContent = st.lastError || '恢复探测未通过，请重新获取验证链接。';
-                button.disabled = false;
+                button.disabled = true;
+                showRenewLink(refreshPath);
+              } else if (st.state === 'WAITING' && st.verifyUrl &&
+                         new URL(st.verifyUrl, window.location.href).pathname !== verifyPagePath) {
+                stopPolling();
+                statusBox.textContent = '原验证会话已更新，请打开新的验证链接。';
+                button.disabled = true;
+                showRenewLink(st.verifyUrl);
               } else if (st.state === 'VERIFYING') {
                 statusBox.textContent = '服务器正在执行恢复探测（后台同步已让位，最多约 2 分钟）…';
               }
@@ -287,7 +349,7 @@ internal fun einkVerificationHtml(vid: String, nonce: String): String = """
 
         button.addEventListener('click', () => {
           statusBox.textContent = '正在打开验证码…';
-          const captcha = new TencentCaptcha('2044038556', async (result) => {
+          const captcha = new TencentCaptcha(captchaAppId, async (result) => {
             if (!result || result.ret !== 0) {
               statusBox.textContent = '验证已取消或未通过，可以再次点击重试。';
               return;
@@ -307,12 +369,7 @@ internal fun einkVerificationHtml(vid: String, nonce: String): String = """
               stopPolling();
               statusBox.textContent = payload.message || (response.ok ? '恢复成功。' : '恢复失败。');
               if (!response.ok && payload.nextUrl) {
-                const link = document.createElement('a');
-                link.href = payload.nextUrl;
-                link.textContent = '打开新的验证链接';
-                link.style.display = 'block';
-                link.style.marginTop = '12px';
-                statusBox.appendChild(link);
+                showRenewLink(payload.nextUrl);
               } else if (!response.ok) {
                 button.disabled = false;
               }

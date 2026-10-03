@@ -72,6 +72,11 @@ weread:
                                # 人工验证恢复后 30 分钟内自动进入温和期（间隔×2、停顿更频繁）
     auto_qr_notification_enabled: true # refreshToken 失效后自动发送人工扫码二维码；-2041 除外
     relogin_retry_backoff: 300  # 自动二维码流程失败后的最小重试间隔（秒）
+    human_verify:
+      # 人工验证页的验证码脚本与 appid；默认腾讯官方。联调时可指向本地 sidecar
+      # （例如 http://127.0.0.1:8765/TCaptcha.js，见 ops/eink-captcha-sidecar），生产不要改。
+      captcha_script_url: "https://ssl.captcha.qq.com/TCaptcha.js"
+      captcha_appid: "2044038556"
 
 adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启
