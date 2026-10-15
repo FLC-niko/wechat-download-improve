@@ -58,4 +58,15 @@ class LoginListenerOrderTest {
         assertFalse(account.isAvailable())
         assertEquals(credentials, account.credentials)
     }
+
+    @Test
+    fun `persisted human verification account reloads without crashing readiness`() {
+        val account = com.google.gson.Gson().fromJson(
+            """{"vid":"test","status":"HUMAN_VERIFY_REQUIRED","credentials":{"wrVid":"test","wrSkey":"fixture"}}""",
+            WeReadAccount::class.java,
+        ).normalized()
+        assertEquals(AccountStatus.HUMAN_VERIFY_REQUIRED, account.status)
+        assertTrue(account.hasWebCredentials())
+        assertFalse(account.isAvailable())
+    }
 }
