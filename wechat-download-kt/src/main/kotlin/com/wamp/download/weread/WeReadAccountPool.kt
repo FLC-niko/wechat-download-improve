@@ -50,6 +50,9 @@ object WeReadAccountPool {
                 try {
                     val acc = gson.fromJson(file.readText(), WeReadAccount::class.java).normalized()
                     if (acc.vid.isNotBlank()) {
+                        if (acc.status == AccountStatus.EXPIRED && acc.disabledReason.startsWith("人工验证(-2041)")) {
+                            acc.status = AccountStatus.HUMAN_VERIFY_REQUIRED
+                        }
                         // 落盘时可能为 COOLDOWN，读入时若已过冷却则恢复 ACTIVE
                         if (acc.status == AccountStatus.COOLDOWN && System.currentTimeMillis() >= acc.cooldownUntil) {
                             acc.status = AccountStatus.ACTIVE
@@ -434,6 +437,15 @@ object WeReadAccountPool {
         }
         if (updated) logger.warn("微信读书账号鉴权失效: vid=$vid, count=$count, reason=$reason")
         return if (updated) count else 0
+    }
+
+    /** 保留有效登录凭证，等待官方人工验证，不触发自动重登。 */
+    fun markHumanVerificationRequired(vid: String): Boolean {
+        probeSuccessAt.remove(vid)
+        return mutate(vid) {
+            it.status = AccountStatus.HUMAN_VERIFY_REQUIRED
+            it.disabledReason = "人工验证(-2041)，登录凭证保留；完成官方验证后重新启用"
+        }
     }
 
     /** 手动启用 / 禁用 */

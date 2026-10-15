@@ -13,6 +13,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -46,7 +49,7 @@ class DeviceRecoveryManager(
     }
 
     fun request(vid: String) {
-        if (WeReadAccountPool.get(vid) == null) {
+        if (WeReadAccountPool.get(vid)?.status.let { it == null || it == AccountStatus.HUMAN_VERIFY_REQUIRED }) {
             waiting.remove(vid)
             attempts.remove(vid)
             return
@@ -93,6 +96,7 @@ class DeviceRecoveryManager(
 
     internal suspend fun recover(vid: String): String? {
         val account = WeReadAccountPool.get(vid) ?: return null
+        if (account.status == AccountStatus.HUMAN_VERIFY_REQUIRED) return null
         val slot = chooseSlot(account)
         if (slot == null) {
             if ((attempts[vid]?.attempts ?: 0) == 0) notifyManual(account)
@@ -107,49 +111,38 @@ class DeviceRecoveryManager(
                 val login = WeReadWebAuth.createLogin() ?: return@withLock "创建微信读书登录二维码失败"
                 val qrFile = saveQrCode(login.second, vid) ?: return@withLock "保存微信读书登录二维码失败"
 
-                // 采用增强的推码与前置清理机制
-                val pushResult = operations.pushQrCode(slot, qrFile)
-                if (!pushResult.success) {
-                    qrFile.delete()
-                    logger.warn("微信读书二维码推送失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-                    lastFailureReason = "推送二维码到手机失败"
-                    continue
-                }
-
-                // AAOS 优先：登录链由手机端无障碍服务执行，服务端只推码 + 下发任务，
-                // 从根上避免服务端 ADB 与 AAOS 任务同时操控微信造成冲突。
-                // 服务未安装/未启用/开关关闭时回退服务端 ADB 坐标穿透管线。
                 val aaosLoginAvailable = AppConfig.adbAaosLoginEnabled &&
-                    operations.isReady(slot) &&
-                    operations.isAaosLoginServiceEnabled(slot)
-
+                    operations.isReady(slot) && operations.isAaosLoginServiceEnabled(slot)
+                var destinationPath: String? = null
                 try {
-                    if (aaosLoginAvailable) {
-                        logger.info("AAOS 无障碍链承接登录，下发 weread_login 任务: vid=$vid, serial=${slot.serial}")
-                        if (!operations.startWeReadLogin(slot)) {
-                            logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-                            lastFailureReason = "自动扫码启动失败"
-                            continue
-                        }
-                    } else {
-                        logger.info("设备执行现代坐标穿透自绘扫码管线 (第 $attempt 次): vid=$vid, serial=${slot.serial}")
-                        val scanResult = operations.performWeReadScanAndConfirm(slot, isWeb = true)
-                        if (scanResult == com.wamp.download.adb.ScanConfirmResult.LOGIN_FAILED_PAGE) {
-                            logger.warn("识别到微信页面提示【登录失败，请重新扫码登录】，退出并立即重试全新流程: vid=$vid (尝试 $attempt/$maxAttempts)")
-                            lastFailureReason = "页面提示登录失败重新扫码"
-                            Thread.sleep(800)
-                            continue
-                        }
-                        if (scanResult != com.wamp.download.adb.ScanConfirmResult.SUCCESS) {
-                            logger.warn("微信读书自动扫码流程启动失败: vid=$vid, serial=${slot.serial}, user=${slot.userId}")
-                            lastFailureReason = "自动扫码与点击流程启动失败"
-                            continue
-                        }
-                    }
-
-                    val credentials = WeReadWebAuth.pollLoginCredentials(
-                        login.first,
-                        timeoutSeconds = if (aaosLoginAvailable) AppConfig.adbAaosLoginPollTimeout else 60,
+                    // 官方网页在显示二维码后立即发起 getLoginInfo 长轮询。
+                    // 若先完成手机授权才监听，确认页会提示“登录失败，请重新扫码”。
+                    val credentials = scanWhileListening(
+                        listen = {
+                            runInterruptible(Dispatchers.IO) {
+                                WeReadWebAuth.pollLoginCredentials(
+                                    login.first,
+                                    timeoutSeconds = if (aaosLoginAvailable) AppConfig.adbAaosLoginPollTimeout else 120,
+                                )
+                            }
+                        },
+                        scan = {
+                            val pushResult = operations.pushQrCode(slot, qrFile)
+                            if (!pushResult.success) throw LoginScanFailure("推送二维码到手机失败")
+                            destinationPath = pushResult.destinationPath
+                            if (aaosLoginAvailable) {
+                                logger.info("AAOS 无障碍链承接登录，下发 weread_login 任务: vid=$vid, serial=${slot.serial}")
+                                if (!operations.startWeReadLogin(slot)) throw LoginScanFailure("自动扫码启动失败")
+                            } else {
+                                logger.info("设备执行现代坐标穿透自绘扫码管线 (第 $attempt 次): vid=$vid, serial=${slot.serial}")
+                                when (operations.performWeReadScanAndConfirm(slot, isWeb = true)) {
+                                    com.wamp.download.adb.ScanConfirmResult.LOGIN_FAILED_PAGE ->
+                                        throw LoginScanFailure("页面提示登录失败重新扫码")
+                                    com.wamp.download.adb.ScanConfirmResult.SUCCESS -> Unit
+                                    else -> throw LoginScanFailure("自动扫码与点击流程启动失败")
+                                }
+                            }
+                        },
                     )
                     if (credentials == null) {
                         logger.warn("微信读书自动恢复扫码超时: vid=$vid")
@@ -165,6 +158,9 @@ class DeviceRecoveryManager(
                     }
                     logger.info("微信读书账号自动恢复成功: vid=$vid, slotKey=${slot.slotKey}")
                     return@withLock null
+                } catch (error: LoginScanFailure) {
+                    lastFailureReason = error.message ?: "自动扫码失败"
+                    logger.warn("微信读书扫码流程未完成: vid=$vid, attempt=$attempt, reason=$lastFailureReason")
                 } finally {
                     // 1. 严格点击左上角叉叉关闭 WebView 并复位回微信根页面 LauncherUI
                     runCatching {
@@ -173,7 +169,7 @@ class DeviceRecoveryManager(
                         logger.warn("复位微信前台失败: vid=$vid, ${it.message}")
                     }
                     // 2. 严格阅后即焚清理临时图片
-                    operations.cleanupQrCode(slot, pushResult.destinationPath)
+                    destinationPath?.let { operations.cleanupQrCode(slot, it) }
                     qrFile.delete()
                 }
             }
@@ -240,5 +236,24 @@ class DeviceRecoveryManager(
                 "bound_serial" to account.boundSerial,
             ))
         }
+    }
+}
+
+private class LoginScanFailure(message: String) : Exception(message)
+
+/** Start the login listener before any phone authorization; cancel it on scan failure. */
+internal suspend fun <T> scanWhileListening(
+    listen: suspend () -> T,
+    scan: suspend () -> Unit,
+): T = coroutineScope {
+    // The caller already runs on IO. Give the listener a different coroutine
+    // dispatcher so runInterruptible(IO) dispatches instead of blocking this
+    // undispatched startup until the HTTP long poll has timed out.
+    val result = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) { listen() }
+    try {
+        scan()
+        result.await()
+    } finally {
+        result.cancel()
     }
 }

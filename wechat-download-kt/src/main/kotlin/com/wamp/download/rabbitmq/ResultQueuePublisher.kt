@@ -5,21 +5,25 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 import org.slf4j.LoggerFactory
+import com.wamp.download.task.AaosFallbackRequiredException
 
 /**
  * 自动公众号 ATD 发布器。
  *
- * 一个 BTA 任务对应一条聚合 ATD，并在同一个租户 vhost 内发布。
+ * pro 使用旧版逐文章扁平 ATD；其他连接保留原有聚合协议，均在来源 vhost 内发布。
  */
 class ResultQueuePublisher(
     private val clientManager: RabbitMqClientManager,
     private val defaultResultEventId: String? = null,
+    private val legacyWireFormat: Boolean = false,
+    private val legacySender: suspend (String, Any) -> Unit = { queue, payload ->
+        clientManager.publishJson(queue, payload)
+    },
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(ResultQueuePublisher::class.java)
     }
 
-    @Deprecated("TaskProcessor 将迁移到直接传入 V2 BTA")
     suspend fun publishArticles(
         gzhName: String,
         jobId: Long,
@@ -34,7 +38,6 @@ class ResultQueuePublisher(
         )
     }
 
-    @Deprecated("TaskProcessor 将迁移到直接传入 V2 BTA")
     suspend fun publishEmptyResult(
         gzhName: String,
         jobId: Long,
@@ -47,7 +50,6 @@ class ResultQueuePublisher(
         )
     }
 
-    @Deprecated("TaskProcessor 将迁移到直接传入 V2 BTA")
     suspend fun publishFailedResult(
         gzhName: String,
         jobId: Long,
@@ -70,6 +72,32 @@ class ResultQueuePublisher(
         eventId: String = defaultResultEventId ?: "evt_${UUID.randomUUID()}"
     ) {
         val message = buildMessage(input, status, seedArticles, error, eventId)
+        if (legacyWireFormat) {
+            // The pro data worker consumes the original flat ATD contract. A V2
+            // envelope on this queue is accepted by RabbitMQ but cannot be parsed
+            // as an article by that worker. Failures belong to the AAOS fallback.
+            if (status == "FAILED") {
+                throw AaosFallbackRequiredException("旧版 pro 任务交由 AAOS 兜底: ${error?.code}")
+            }
+            val urls = message.payload.seedArticles.map { it.url }.filter { it.isNotBlank() }
+            require(status != "SUCCEEDED" || urls.isNotEmpty()) { "旧版成功结果必须包含文章 URL" }
+            val resultUrls: List<String?> = if (status == "EMPTY") listOf(null) else urls
+            for (url in resultUrls) {
+                legacySender(
+                    GZH_RESULT_QUEUE,
+                    GzhAutoToBigData(
+                        queueName = GZH_RESULT_QUEUE,
+                        gzhName = input.payload.account.name,
+                        tempTimeStamp = listOf(input.payload.captureWindow.startsAt, input.payload.captureWindow.endsAt),
+                        url = url,
+                        jobId = input.business.jobId,
+                        correlationId = input.workflowId,
+                    ),
+                )
+            }
+            logger.info("旧版 pro ATD 发布成功: jobId=${input.business.jobId}, correlationId=${input.workflowId}, publishedCount=${urls.size}")
+            return
+        }
         // xdag 租户的结果经 archive.new-media.v2 路由到 archive.gzh.auto.atd.v2；
         // 其余 vhost 仍走 new-media-backend / gzh-auto-ATD-queue。
         val routingKey = if (clientManager.isXdagVhost) XDAG_RESULT_ROUTING else GZH_RESULT_ROUTING

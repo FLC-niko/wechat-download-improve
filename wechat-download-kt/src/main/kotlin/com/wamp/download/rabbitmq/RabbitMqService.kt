@@ -140,7 +140,7 @@ class RabbitMqService(
                         }
                     }
                     try {
-                        onTaskReceived(taskMessage, ResultQueuePublisher(manager, claim.resultEventId))
+                        onTaskReceived(taskMessage, ResultQueuePublisher(manager, claim.resultEventId, legacyWireFormat = env == "pro"))
                     } finally {
                         heartbeat.cancelAndJoin()
                     }

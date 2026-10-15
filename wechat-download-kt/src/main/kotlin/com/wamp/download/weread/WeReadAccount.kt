@@ -45,6 +45,7 @@ enum class AccountStatus {
     ACTIVE,
     COOLDOWN,
     EXPIRED,
+    HUMAN_VERIFY_REQUIRED,
     DISABLED,
 }
 
@@ -86,7 +87,7 @@ data class WeReadAccount(
         hasWebCredentials() && when (status) {
             AccountStatus.ACTIVE -> now >= cooldownUntil
             AccountStatus.COOLDOWN -> now >= cooldownUntil
-            AccountStatus.EXPIRED, AccountStatus.DISABLED -> false
+            AccountStatus.EXPIRED, AccountStatus.HUMAN_VERIFY_REQUIRED, AccountStatus.DISABLED -> false
         }
 
     fun normalized(): WeReadAccount {
