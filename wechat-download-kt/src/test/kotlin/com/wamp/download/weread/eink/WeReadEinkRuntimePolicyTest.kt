@@ -8,6 +8,113 @@ import kotlin.test.assertTrue
 
 class WeReadEinkRuntimePolicyTest {
     @Test
+    fun `自动求解必须显式开启且账号位于非空白名单`() {
+        assertFalse(isAutoSolverEligible(false, setOf("vid-test"), "vid-test"))
+        assertFalse(isAutoSolverEligible(true, emptySet(), "vid-test"))
+        assertFalse(isAutoSolverEligible(true, setOf("vid-other"), "vid-test"))
+        assertTrue(isAutoSolverEligible(true, setOf("vid-test"), "vid-test"))
+    }
+
+    @Test
+    fun `自动求解成功复用当前 nonce 并返回 recovered`() {
+        var completedNonce: String? = null
+        val attempt = performEinkAutoRecovery(
+            enabled = true,
+            allowlist = setOf("vid-test"),
+            vid = "vid-test",
+            verification = WeReadEinkVerificationStatus(
+                state = WeReadEinkVerificationState.WAITING,
+                verifyUrl = "https://test.invalid/weread/eink/verify/vid-test/nonce-1",
+            ),
+            solve = { entryUrl ->
+                assertTrue(entryUrl.endsWith("/vid-test/nonce-1"))
+                WeReadEinkCaptchaSolveResult(
+                    code = WeReadEinkCaptchaSolveCode.SOLVED,
+                    captcha = WeReadEinkCaptchaTicket("ticket", "randstr"),
+                    attempts = 1,
+                    durationMs = 25,
+                )
+            },
+            complete = { _, nonce, _, _ ->
+                completedNonce = nonce
+                WeReadEinkVerificationResult(true, "RECOVERED", "ok")
+            },
+        )
+
+        assertEquals(WeReadEinkAutoRecoveryCode.RECOVERED, attempt?.code)
+        assertEquals("nonce-1", completedNonce)
+        assertEquals(1, attempt?.attempts)
+        assertEquals(25, attempt?.durationMs)
+    }
+
+    @Test
+    fun `自动求解失败和探测失败均返回稳定分类`() {
+        var completeCalled = false
+        val solveFailed = performEinkAutoRecovery(
+            enabled = true,
+            allowlist = setOf("vid-test"),
+            vid = "vid-test",
+            verification = WeReadEinkVerificationStatus(
+                state = WeReadEinkVerificationState.WAITING,
+                verifyUrl = "https://test.invalid/weread/eink/verify/vid-test/nonce-1",
+            ),
+            solve = {
+                WeReadEinkCaptchaSolveResult(
+                    code = WeReadEinkCaptchaSolveCode.SOLVE_FAILED,
+                    attempts = 1,
+                    durationMs = 10,
+                )
+            },
+            complete = { _, _, _, _ ->
+                completeCalled = true
+                WeReadEinkVerificationResult(true, "RECOVERED", "ok")
+            },
+        )
+        assertEquals(WeReadEinkAutoRecoveryCode.SOLVE_FAILED, solveFailed?.code)
+        assertFalse(completeCalled)
+
+        val probeFailed = performEinkAutoRecovery(
+            enabled = true,
+            allowlist = setOf("vid-test"),
+            vid = "vid-test",
+            verification = WeReadEinkVerificationStatus(
+                state = WeReadEinkVerificationState.WAITING,
+                verifyUrl = "https://test.invalid/weread/eink/verify/vid-test/nonce-1",
+            ),
+            solve = {
+                WeReadEinkCaptchaSolveResult(
+                    code = WeReadEinkCaptchaSolveCode.SOLVED,
+                    captcha = WeReadEinkCaptchaTicket("ticket", "randstr"),
+                    attempts = 1,
+                    durationMs = 10,
+                )
+            },
+            complete = { _, _, _, _ -> WeReadEinkVerificationResult(false, "PROBE_FAILED", "failed") },
+        )
+        assertEquals(WeReadEinkAutoRecoveryCode.PROBE_FAILED, probeFailed?.code)
+
+        val thrownProbe = performEinkAutoRecovery(
+            enabled = true,
+            allowlist = setOf("vid-test"),
+            vid = "vid-test",
+            verification = WeReadEinkVerificationStatus(
+                state = WeReadEinkVerificationState.WAITING,
+                verifyUrl = "https://test.invalid/weread/eink/verify/vid-test/nonce-1",
+            ),
+            solve = {
+                WeReadEinkCaptchaSolveResult(
+                    code = WeReadEinkCaptchaSolveCode.SOLVED,
+                    captcha = WeReadEinkCaptchaTicket("ticket", "randstr"),
+                    attempts = 1,
+                    durationMs = 10,
+                )
+            },
+            complete = { _, _, _, _ -> error("probe unavailable") },
+        )
+        assertEquals(WeReadEinkAutoRecoveryCode.PROBE_FAILED, thrownProbe?.code)
+    }
+
+    @Test
     fun `验证恢复后再次受限立即提醒 同一次受限仍按三小时限频`() {
         val firstNoticeAt = 1_000_000L
         val blockedAgainAt = firstNoticeAt + 6 * 60_000L

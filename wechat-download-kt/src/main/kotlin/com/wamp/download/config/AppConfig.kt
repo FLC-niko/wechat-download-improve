@@ -118,6 +118,18 @@ object AppConfig {
         )
     val wereadEinkCaptchaAppId: String
         get() = getString("weread.eink.human_verify.captcha_appid", "2044038556")
+    val wereadEinkAutoSolverEnabled: Boolean
+        get() = getBool("weread.eink.human_verify.auto_solver.enabled", false)
+    val wereadEinkAutoSolverUrl: String
+        get() = getString("weread.eink.human_verify.auto_solver.url", "http://127.0.0.1:9991")
+    val wereadEinkAutoSolverSecret: String
+        get() = getString("weread.eink.human_verify.auto_solver.secret", "")
+    val wereadEinkAutoSolverTimeoutSeconds: Long
+        get() = getLong("weread.eink.human_verify.auto_solver.timeout_seconds", 75L).coerceIn(5L, 120L)
+    val wereadEinkAutoSolverRetries: Int
+        get() = getInt("weread.eink.human_verify.auto_solver.retries", 1).coerceIn(1, 2)
+    val wereadEinkAutoSolverVidAllowlist: Set<String>
+        get() = getStringList("weread.eink.human_verify.auto_solver.vid_allowlist").toSet()
     val wereadWebHealthCheckInterval: Long
         get() = getLong("weread.health_check_interval", 300L).coerceAtLeast(30L)
     val wereadWebProbeFreshness: Long
@@ -213,4 +225,10 @@ object AppConfig {
 
     private fun getBool(key: String, default: Boolean): Boolean =
         getRaw(key)?.toString()?.toBooleanStrictOrNull() ?: default
+
+    private fun getStringList(key: String): List<String> = when (val value = getRaw(key)) {
+        is Collection<*> -> value.mapNotNull { it?.toString()?.trim()?.takeIf(String::isNotEmpty) }
+        is String -> value.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) }
+        else -> emptyList()
+    }
 }

@@ -4,7 +4,9 @@ import com.wamp.download.config.AppConfig
 import com.wamp.download.notify.WebhookNotifier
 import com.wamp.download.store.SubscriptionStore
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.io.IOException
@@ -35,6 +37,93 @@ internal data class WeReadEinkHealthProbeCandidate(
     val lastProbeAt: Long,
     val humanVerifyCycleCount: Int,
 )
+
+internal enum class WeReadEinkAutoRecoveryCode {
+    RECOVERED,
+    SIDE_CAR_UNAVAILABLE,
+    SIDE_CAR_UNAUTHORIZED,
+    SOLVE_FAILED,
+    INVALID_RESULT,
+    PROBE_FAILED,
+    NOT_ALLOWLISTED,
+}
+
+internal data class WeReadEinkAutoRecoveryAttempt(
+    val code: WeReadEinkAutoRecoveryCode,
+    val attempts: Int? = null,
+    val durationMs: Long = 0L,
+)
+
+internal fun isAutoSolverEligible(enabled: Boolean, allowlist: Set<String>, vid: String): Boolean =
+    enabled && allowlist.isNotEmpty() && vid in allowlist
+
+/** Resolve the current challenge only after the automatic attempt, which may have consumed it. */
+internal suspend fun sendEinkManualFallback(
+    attempt: WeReadEinkAutoRecoveryAttempt?,
+    currentVerification: () -> WeReadEinkVerificationStatus,
+    notify: suspend (WeReadEinkVerificationStatus) -> Unit,
+) {
+    if (attempt?.code == WeReadEinkAutoRecoveryCode.RECOVERED) return
+    notify(currentVerification())
+}
+
+internal fun performEinkAutoRecovery(
+    enabled: Boolean,
+    allowlist: Set<String>,
+    vid: String,
+    verification: WeReadEinkVerificationStatus,
+    solve: (entryUrl: String) -> WeReadEinkCaptchaSolveResult,
+    complete: (vid: String, nonce: String, ticket: String, randstr: String) -> WeReadEinkVerificationResult,
+): WeReadEinkAutoRecoveryAttempt? {
+    if (!enabled) return null
+    if (!isAutoSolverEligible(true, allowlist, vid)) {
+        return WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.NOT_ALLOWLISTED)
+    }
+    val verifyUrl = verification.verifyUrl
+        ?: return WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.INVALID_RESULT)
+    val nonce = verifyUrl.substringAfterLast('/').takeIf { it.isNotBlank() }
+        ?: return WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.INVALID_RESULT)
+    val solved = runCatching { solve(verifyUrl) }.getOrElse {
+        WeReadEinkCaptchaSolveResult(
+            code = WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE,
+            durationMs = 0L,
+        )
+    }
+    val mapped = when (solved.code) {
+        WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE -> WeReadEinkAutoRecoveryCode.SIDE_CAR_UNAVAILABLE
+        WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAUTHORIZED -> WeReadEinkAutoRecoveryCode.SIDE_CAR_UNAUTHORIZED
+        WeReadEinkCaptchaSolveCode.SOLVE_FAILED -> WeReadEinkAutoRecoveryCode.SOLVE_FAILED
+        WeReadEinkCaptchaSolveCode.INVALID_RESULT -> WeReadEinkAutoRecoveryCode.INVALID_RESULT
+        WeReadEinkCaptchaSolveCode.SOLVED -> null
+    }
+    if (mapped != null) {
+        return WeReadEinkAutoRecoveryAttempt(mapped, solved.attempts, solved.durationMs)
+    }
+    val captcha = solved.captcha
+        ?: return WeReadEinkAutoRecoveryAttempt(
+            WeReadEinkAutoRecoveryCode.INVALID_RESULT,
+            solved.attempts,
+            solved.durationMs,
+        )
+    val completion = runCatching {
+        complete(vid, nonce, captcha.ticket, captcha.randstr)
+    }.getOrElse {
+        return WeReadEinkAutoRecoveryAttempt(
+            WeReadEinkAutoRecoveryCode.PROBE_FAILED,
+            solved.attempts,
+            solved.durationMs,
+        )
+    }
+    return WeReadEinkAutoRecoveryAttempt(
+        code = when {
+            completion.ok && completion.code == "RECOVERED" -> WeReadEinkAutoRecoveryCode.RECOVERED
+            completion.code == "PROBE_FAILED" -> WeReadEinkAutoRecoveryCode.PROBE_FAILED
+            else -> WeReadEinkAutoRecoveryCode.INVALID_RESULT
+        },
+        attempts = solved.attempts,
+        durationMs = solved.durationMs,
+    )
+}
 
 object WeReadEinkRuntime {
     private val logger = LoggerFactory.getLogger(WeReadEinkRuntime::class.java)
@@ -674,7 +763,49 @@ object WeReadEinkRuntime {
         account.humanVerificationReported.set(true)
         val verification = WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
         recoveryScope?.launch {
-            val textSent = WebhookNotifier.notify(
+            val automaticAttempt = attemptAutomaticHumanVerification(account.vid, verification)
+            if (automaticAttempt != null) {
+                logger.info(
+                    "E-Ink 自动验证结束: vid=${account.vid}, code=${automaticAttempt.code}, " +
+                        "attempts=${automaticAttempt.attempts ?: 0}, duration_ms=${automaticAttempt.durationMs}",
+                )
+            }
+
+            // The automatic probe may consume the challenge and create a replacement. Always
+            // re-read/create the current challenge before notifying so an old nonce is never sent.
+            sendEinkManualFallback(
+                attempt = automaticAttempt,
+                currentVerification = {
+                    WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
+                },
+                notify = { sendHumanVerificationNotification(account, error, it) },
+            )
+        } ?: run {
+            account.humanVerificationReported.set(false)
+            logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")
+        }
+    }
+
+    private suspend fun attemptAutomaticHumanVerification(
+        vid: String,
+        verification: WeReadEinkVerificationStatus,
+    ): WeReadEinkAutoRecoveryAttempt? = withContext(Dispatchers.IO) {
+        performEinkAutoRecovery(
+            enabled = AppConfig.wereadEinkAutoSolverEnabled,
+            allowlist = AppConfig.wereadEinkAutoSolverVidAllowlist,
+            vid = vid,
+            verification = verification,
+            solve = { entryUrl -> WeReadEinkCaptchaSolverClient.fromConfig().solve(entryUrl) },
+            complete = WeReadEinkHumanVerification::complete,
+        )
+    }
+
+    private suspend fun sendHumanVerificationNotification(
+        account: AccountRuntime,
+        error: WeReadEinkApiException,
+        verification: WeReadEinkVerificationStatus,
+    ) {
+        val textSent = WebhookNotifier.notify(
                 "weread_eink_human_verify",
                 mapOf(
                     "message" to "微信读书 E-Ink 触发 -2041；请点击验证链接或扫描随后发送的二维码",
@@ -684,7 +815,7 @@ object WeReadEinkRuntime {
                     "error" to error.message,
                 ),
             )
-            val qrSent = verification.verifyUrl?.let { verifyUrl ->
+        val qrSent = verification.verifyUrl?.let { verifyUrl ->
                 runCatching {
                     val png = WeReadEinkHumanVerification.generateQrPng(verifyUrl)
                     // 账号隔离：每个账号的二维码存成独立文件，通知并发时不会相互覆盖。
@@ -707,13 +838,9 @@ object WeReadEinkRuntime {
                 }.onFailure { qrError ->
                     logger.warn("E-Ink 人工验证二维码生成或推送失败: ${qrError.message}")
                 }.getOrDefault(false)
-            } ?: false
-            if (!textSent && !qrSent) {
-                account.humanVerificationReported.set(false)
-            }
-        } ?: run {
+        } ?: false
+        if (!textSent && !qrSent) {
             account.humanVerificationReported.set(false)
-            logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")
         }
     }
 

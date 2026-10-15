@@ -69,6 +69,8 @@ wx:
 
 Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。其他部署若没有设备，应保持 `adb.enabled: false`；启用时还必须让服务进程继承正确的 `ADB_SERVER_SOCKET`。E-Ink 返回 `-2041` 时属于官方风控人工验证：机器人会发送验证页面链接和二维码，页面提交腾讯验证码的 `ticket/randstr` 后立即执行一次 E-Ink 恢复探测。链接默认 5 分钟有效且只允许提交一次，验证码结果不落盘、不出现在状态接口和日志中。未完成人工验证前任务不会继续撞 E-Ink，真实健康探测默认退避到每小时一次。
 
+授权测试环境可选接入本机 `crack-tcaptcha serve` sidecar。自动求解默认关闭，并要求显式账号白名单；每个新挑战只尝试一次，任何失败都会回退上述人工链接/二维码流程。部署与固定版本安装说明见 `../ops/eink-captcha-sidecar/README.md`。
+
 ADB 序列号、安卓微信读书 App 的设备身份与 E-Ink 会话的 `deviceId` 不等价。当前代码只通过 ADB 发现设备和控制微信扫码页面，不读取微信读书 App 私有数据，也不会把手机客户端 `deviceId` 写入服务端 E-Ink 凭证。
 
 ### ADB 设备代扫与自愈机制
