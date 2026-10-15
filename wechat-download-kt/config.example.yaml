@@ -77,6 +77,15 @@ weread:
       # （例如 http://127.0.0.1:8765/TCaptcha.js，见 ops/eink-captcha-sidecar），生产不要改。
       captcha_script_url: "https://ssl.captcha.qq.com/TCaptcha.js"
       captcha_appid: "2044038556"
+      # 可选的 crack-tcaptcha 本机 sidecar。默认关闭；失败后保留现有人工验证通知。
+      # secret 应在未纳入版本控制的 config.yaml 或环境变量中设置。
+      auto_solver:
+        enabled: false
+        url: "http://127.0.0.1:9991"
+        secret: ""
+        timeout_seconds: 75
+        retries: 1
+        vid_allowlist: []
 
 adb:
   enabled: false             # 当前上线版本不依赖 ADB；需要设备自动恢复时再显式开启

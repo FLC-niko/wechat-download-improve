@@ -1,0 +1,25 @@
+[Unit]
+Description=Local crack-tcaptcha solver sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=topview
+Group=topview
+WorkingDirectory=/opt/crack-tcaptcha/source
+EnvironmentFile=/etc/crack-tcaptcha.env
+ExecStart=/opt/crack-tcaptcha/venv/bin/crack-tcaptcha serve --host 127.0.0.1 --port 9991 --workers 1
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

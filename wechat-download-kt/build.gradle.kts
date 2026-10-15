@@ -68,6 +68,18 @@ tasks.test {
     useJUnitPlatform()
 }
 
+tasks.register<Test>("einkAutoRecoverySmokeTest") {
+    group = "verification"
+    description = "Runs the offline E-Ink captcha auto-recovery and manual-fallback smoke tests"
+    testClassesDirs = sourceSets["test"].output.classesDirs
+    classpath = sourceSets["test"].runtimeClasspath
+    dependsOn(tasks.testClasses)
+    useJUnitPlatform()
+    filter {
+        includeTestsMatching("com.wamp.download.weread.eink.WeReadEinkAutoRecoverySmokeTest")
+    }
+}
+
 kotlin {
     jvmToolchain(17)
 }
