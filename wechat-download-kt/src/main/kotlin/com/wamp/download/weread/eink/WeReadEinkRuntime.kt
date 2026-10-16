@@ -144,8 +144,9 @@ object WeReadEinkRuntime {
     @Volatile
     private var lastSelectedVid: String? = null
 
-    /** 同一封禁期间人工验证提醒最小间隔（3 小时）；恢复成功后再次 -2041 会立即提醒。 */
-    private const val HUMAN_VERIFY_REMINDER_INTERVAL_MS = 3 * 60 * 60 * 1000L
+    /** 同一封禁期间人工验证提醒最小间隔；恢复成功后再次 -2041 会立即提醒。 */
+    private val humanVerifyReminderIntervalMs: Long
+        get() = AppConfig.wereadEinkHumanVerifyReminderInterval * 1000L
 
     /** 每个账号独立的运行时状态。 */
     private class AccountRuntime(
@@ -306,8 +307,11 @@ object WeReadEinkRuntime {
     internal fun humanVerifyNotificationAtAfterSuccess(previousState: String, lastNotifiedAt: Long): Long =
         if (previousState == "HUMAN_VERIFY_REQUIRED") 0L else lastNotifiedAt
 
-    internal fun humanVerifyNotificationSuppressed(lastNotifiedAt: Long, now: Long): Boolean =
-        lastNotifiedAt > 0L && now - lastNotifiedAt < HUMAN_VERIFY_REMINDER_INTERVAL_MS
+    internal fun humanVerifyNotificationSuppressed(
+        lastNotifiedAt: Long,
+        now: Long,
+        intervalMs: Long = humanVerifyReminderIntervalMs,
+    ): Boolean = intervalMs > 0L && lastNotifiedAt > 0L && now - lastNotifiedAt < intervalMs
 
     fun recordTaskRequestFailure(service: WeReadEinkSyncService?, error: Throwable) {
         val account = accountFor(service) ?: return
@@ -747,14 +751,17 @@ object WeReadEinkRuntime {
     }
 
     private fun notifyHumanVerification(account: AccountRuntime, error: WeReadEinkApiException) {
-        // 同一次封禁期间最多每 3 小时提醒一次；成功恢复后再次 -2041 属于新事件。
+        // 同一次封禁期间按配置间隔提醒；成功恢复后再次 -2041 属于新事件。
         // CAS 保证并发下只有一条提醒发出。
         val now = System.currentTimeMillis()
         while (true) {
             val last = account.lastHumanVerifyNotificationAt.get()
             if (humanVerifyNotificationSuppressed(last, now)) {
                 logger.info(
-                    "E-Ink 人工验证提醒静默中（每 3 小时最多一条），跳过本次: vid=${account.vid}, 距上次 ${(now - last) / 60_000} 分钟",
+                    "E-Ink 人工验证提醒静默中（间隔 {} 秒），跳过本次: vid={}, 距上次 {} 分钟",
+                    AppConfig.wereadEinkHumanVerifyReminderInterval,
+                    account.vid,
+                    (now - last) / 60_000,
                 )
                 return
             }

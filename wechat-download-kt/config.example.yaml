@@ -70,6 +70,8 @@ weread:
     max_concurrent_per_account: 1
     min_request_interval: 4     # 同一 E-Ink 账号请求最小间隔（秒）；闸门另加 6~11 次一次的长停顿抖动
                                # 人工验证恢复后 30 分钟内自动进入温和期（间隔×2、停顿更频繁）
+    human_verify_reminder_interval: 10800 # 同一封禁期间人工验证提醒最小间隔（秒）；0 = 不限频，每次 -2041 都提醒
+                               # 恢复成功后再次 -2041 属于新事件，始终立即提醒
     auto_qr_notification_enabled: true # refreshToken 失效后自动发送人工扫码二维码；-2041 除外
     relogin_retry_backoff: 300  # 自动二维码流程失败后的最小重试间隔（秒）
     human_verify:

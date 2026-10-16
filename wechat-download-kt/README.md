@@ -54,6 +54,7 @@ weread:
     enabled: true
     auto_qr_notification_enabled: true
     human_verify_probe_interval: 3600
+    human_verify_reminder_interval: 10800 # 同一封禁期间的提醒间隔（秒）；0 表示不限频
 
 adb:
   enabled: true
@@ -68,6 +69,8 @@ wx:
 ```
 
 Web 与 E-Ink 的二维码通知默认开启；可分别用 `weread.auto_qr_notification_enabled` 和 `weread.eink.auto_qr_notification_enabled` 关闭。其他部署若没有设备，应保持 `adb.enabled: false`；启用时还必须让服务进程继承正确的 `ADB_SERVER_SOCKET`。E-Ink 返回 `-2041` 时属于官方风控人工验证：机器人会发送验证页面链接和二维码，页面提交腾讯验证码的 `ticket/randstr` 后立即执行一次 E-Ink 恢复探测。链接默认 5 分钟有效且只允许提交一次，验证码结果不落盘、不出现在状态接口和日志中。未完成人工验证前任务不会继续撞 E-Ink，真实健康探测默认退避到每小时一次。
+
+同一 `HUMAN_VERIFY_REQUIRED` 期间的提醒频率由 `weread.eink.human_verify_reminder_interval` 控制，默认每 3 小时最多提醒一次；设为 `0` 可关闭限频。账号恢复后再次进入人工验证会作为新事件立即提醒。
 
 授权测试环境可选接入本机 `crack-tcaptcha serve` sidecar。自动求解默认关闭，并要求显式账号白名单；每个新挑战只尝试一次，任何失败都会回退上述人工链接/二维码流程。部署与固定版本安装说明见 `../ops/eink-captcha-sidecar/README.md`。
 

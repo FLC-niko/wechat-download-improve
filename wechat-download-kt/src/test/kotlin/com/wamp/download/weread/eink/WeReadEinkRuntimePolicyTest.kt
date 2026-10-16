@@ -115,7 +115,7 @@ class WeReadEinkRuntimePolicyTest {
     }
 
     @Test
-    fun `验证恢复后再次受限立即提醒 同一次受限仍按三小时限频`() {
+    fun `验证恢复后再次受限立即提醒 同一次受限仍按默认间隔限频`() {
         val firstNoticeAt = 1_000_000L
         val blockedAgainAt = firstNoticeAt + 6 * 60_000L
         val afterRecovery = WeReadEinkRuntime.humanVerifyNotificationAtAfterSuccess(
@@ -135,6 +135,41 @@ class WeReadEinkRuntimePolicyTest {
             firstNoticeAt,
             WeReadEinkRuntime.humanVerifyNotificationAtAfterSuccess("HEALTHY", firstNoticeAt),
             "普通成功请求不应重置同一次验证事件的提醒窗口",
+        )
+    }
+
+    @Test
+    fun `提醒间隔配置为零时不限频 每次失效都立即提醒`() {
+        val firstNoticeAt = 1_000_000L
+        val againAt = firstNoticeAt + 60_000L
+
+        // intervalMs = 0 → 不静默，任何时刻都提醒
+        assertFalse(
+            WeReadEinkRuntime.humanVerifyNotificationSuppressed(firstNoticeAt, againAt, intervalMs = 0L),
+        )
+        assertFalse(
+            WeReadEinkRuntime.humanVerifyNotificationSuppressed(firstNoticeAt, firstNoticeAt, intervalMs = 0L),
+        )
+    }
+
+    @Test
+    fun `提醒间隔按配置生效 且窗口内只提醒一次`() {
+        val firstNoticeAt = 1_000_000L
+
+        // 配置 600 秒：窗口内静默，超出后恢复提醒
+        assertTrue(
+            WeReadEinkRuntime.humanVerifyNotificationSuppressed(
+                firstNoticeAt,
+                firstNoticeAt + 599_000L,
+                intervalMs = 600_000L,
+            ),
+        )
+        assertFalse(
+            WeReadEinkRuntime.humanVerifyNotificationSuppressed(
+                firstNoticeAt,
+                firstNoticeAt + 600_000L,
+                intervalMs = 600_000L,
+            ),
         )
     }
 

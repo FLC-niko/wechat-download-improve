@@ -101,6 +101,14 @@ object AppConfig {
     val wereadEinkMinRequestInterval: Long
         // 2026-09-29 风控复盘：下限提升到 4 秒，配合请求闸门的长停顿抖动降低 -2041 触发率。
         get() = getLong("weread.eink.min_request_interval", 4L).coerceAtLeast(0L)
+
+    /**
+     * 同一封禁期间人工验证提醒的最小间隔（秒）。
+     *
+     * 0 表示不限制：每次 -2041 都立即提醒。恢复成功后再次 -2041 属于新事件，始终立即提醒。
+     */
+    val wereadEinkHumanVerifyReminderInterval: Long
+        get() = getLong("weread.eink.human_verify_reminder_interval", 10_800L).coerceAtLeast(0L)
     /** 自动生成并通过机器人投递人工扫码二维码；与 ADB 无人值守扫码互不依赖。 */
     val wereadEinkAutoQrNotificationEnabled: Boolean
         get() = getBool("weread.eink.auto_qr_notification_enabled", true)
