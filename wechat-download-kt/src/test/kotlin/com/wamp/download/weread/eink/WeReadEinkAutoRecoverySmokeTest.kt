@@ -4,6 +4,10 @@ import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.runBlocking
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -17,6 +21,70 @@ import kotlin.test.assertTrue
  * 人工审核链接。这里不实际发送 Webhook，避免冒烟测试产生外部副作用。
  */
 class WeReadEinkAutoRecoverySmokeTest {
+    @Test
+    fun `no manual notification while solver and probe are pending or after success`() {
+        val solving = CountDownLatch(1)
+        val allowSolve = CountDownLatch(1)
+        val probing = CountDownLatch(1)
+        val allowProbe = CountDownLatch(1)
+        val notifications = AtomicInteger(0)
+        val tracker = WeReadEinkAutoSolverDiagnostics()
+        val executor = Executors.newSingleThreadExecutor()
+        val sidecar = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        sidecar.createContext("/solve") { exchange ->
+            solving.countDown()
+            check(allowSolve.await(10, TimeUnit.SECONDS))
+            val body = """{"ok":true,"ticket":"paused-ticket","randstr":"paused-randstr","attempts":1}""".toByteArray()
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        sidecar.start()
+        try {
+            val future = executor.submit {
+                runBlocking {
+                    val vid = "paused-vid"
+                    tracker.begin()
+                    val attempt = performEinkAutoRecovery(
+                        true, setOf(vid), vid,
+                        WeReadEinkVerificationStatus(
+                            WeReadEinkVerificationState.WAITING,
+                            verifyUrl = "http://127.0.0.1:8080/weread/eink/verify/$vid/paused-nonce",
+                        ),
+                        solve = solverClient(sidecar.address.port, 15)::solve,
+                        complete = { _, _, _, _ ->
+                            probing.countDown()
+                            check(allowProbe.await(10, TimeUnit.SECONDS))
+                            WeReadEinkVerificationResult(true, "RECOVERED", "ok")
+                        },
+                        onPhase = tracker::transition,
+                    )
+                    tracker.finish(attempt)
+                    sendEinkManualFallback(
+                        attempt,
+                        currentVerification = { error("success must not create a manual URL") },
+                        notify = { notifications.incrementAndGet() },
+                    )
+                }
+            }
+            assertTrue(solving.await(10, TimeUnit.SECONDS))
+            assertEquals("SOLVING", tracker.status(true, true)["phase"])
+            assertEquals(0, notifications.get())
+            allowSolve.countDown()
+            assertTrue(probing.await(10, TimeUnit.SECONDS))
+            assertEquals("PROBING", tracker.status(true, true)["phase"])
+            assertEquals(0, notifications.get())
+            allowProbe.countDown()
+            future.get(10, TimeUnit.SECONDS)
+            assertEquals("RECOVERED", tracker.status(true, true)["phase"])
+            assertEquals(0, notifications.get())
+        } finally {
+            allowSolve.countDown()
+            allowProbe.countDown()
+            executor.shutdownNow()
+            sidecar.stop(0)
+        }
+    }
+
     @Test
     fun `local solver result completes one-time ticket and recovers probe`() {
         val sidecar = startSuccessfulSidecar()
@@ -150,12 +218,12 @@ class WeReadEinkAutoRecoverySmokeTest {
         }
     }
 
-    private fun solverClient(port: Int) = WeReadEinkCaptchaSolverClient(
+    private fun solverClient(port: Int, timeoutSeconds: Long = 2) = WeReadEinkCaptchaSolverClient(
         baseUrl = "http://127.0.0.1:$port",
         appId = "smoke-appid",
         secret = "smoke-secret",
         retries = 1,
-        timeoutSeconds = 2,
+        timeoutSeconds = timeoutSeconds,
     )
 
     private fun startSuccessfulSidecar(): HttpServer {
