@@ -1,0 +1,4 @@
+# Linux deployment assets must remain usable after a Windows checkout.
+ops/eink-captcha-sidecar/*.sh text eol=lf
+ops/eink-captcha-sidecar/*.service text eol=lf
+ops/eink-captcha-sidecar/*.env.example text eol=lf

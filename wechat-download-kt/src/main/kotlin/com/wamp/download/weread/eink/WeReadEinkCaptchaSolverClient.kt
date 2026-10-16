@@ -11,6 +11,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.ConnectException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
@@ -32,6 +34,8 @@ internal data class WeReadEinkCaptchaSolveResult(
     val captcha: WeReadEinkCaptchaTicket? = null,
     val attempts: Int? = null,
     val durationMs: Long,
+    val httpStatus: Int? = null,
+    val failure: WeReadEinkSolverFailure? = null,
 )
 
 /**
@@ -61,15 +65,19 @@ internal class WeReadEinkCaptchaSolverClient(
 
     fun solve(entryUrl: String): WeReadEinkCaptchaSolveResult {
         val startedAt = System.nanoTime()
+        var httpStatus: Int? = null
         fun result(
             code: WeReadEinkCaptchaSolveCode,
             captcha: WeReadEinkCaptchaTicket? = null,
             attempts: Int? = null,
+            failure: WeReadEinkSolverFailure? = null,
         ) = WeReadEinkCaptchaSolveResult(
             code = code,
             captcha = captcha,
             attempts = attempts,
             durationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt),
+            httpStatus = httpStatus,
+            failure = failure,
         )
 
         val payload = JsonObject().apply {
@@ -87,26 +95,27 @@ internal class WeReadEinkCaptchaSolverClient(
 
         return try {
             client.newCall(request).execute().use { response ->
+                httpStatus = response.code
                 when {
                     response.code == 401 || response.code == 403 ->
-                        result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAUTHORIZED)
+                        result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAUTHORIZED, failure = WeReadEinkSolverFailure.HTTP_ERROR)
                     response.code >= 500 ->
-                        result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE)
+                        result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE, failure = WeReadEinkSolverFailure.HTTP_ERROR)
                     !response.isSuccessful ->
-                        result(WeReadEinkCaptchaSolveCode.SOLVE_FAILED)
+                        result(WeReadEinkCaptchaSolveCode.SOLVE_FAILED, failure = WeReadEinkSolverFailure.HTTP_ERROR)
                     else -> {
                         val raw = response.body?.readBoundedUtf8()
-                            ?: return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT)
+                            ?: return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, failure = WeReadEinkSolverFailure.INVALID_RESPONSE)
                         val json = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull()
-                            ?: return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT)
+                            ?: return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, failure = WeReadEinkSolverFailure.INVALID_RESPONSE)
                         val attempts = runCatching { json["attempts"]?.asInt }.getOrNull()
                         val ok = runCatching { json["ok"]?.asBoolean }.getOrNull()
-                            ?: return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, attempts = attempts)
-                        if (!ok) return@use result(WeReadEinkCaptchaSolveCode.SOLVE_FAILED, attempts = attempts)
+                            ?: return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, attempts = attempts, failure = WeReadEinkSolverFailure.INVALID_RESPONSE)
+                        if (!ok) return@use result(WeReadEinkCaptchaSolveCode.SOLVE_FAILED, attempts = attempts, failure = WeReadEinkSolverFailure.SOLVER_REJECTED)
                         val ticket = runCatching { json["ticket"]?.asString }.getOrNull().orEmpty()
                         val randstr = runCatching { json["randstr"]?.asString }.getOrNull().orEmpty()
                         if (!validValue(ticket, MAX_TICKET_LENGTH) || !validValue(randstr, MAX_RANDSTR_LENGTH)) {
-                            return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, attempts = attempts)
+                            return@use result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, attempts = attempts, failure = WeReadEinkSolverFailure.INVALID_RESPONSE)
                         }
                         result(
                             WeReadEinkCaptchaSolveCode.SOLVED,
@@ -116,10 +125,14 @@ internal class WeReadEinkCaptchaSolverClient(
                     }
                 }
             }
+        } catch (_: InterruptedIOException) {
+            result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE, failure = WeReadEinkSolverFailure.TIMEOUT)
+        } catch (_: ConnectException) {
+            result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE, failure = WeReadEinkSolverFailure.CONNECTION_FAILED)
         } catch (_: IOException) {
-            result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE)
+            result(WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE, failure = WeReadEinkSolverFailure.IO_ERROR)
         } catch (_: RuntimeException) {
-            result(WeReadEinkCaptchaSolveCode.INVALID_RESULT)
+            result(WeReadEinkCaptchaSolveCode.INVALID_RESULT, failure = WeReadEinkSolverFailure.INVALID_RESPONSE)
         }
     }
 

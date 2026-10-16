@@ -9,6 +9,9 @@ User=topview
 Group=topview
 WorkingDirectory=/opt/crack-tcaptcha/source
 EnvironmentFile=/etc/crack-tcaptcha.env
+# The non-editable Python package must use the same JS directory as npm ci.
+Environment=TCAPTCHA_TDC_JS_DIR=/opt/crack-tcaptcha/source/src/crack_tcaptcha/tdc/js
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/crack-tcaptcha/venv/bin/crack-tcaptcha serve --host 127.0.0.1 --port 9991 --workers 1
 Restart=on-failure
 RestartSec=5
