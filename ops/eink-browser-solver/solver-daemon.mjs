@@ -124,7 +124,10 @@ async function ensureChrome() {
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=Translate,OptimizationHints",
+    "--disable-features=Translate,OptimizationHints,CalculateNativeWinOcclusion",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
     "--window-size=1280,900",
     "--lang=zh-CN",
     "about:blank",
@@ -201,12 +204,16 @@ async function solveOnce(entryUrl, appid, retries) {
   const tab = await httpJson(`/json/new?${encodeURIComponent("about:blank")}`, "PUT");
   const page = new Target(tab.webSocketDebuggerUrl, "page");
   await page.waitReady();
+  // 并发求解时保持两个 tab 都不被 Chrome 后台节流。
+  await page.send("Page.bringToFront").catch(() => {});
 
   // state captured from the wire
   let challenge = null;         // {instruction, regions, bgW, bgH}
   let challengeTs = 0;
   let imageB64 = null;
   let imageTs = 0;
+  let spriteB64 = null;
+  let spriteTs = 0;
   let lastVerify = null;
   const verifyResponses = [];   // chronological verify bodies
   let completionSeen = false;
@@ -266,6 +273,14 @@ async function solveOnce(entryUrl, appid, retries) {
     } else if (/getcapbysig/.test(url)) {
       const mk = url.match(/image=([^&]+)/);
       const key = mk ? mk[1] : ("nokey-" + Date.now());
+      const idxMatch = url.match(/img_index=(\d+)/);
+      const imgIndex = idxMatch ? parseInt(idxMatch[1], 10) : 1;
+      if (imgIndex === 0) {
+        spriteB64 = raw.toString("base64");
+        spriteTs = Date.now();
+        log("sprite captured:", raw.length, "bytes");
+        return;
+      }
       imageStore.set(key, { b64: raw.toString("base64"), ts: Date.now() });
       imageB64 = raw.toString("base64");
       imageTs = Date.now();
@@ -305,6 +320,18 @@ async function solveOnce(entryUrl, appid, retries) {
     }
   };
   page.onMessage(captureHandler(page));
+  let childIframeTargetId = null;
+  page.onMessage((msg) => {
+    if (msg.method === "Target.attachedToTarget") {
+      const ti = msg.params?.targetInfo || {};
+      if (ti.type === "iframe" && /captcha\.gtimg\.com\/static\/template/.test(ti.url || "")) {
+        childIframeTargetId = ti.targetId;
+      }
+    }
+  });
+  await page
+    .send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })
+    .catch((e) => log("autoAttach unavailable:", String(e).slice(0, 100)));
 
   try {
     await page.send("Network.enable");
@@ -363,6 +390,12 @@ async function solveOnce(entryUrl, appid, retries) {
           reclicked = true;
           log("retrying captcha after forged fallback ticket");
           await page.send("Runtime.evaluate", { expression: "document.getElementById('verify') && document.getElementById('verify').click()" }).catch(() => {});
+        }
+        if (childIframeTargetId) {
+          const all = await httpJson("/json").catch(() => []);
+          iframe = (all || []).find((x) => x.id === childIframeTargetId) || null;
+          if (iframe) { log("iframe bound via auto-attach"); break; }
+          childIframeTargetId = null;
         }
         iframe = await findIframeTarget(500);
         if (iframe) break;
@@ -441,6 +474,11 @@ async function solveOnce(entryUrl, appid, retries) {
 
     const deadline = startedAt + SOLVE_BUDGET_MS;
     while (Date.now() < deadline && rounds < maxRounds) {
+      // 剩余预算不足一轮完整提交时，体面收尾而不是用过期 deadline 制造误报超时。
+      if (deadline - Date.now() < 22000) {
+        log("budget nearly exhausted, stopping with", rounds, "rounds");
+        break;
+      }
       // wait for a stable, not-yet-submitted challenge read from the live DOM
       const waitDeadline = Math.min(deadline, Date.now() + 28000);
       let live = null;
@@ -484,6 +522,38 @@ async function solveOnce(entryUrl, appid, retries) {
       if (!pickImageB64) { log("no image available for round", rounds); break; }
       const instr = String(live.instr).replace(/[\u201c\u201d"']/g, "").trim();
       log(`round ${rounds}: live instr=${JSON.stringify(instr)} src=${domB64 ? "dom" : (stored ? "net-key" : "net-latest")} b64len=${pickImageB64 ? pickImageB64.length : 0} key=${(netKey || "").slice(0, 20)}`);
+      // 升级题型“依次点击：”（icon-float）：提示图标在题面 DOM 里，答案要按序点击到图上。
+      const seqMode = /依次点击/.test(instr);
+      if (seqMode) {
+        try {
+          const dump = await ifr.send("Runtime.evaluate", {
+            expression: `(() => {
+              const t = document.getElementById('instructionText');
+              const wrap = t ? (t.closest('.tc-header, .tc-wrap, div') || t.parentElement) : document.body;
+              const imgs = [...document.querySelectorAll('img')].map(i => ({ src: (i.src || '').slice(0, 160), w: i.offsetWidth, h: i.offsetHeight, x: Math.round(i.getBoundingClientRect().x), y: Math.round(i.getBoundingClientRect().y) })).slice(0, 20);
+              const spans = [...document.querySelectorAll('#instructionText *, .tc-header *')].slice(0, 40).map(e => ({ tag: e.tagName, cls: String(e.className || '').slice(0, 40), bg: String(getComputedStyle(e).backgroundImage || '').slice(0, 120), w: e.offsetWidth, h: e.offsetHeight }));
+              return JSON.stringify({ html: wrap.outerHTML.slice(0, 7000), imgs, spans: spans.slice(0, 25) });
+            })()`,
+            returnByValue: true,
+          });
+          fs.mkdirSync(DEBUG_DIR, { recursive: true });
+          fs.writeFileSync(path.join(DEBUG_DIR, "seq-dom.json"), String(dump?.result?.value || "{}"));
+          fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
+          if (spriteB64) fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-sprite.png`), Buffer.from(spriteB64, "base64"));
+          log("seq-mode DOM dumped (依次点击)");
+        } catch (e) { log("seq dom dump failed:", String(e).slice(0, 100)); }
+      }
+      if (seqMode) {
+        // 该题型暂不支持，直接点“换一组”换题，避免错位乱点。
+        try {
+          const rr = await rectOf("(() => { const b = document.querySelector('.tc-refresh-icon') || document.getElementById('ticon_refresh'); if (!b) return 'null'; const r = b.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
+          if (rr && rr.x !== undefined) await clickAt(Math.round(rr.x + rr.w / 2), Math.round(rr.y + rr.h / 2));
+        } catch {}
+        lastSubmittedInstr = instr;
+        lastSubmittedUrl = live.url || null;
+        await sleep(1200);
+        continue;
+      }
       const pick = await pickRegion(pickImageB64, instr, CONST_GRID);
       if (!pick?.ok) throw new Error(`pick failed: ${pick?.error || "unknown"}`);
       log(`round ${rounds}: pick=${pick.region_id} set=${JSON.stringify(pick.region_ids || [pick.region_id])} method=${pick.method}`);
@@ -610,8 +680,9 @@ async function solveOnce(entryUrl, appid, retries) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP server (single-flight queue)
-let busy = false;
+// HTTP server (bounded-concurrency queue; two accounts flap simultaneously)
+const MAX_CONCURRENT = parseInt(process.env.SOLVER_MAX_CONCURRENT || "2", 10);
+let activeCount = 0;
 const queue = [];
 
 function enqueueSolve(payload) {
@@ -622,18 +693,23 @@ function enqueueSolve(payload) {
 }
 
 async function pump() {
-  if (busy) return;
-  const job = queue.shift();
-  if (!job) return;
-  busy = true;
+  while (activeCount < MAX_CONCURRENT) {
+    const job = queue.shift();
+    if (!job) return;
+    activeCount++;
+    runJob(job).finally(() => {
+      activeCount--;
+      setImmediate(pump);
+    });
+  }
+}
+
+async function runJob(job) {
   try {
     const result = await solveOnce(job.payload.entry_url, job.payload.appid, job.payload.retries);
     job.resolve(result);
   } catch (e) {
     job.resolve({ ok: false, attempts: null, error: String(e.message || e).slice(0, 300) });
-  } finally {
-    busy = false;
-    setImmediate(pump);
   }
 }
 
@@ -644,7 +720,7 @@ const server = http.createServer((req, res) => {
     res.end(body);
   };
   if (req.method === "GET" && req.url === "/health") {
-    send(200, { status: "ok", browser: chromeProc !== null, busy, queued: queue.length, solves: solvesSinceLaunch });
+    send(200, { status: "ok", browser: chromeProc !== null, active: activeCount, queued: queue.length, solves: solvesSinceLaunch });
     return;
   }
   if (req.method === "POST" && req.url === "/solve") {
