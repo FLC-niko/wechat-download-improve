@@ -140,6 +140,7 @@ object WeReadWebAuth {
                 val deadline = System.currentTimeMillis() + windowMs
                 var notified = false
                 var success = false
+                var mismatchReason: String? = null
                 // 有效期内复用同一二维码；每 60s 轮询一轮，refresh 续期会被下一轮自动接走。
                 while (System.currentTimeMillis() < deadline && !success) {
                     val pending = ensurePendingLogin(vid) ?: break
@@ -148,7 +149,11 @@ object WeReadWebAuth {
                     if (credentials == null) continue
                     if (credentials.wrVid != vid) {
                         logger.warn("扫码账号与目标账号不一致，拒绝覆盖凭证: expected=$vid, actual=${credentials.wrVid}")
-                        recordReloginFailure(vid)
+                        // 该二维码已被这次扫码消费：清掉 pending，下一轮直接生成新码而不是复用旧码。
+                        pendingLogins.remove(vid, pending)
+                        mismatchReason =
+                            "扫码账号不匹配：需要 $vid，实际扫到 ${credentials.wrVid}；" +
+                                "请改用绑定了 $vid 的微信扫码，或打开刷新页重新获取二维码"
                         break
                     }
                     if (saveLoginCredentials(credentials)) {
@@ -167,13 +172,19 @@ object WeReadWebAuth {
                 }
                 if (!success) {
                     recordReloginFailure(vid)
-                    // 失败提醒同样受提醒间隔约束：本轮推过码直接发；否则仅当距离上次提醒
-                    // 已超过间隔才发，保证任何情况下同账号单位间隔内最多一条登录相关消息。
-                    val now2 = System.currentTimeMillis()
-                    val intervalMs = AppConfig.wereadQrReminderIntervalSeconds * 1000L
-                    if (notified || now2 - lastQrNotificationAt.getOrDefault(vid, 0L) >= intervalMs) {
-                        lastQrNotificationAt[vid] = now2
-                        notifyReloginFailure(vid, "二维码等待扫码超时，过期后可在刷新页一键续期")
+                    if (mismatchReason != null) {
+                        // 扫错账号是用户可操作的明确失败：立即发具体原因（带刷新页链接），
+                        // 不再补发含糊的"等待扫码超时"，避免误导。
+                        notifyReloginFailure(vid, mismatchReason)
+                    } else {
+                        // 失败提醒同样受提醒间隔约束：本轮推过码直接发；否则仅当距离上次提醒
+                        // 已超过间隔才发，保证任何情况下同账号单位间隔内最多一条登录相关消息。
+                        val now2 = System.currentTimeMillis()
+                        val intervalMs = AppConfig.wereadQrReminderIntervalSeconds * 1000L
+                        if (notified || now2 - lastQrNotificationAt.getOrDefault(vid, 0L) >= intervalMs) {
+                            lastQrNotificationAt[vid] = now2
+                            notifyReloginFailure(vid, "二维码等待扫码超时，过期后可在刷新页一键续期")
+                        }
                     }
                 }
             } catch (error: CancellationException) {
@@ -607,6 +618,7 @@ object WeReadWebAuth {
                 "message" to "微信读书 Web 二维码恢复未完成，服务将按退避策略重试",
                 "vid" to vid,
                 "reason" to reason.take(500),
+                "refresh_url" to webLoginRefreshPageUrl(vid),
                 "next_retry_at" to nextReloginAttemptAt[vid],
             ),
         )
