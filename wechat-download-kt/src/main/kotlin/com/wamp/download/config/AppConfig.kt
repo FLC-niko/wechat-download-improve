@@ -156,6 +156,12 @@ object AppConfig {
         get() = getBool("weread.auto_qr_notification_enabled", true)
     val wereadReloginRetryBackoff: Long
         get() = getLong("weread.relogin_retry_backoff", 300L).coerceAtLeast(30L)
+    /** Web 登录二维码有效期复用窗口（秒）：窗口内复用同一扫码链接，不重复生成推送。 */
+    val wereadQrReuseWindowSeconds: Long
+        get() = getLong("weread.qr_reuse_window_seconds", 300L).coerceAtLeast(60L)
+    /** Web 登录二维码提醒最小间隔（秒）：同一账号等待扫码期间最多每间隔推送一次。 */
+    val wereadQrReminderIntervalSeconds: Long
+        get() = getLong("weread.qr_reminder_interval_seconds", 3600L).coerceAtLeast(300L)
 
     // 翻页控制
     val wereadContentInterval: Long get() = getLong("weread.content_interval", 5L)      // 翻页基础间隔（秒）

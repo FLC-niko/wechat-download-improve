@@ -62,6 +62,12 @@ object WeReadWebAuth {
     private val reloginFailureCount = ConcurrentHashMap<String, Int>()
     private val nextReloginAttemptAt = ConcurrentHashMap<String, Long>()
 
+    /** 待扫码登录会话（E-Ink 式“有效期内复用”语义，避免每轮健康检查都发新码）。 */
+    data class PendingWebLogin(val uid: String, val scanUrl: String, val createdAt: Long)
+    private val pendingLogins = ConcurrentHashMap<String, PendingWebLogin>()
+    /** 上次机器人二维码提醒时间（同账号等待扫码期间限频用）。 */
+    private val lastQrNotificationAt = ConcurrentHashMap<String, Long>()
+
     @Volatile
     private var recoveryScope: CoroutineScope? = null
 
@@ -130,16 +136,45 @@ object WeReadWebAuth {
         val job = scope.launch(Dispatchers.IO) {
             try {
                 logger.warn("微信读书凭证失效，异步触发重新扫码: vid=$vid")
-                if (startLogin(targetVid = vid, requireNotification = true)) {
-                    reloginFailureCount.remove(vid)
-                    nextReloginAttemptAt.remove(vid)
-                    WebhookNotifier.notify(
-                        "weread_account_recovered",
-                        mapOf("message" to "微信读书 Web 账号已恢复", "vid" to vid),
-                    )
-                } else {
+                val windowMs = AppConfig.wereadQrReuseWindowSeconds * 1000L
+                val deadline = System.currentTimeMillis() + windowMs
+                var notified = false
+                var success = false
+                // 有效期内复用同一二维码；每 60s 轮询一轮，refresh 续期会被下一轮自动接走。
+                while (System.currentTimeMillis() < deadline && !success) {
+                    val pending = ensurePendingLogin(vid) ?: break
+                    if (notifyLoginQr(vid, pending)) notified = true
+                    val credentials = pollLoginCredentials(pending.uid, timeoutSeconds = 60)
+                    if (credentials == null) continue
+                    if (credentials.wrVid != vid) {
+                        logger.warn("扫码账号与目标账号不一致，拒绝覆盖凭证: expected=$vid, actual=${credentials.wrVid}")
+                        recordReloginFailure(vid)
+                        break
+                    }
+                    if (saveLoginCredentials(credentials)) {
+                        pendingLogins.remove(vid, pending)
+                        reloginFailureCount.remove(vid)
+                        nextReloginAttemptAt.remove(vid)
+                        WebhookNotifier.notify(
+                            "weread_account_recovered",
+                            mapOf("message" to "微信读书 Web 账号已恢复", "vid" to vid),
+                        )
+                        success = true
+                    } else {
+                        recordReloginFailure(vid)
+                        break
+                    }
+                }
+                if (!success) {
                     recordReloginFailure(vid)
-                    notifyReloginFailure(vid, "二维码生成、投递或扫码流程未完成")
+                    // 失败提醒同样受提醒间隔约束：本轮推过码直接发；否则仅当距离上次提醒
+                    // 已超过间隔才发，保证任何情况下同账号单位间隔内最多一条登录相关消息。
+                    val now2 = System.currentTimeMillis()
+                    val intervalMs = AppConfig.wereadQrReminderIntervalSeconds * 1000L
+                    if (notified || now2 - lastQrNotificationAt.getOrDefault(vid, 0L) >= intervalMs) {
+                        lastQrNotificationAt[vid] = now2
+                        notifyReloginFailure(vid, "二维码等待扫码超时，过期后可在刷新页一键续期")
+                    }
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -154,6 +189,168 @@ object WeReadWebAuth {
         // A cancelled scope can prevent the coroutine body from running at all.
         job.invokeOnCompletion { reloginInProgress.remove(vid) }
         return ReloginRequestResult.STARTED
+    }
+
+    /** Web 登录刷新页地址（随机器人消息下发，过期点按钮续期）。 */
+    fun webLoginRefreshPageUrl(vid: String): String =
+        "${AppConfig.siteUrl.trimEnd('/')}/weread/web/login/refresh?vid=${vid}"
+
+    /**
+     * 获取当前有效的待扫码登录（有效期内复用，不重复生成）。
+     * 有效期见 `weread.qr_reuse_window_seconds`（默认 300 秒）。
+     */
+    fun ensurePendingLogin(vid: String): PendingWebLogin? {
+        val now = System.currentTimeMillis()
+        val windowMs = AppConfig.wereadQrReuseWindowSeconds * 1000L
+        pendingLogins[vid]?.let { if (now - it.createdAt < windowMs) return it }
+        val (uid, scanUrl) = createLogin() ?: return null
+        val pending = PendingWebLogin(uid, scanUrl, now)
+        pendingLogins[vid] = pending
+        runCatching {
+            generateQrPng(scanUrl)?.let { png ->
+                java.io.File("qrcode").apply { mkdirs() }
+                java.io.File(java.io.File("qrcode"), "weread_web_${vid}.png").writeBytes(png)
+            }
+        }.onFailure { logger.warn("保存二维码图片失败: ${it.message}") }
+        return pending
+    }
+
+    /**
+     * 推送登录二维码（E-Ink 式限频：同一账号等待扫码期间最多每间隔推送一次）。
+     * @return 是否实际发出了推送。
+     */
+    fun notifyLoginQr(vid: String, pending: PendingWebLogin): Boolean {
+        val now = System.currentTimeMillis()
+        val intervalMs = AppConfig.wereadQrReminderIntervalSeconds * 1000L
+        if (now - lastQrNotificationAt.getOrDefault(vid, 0L) < intervalMs) {
+            logger.info("微信读书登录二维码提醒限频中，跳过推送: vid=$vid")
+            return false
+        }
+        val qrPng = generateQrPng(pending.scanUrl)
+        val delivered = if (qrPng != null) {
+            kotlinx.coroutines.runBlocking {
+                WebhookNotifier.pushQrcode(
+                    qrPng,
+                    "请使用微信扫码登录微信读书（过期后可打开刷新页重新获取）",
+                    fileName = "weread_web_${vid}.png",
+                    localFileAvailable = true,
+                    targetUrl = webLoginRefreshPageUrl(vid),
+                )
+            }.anySuccess
+        } else {
+            kotlinx.coroutines.runBlocking {
+                WebhookNotifier.notify(
+                    "weread_login_qr",
+                    mapOf(
+                        "message" to "微信读书需要重新登录，请打开链接扫码",
+                        "scan_url" to pending.scanUrl,
+                        "refresh_url" to webLoginRefreshPageUrl(vid),
+                        "vid" to vid,
+                    ),
+                )
+            }
+        }
+        if (delivered) lastQrNotificationAt[vid] = now
+        else logger.warn("微信读书登录二维码推送失败: vid=$vid")
+        return delivered
+    }
+
+    /**
+     * 刷新页/按钮入口：强制生成新二维码并推送，同时唤醒轮询。
+     * 已恢复的账号直接返回无需扫码。
+     */
+    fun refreshLoginQr(vid: String): Map<String, Any?> {
+        val account = WeReadAccountPool.get(vid)
+            ?: return mapOf("ok" to false, "error" to "账号不存在")
+        if (account.status == AccountStatus.ACTIVE) {
+            return mapOf("ok" to true, "recovered" to true, "message" to "账号正常，无需扫码")
+        }
+        pendingLogins.remove(vid)
+        lastQrNotificationAt.remove(vid)
+        val pending = ensurePendingLogin(vid)
+            ?: return mapOf("ok" to false, "error" to "二维码生成失败")
+        val notified = notifyLoginQr(vid, pending)
+        // 运行中的轮询会在下一轮自动接走新 uid；没有运行时则启动一个。
+        requestReloginIfNeeded(vid, force = true, automatic = false)
+        return mapOf(
+            "ok" to true,
+            "scan_url" to pending.scanUrl,
+            "refresh_url" to webLoginRefreshPageUrl(vid),
+            "notified" to notified,
+        )
+    }
+
+    /** Web 登录刷新页 HTML（状态 + 二维码 + 一键续期按钮）。 */
+    fun webLoginStatusHtml(vid: String): String {
+        fun esc(value: String): String = value
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\"", "&quot;")
+        val account = WeReadAccountPool.get(vid)
+            ?: return webLoginNoticeHtml("该微信读书账号不存在。", vid, null, null)
+        if (account.status == AccountStatus.ACTIVE) {
+            return webLoginNoticeHtml("账号 $vid 状态正常，无需扫码。", vid, null, null)
+        }
+        val now = System.currentTimeMillis()
+        val windowMs = AppConfig.wereadQrReuseWindowSeconds * 1000L
+        val pending = pendingLogins[vid]?.takeIf { now - it.createdAt < windowMs }
+        val qrDataUri = pending?.let {
+            generateQrPng(it.scanUrl)?.let { png ->
+                "data:image/png;base64," + java.util.Base64.getEncoder().encodeToString(png)
+            }
+        }
+        val remainSec = pending?.let { ((it.createdAt + windowMs - now) / 1000L).coerceAtLeast(0L) }
+        return webLoginNoticeHtml(
+            message = if (pending != null) {
+                "账号 $vid 等待扫码登录（二维码约 ${remainSec} 秒后过期）。"
+            } else {
+                "账号 $vid 当前没有有效二维码（已过期或尚未生成），点下面按钮重新获取。"
+            },
+            vid = vid,
+            scanUrl = pending?.scanUrl,
+            qrDataUri = qrDataUri,
+        )
+    }
+
+    private fun webLoginNoticeHtml(message: String, vid: String, scanUrl: String?, qrDataUri: String?): String {
+        fun esc(value: String): String = value
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\"", "&quot;")
+        val qrBlock = if (qrDataUri != null && scanUrl != null) {
+            """<img src="${qrDataUri}" alt="登录二维码" style="width:260px;height:260px;margin:12px auto;display:block;border:1px solid #e5e7eb;border-radius:12px;">
+        <p class="hint">或复制链接到微信打开：<br><code>${esc(scanUrl)}</code></p>"""
+        } else if (scanUrl != null) {
+            """<p class="hint">扫码链接：<br><code>${esc(scanUrl)}</code></p>"""
+        } else {
+            ""
+        }
+        return """
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>微信读书 Web 扫码登录</title>
+      <style>
+        body { margin: 0; background: #f5f7fa; color: #172033; font-family: system-ui, sans-serif; }
+        main { max-width: 520px; margin: 10vh auto; padding: 32px; background: white; border-radius: 16px; box-shadow: 0 10px 35px #17203318; }
+        h1 { font-size: 20px; }
+        .hint { color: #667085; line-height: 1.7; word-break: break-all; }
+        code { font-size: 12px; }
+        button { display: block; width: 100%; margin-top: 18px; padding: 14px; border: none; border-radius: 10px; color: white; background: #07c160; font-size: 17px; }
+      </style>
+    </head>
+    <body>
+      <main>
+        <h1>微信读书 Web 扫码登录</h1>
+        <p class="hint">${esc(message)}</p>
+        ${qrBlock}
+        <form method="post" action="/api/weread/account/recover/refresh?vid=${esc(vid)}">
+          <button type="submit">重新获取二维码</button>
+        </form>
+      </main>
+    </body>
+    </html>
+""".trimIndent()
     }
 
     /**

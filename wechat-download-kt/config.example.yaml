@@ -48,6 +48,8 @@ weread:
   refresh_fail_threshold: 3
   auto_qr_notification_enabled: true # 失效后自动生成并通过机器人发送人工扫码二维码
   relogin_retry_backoff: 300   # Web 自动恢复失败后的最小重试间隔（秒）
+  qr_reuse_window_seconds: 300   # 登录二维码有效期内复用同一链接，不重复生成推送
+  qr_reminder_interval_seconds: 3600  # 同一账号等待扫码期间机器人提醒最小间隔（秒）；过期点刷新页按钮随时手动续期
   health_check_interval: 300   # Web 凭证健康检查间隔（秒）
   web_probe_freshness: 600     # /api/ready 认可最近一次成功探测的最长时间（秒）
   eink:

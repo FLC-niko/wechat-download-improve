@@ -388,6 +388,22 @@ fun main() {
                     "message" to com.wamp.download.weread.CredentialHealthChecker.recoveryMessage(result),
                 ))
             }
+            // Web 登录刷新页：展示当前有效二维码（有效期内复用），附一键续期按钮。
+            get("/weread/web/login/refresh") {
+                val vid = call.request.queryParameters["vid"].orEmpty()
+                call.respondText(
+                    com.wamp.download.weread.WeReadWebAuth.webLoginStatusHtml(vid),
+                    io.ktor.http.ContentType.parse("text/html; charset=UTF-8"),
+                )
+            }
+            // 一键续期：强制生成新二维码并推送（刷新页按钮用；链接过期时点它）。
+            post("/api/weread/account/recover/refresh") {
+                val vid = call.request.queryParameters["vid"].orEmpty()
+                    .ifBlank {
+                        runCatching { call.receive<Map<String, String>>()["vid"] }.getOrElse { "" } ?: ""
+                    }
+                call.respond(com.wamp.download.weread.WeReadWebAuth.refreshLoginQr(vid))
+            }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()
                 val vid = body["vid"] ?: ""
