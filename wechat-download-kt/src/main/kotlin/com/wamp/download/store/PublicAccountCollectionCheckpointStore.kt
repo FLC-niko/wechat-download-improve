@@ -18,7 +18,9 @@ data class PublicAccountCollectionCheckpoint(
     val articlesCollected: Int,
 ) {
     fun covers(startTime: Long, endTime: Long): Boolean =
-        oldestCollectedAt <= startTime && newestCollectedAt >= endTime
+        // oldestCollectedAt == 0 表示起始边界未知（从未记录到），此时不得宣称覆盖
+        // 任何历史区间，否则未采集的老窗口会被误判为已覆盖（2026-10-17 实证）。
+        oldestCollectedAt > 0 && oldestCollectedAt <= startTime && newestCollectedAt >= endTime
 }
 
 /** Persists page-level collection progress without overstating unfinished pages as covered. */
