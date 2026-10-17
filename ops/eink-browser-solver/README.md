@@ -78,3 +78,15 @@ fake-IP 会让 `GEOIP,CN→Direct` 永远匹配不上，所以必须用显式域
 2. iStoreOS 恢复规则备份并重启 OpenClash；
 3. 可选：重新启用 crack-tcaptcha sidecar（见 `../eink-captcha-sidecar/README.md`，
    注意其 `turing` 端点与旧 `verify` 契约当前不可用）。
+
+## 运行模式与通知策略（2026-10-17 起：无 ADB 模式）
+
+- 手机离线时服务器 `config.yaml` 置 `adb.enabled: false`：停用 ADB 设备探测与
+  AAOS/坐标两条自动恢复管线，不再产生“没有可用的 ADB 设备槽位”重试。
+- Web 通道：健康检查每 5 分钟一轮；凭证过期即生成新二维码推送企微+飞书，
+  服务端轮询等待人工扫码，扫码成功恢复采集，失败退避后下轮发新码。
+  手机上线后可改回 `adb.enabled: true`，扫码即转由手机 AAOS 承接。
+- E-Ink 通知策略：仅当自动解题**失败或未配置**时才发人工验证链接+二维码
+  （`sendEinkManualFallback` 遇 `RECOVERED` 直接返回）；自动解题成功时机器人
+  保持静默（已用成功窗口日志验证）。`auto_solver.timeout_seconds` 建议 ≥150
+  以容纳多轮耗时（当前生产值 180）。
