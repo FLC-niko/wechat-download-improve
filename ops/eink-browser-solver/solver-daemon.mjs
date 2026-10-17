@@ -32,6 +32,9 @@ const think = async (a, b) => {
 };
 const SOLVE_BUDGET_MS = parseInt(process.env.SOLVER_BUDGET_MS || "60000", 10);
 const RECYCLE_SOLVES = parseInt(process.env.SOLVER_RECYCLE_SOLVES || "30", 10);
+// 升级题型“依次点击：”：sprite 剪影序列匹配的最低接受分，以及单次解题内允许的 seq 轮数。
+const SEQ_MIN_SCORE = parseFloat(process.env.SOLVER_SEQ_MIN_SCORE || "0.62");
+const SEQ_MAX_ROUNDS = parseInt(process.env.SOLVER_SEQ_MAX_ROUNDS || "3", 10);
 const DEBUG_DIR = process.env.DEBUG_DIR || "/tmp/eink-debug";
 const CONST_GRID = [
   { id: 1, range: [0, 34, 220, 254] },
@@ -192,6 +195,28 @@ async function pickRegion(imageB64, instruction, regions) {
       }
     );
     req.on("timeout", () => req.destroy(new Error("clip timeout")));
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+// “依次点击”题型的 sprite/主图匹配（seq_match.py，多尺度模板匹配）。
+async function seqPick(imageB64, spriteB64) {
+  const payload = JSON.stringify({ image_b64: imageB64, sprite_b64: spriteB64 });
+  const u = new URL(CLIP_URL);
+  const path = u.pathname.replace(/\/pick$/, "/seq-pick");
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: u.hostname, port: u.port, path, method: "POST", timeout: 90000,
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => (d += c));
+        res.on("end", () => { try { resolve(JSON.parse(d)); } catch (e) { reject(new Error(`seq-pick bad json: ${d.slice(0, 120)}`)); } });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("seq-pick timeout")));
     req.on("error", reject);
     req.write(payload);
     req.end();
@@ -447,6 +472,7 @@ async function solveOnce(entryUrl, appid, retries) {
 
     const maxRounds = Math.max(2, MAX_ROUNDS);
     let rounds = 0;
+    let seqRounds = 0;
     let lastHandledTs = 0;
     let lastImageTs = 0;
     let needFresh = true; // errorCode 50 = re-answer same question, no new challenge
@@ -557,54 +583,104 @@ async function solveOnce(entryUrl, appid, retries) {
           log("seq-mode DOM dumped (依次点击)");
         } catch (e) { log("seq dom dump failed:", String(e).slice(0, 100)); }
       }
+      let seqSubmitted = false;
       if (seqMode) {
-        // 该题型暂不支持，直接点“换一组”换题，避免错位乱点。
-        try {
-          const rr = await rectOf("(() => { const b = document.querySelector('.tc-refresh-icon') || document.getElementById('ticon_refresh'); if (!b) return 'null'; const r = b.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
-          if (rr && rr.x !== undefined) await clickAt(Math.round(rr.x + rr.w / 2), Math.round(rr.y + rr.h / 2));
-        } catch {}
+        seqRounds++;
+        // 升级题型“依次点击：”：sprite 剪影序列做多尺度模板匹配，命中后按序点击。
+        ensureBudget(20000, "seq-pick");
+        let sprite = spriteB64;
+        const spriteStale = !sprite || (Date.now() - spriteTs > 8000);
+        if (spriteStale && live.url) {
+          const spriteUrl = String(live.url).replace(/img_index=1/, "img_index=0");
+          if (spriteUrl !== String(live.url)) {
+            const fresh = await fetchB64(spriteUrl);
+            if (fresh) sprite = fresh;
+          }
+        }
+        let seq = null;
+        if (sprite) {
+          try {
+            seq = await seqPick(pickImageB64, sprite);
+          } catch (e) { log("seq-pick error:", String(e).slice(0, 120)); }
+        }
+        const confident = seq && seq.ok && Array.isArray(seq.clicks) && seq.clicks.length > 0
+          && typeof seq.min_score === "number" && seq.min_score >= SEQ_MIN_SCORE;
+        if (confident && seqRounds <= SEQ_MAX_ROUNDS) {
+          const sx = 672 / (seq.img_w || 672);
+          const sy = 480 / (seq.img_h || 480);
+          const pts = seq.clicks.map((c) => ({ x: c.x * sx, y: c.y * sy, score: c.score }));
+          log(`seq pick ok: n=${pts.length} min=${seq.min_score} clicks=${JSON.stringify(pts.map((p) => [Math.round(p.x), Math.round(p.y)]))}`);
+          if (process.env.DEBUG_SAVE === "1") {
+            try {
+              fs.mkdirSync(DEBUG_DIR, { recursive: true });
+              fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-pick.json`), JSON.stringify({ seq, points: pts, liveUrl: live.url || null }));
+            } catch {}
+          }
+          const bgR = await rectOf("(() => { const bg = document.getElementById('slideBg'); if (!bg) return 'null'; const r = bg.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
+          if (!bgR || bgR.w === undefined) throw new Error("slideBg not found");
+          for (const p of pts) {
+            const cx = bgR.x + p.x * (bgR.w / 672);
+            const cy = bgR.y + p.y * (bgR.h / 480);
+            await clickAt(Math.round(cx), Math.round(cy));
+            await sleep(120 + Math.random() * 140);
+          }
+          lastSubmittedInstr = instr;
+          lastSubmittedUrl = live.url || null;
+          seqSubmitted = true;
+        } else {
+          if (seqRounds > SEQ_MAX_ROUNDS) {
+            throw new Error(`seq tasks unresolved after ${seqRounds} rounds (min=${seq && typeof seq.min_score === "number" ? seq.min_score : "n/a"})`);
+          }
+          log("seq pick low confidence -> refresh", seq ? `min=${seq.min_score}` : "(no result)");
+          try {
+            const rr = await rectOf("(() => { const b = document.querySelector('.tc-refresh-icon') || document.getElementById('ticon_refresh'); if (!b) return 'null'; const r = b.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
+            if (rr && rr.x !== undefined) await clickAt(Math.round(rr.x + rr.w / 2), Math.round(rr.y + rr.h / 2));
+          } catch {}
+          lastSubmittedInstr = instr;
+          lastSubmittedUrl = live.url || null;
+          await sleep(1200);
+          continue;
+        }
+      }
+      if (!seqSubmitted) {
+        ensureBudget(20000, "pick");
+        const pick = await pickRegion(pickImageB64, instr, CONST_GRID);
+        if (!pick?.ok) throw new Error(`pick failed: ${pick?.error || "unknown"}`);
+        log(`round ${rounds}: pick=${pick.region_id} set=${JSON.stringify(pick.region_ids || [pick.region_id])} method=${pick.method}`);
         lastSubmittedInstr = instr;
         lastSubmittedUrl = live.url || null;
-        await sleep(1200);
-        continue;
-      }
-      ensureBudget(20000, "pick");
-      const pick = await pickRegion(pickImageB64, instr, CONST_GRID);
-      if (!pick?.ok) throw new Error(`pick failed: ${pick?.error || "unknown"}`);
-      log(`round ${rounds}: pick=${pick.region_id} set=${JSON.stringify(pick.region_ids || [pick.region_id])} method=${pick.method}`);
-      lastSubmittedInstr = instr;
-      lastSubmittedUrl = live.url || null;
-      if (process.env.DEBUG_SAVE === "1") {
-        try {
-          fs.mkdirSync(DEBUG_DIR, { recursive: true });
-          fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
-          fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-pick.json`), JSON.stringify({ instruction: instr, pick, regions: CONST_GRID, liveUrl: live.url || null, src: live.b64 ? "dom" : "net" }));
-        } catch {}
-      }
+        if (process.env.DEBUG_SAVE === "1") {
+          try {
+            fs.mkdirSync(DEBUG_DIR, { recursive: true });
+            fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
+            fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-pick.json`), JSON.stringify({ instruction: instr, pick, regions: CONST_GRID, liveUrl: live.url || null, src: live.b64 ? "dom" : "net" }));
+          } catch {}
+        }
 
-      const bgRect = await rectOf(
-        "(() => { const bg = document.getElementById('slideBg'); if (!bg) return 'null'; const r = bg.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()"
-      );
-      if (!bgRect || bgRect.w === undefined) throw new Error("slideBg not found");
-      let ids = (Array.isArray(pick.region_ids) && pick.region_ids.length ? pick.region_ids : [pick.region_id]).filter((x) => typeof x === "number" && x >= 1 && x <= 6);
-      if (!ids.length) {
-        log("round", rounds, ": empty pick set -> clicking refresh and continuing");
-        try {
-          const rr = await rectOf("(() => { const b = document.querySelector('.tc-refresh-icon') || document.getElementById('ticon_refresh'); if (!b) return 'null'; const r = b.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
-          if (rr && rr.x !== undefined) await clickAt(Math.round(rr.x + rr.w / 2), Math.round(rr.y + rr.h / 2));
-        } catch {}
-        await sleep(1500);
-        continue;
-      }
-      log(`click set = ${JSON.stringify(ids)} (bgRect=${JSON.stringify(bgRect)})`);
-      for (const rid of ids) {
-        const reg = CONST_GRID.find((r) => r.id === rid);
-        if (!reg) continue;
-        const [x1, y1, x2, y2] = reg.range;
-        const cx = bgRect.x + ((x1 + x2) / 2) * (bgRect.w / 672);
-        const cy = bgRect.y + ((y1 + y2) / 2) * (bgRect.h / 480);
-        await clickAt(Math.round(cx), Math.round(cy));
-        await sleep(90 + Math.random() * 90);
+        const bgRect = await rectOf(
+          "(() => { const bg = document.getElementById('slideBg'); if (!bg) return 'null'; const r = bg.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()"
+        );
+        if (!bgRect || bgRect.w === undefined) throw new Error("slideBg not found");
+        let ids = (Array.isArray(pick.region_ids) && pick.region_ids.length ? pick.region_ids : [pick.region_id]).filter((x) => typeof x === "number" && x >= 1 && x <= 6);
+        if (!ids.length) {
+          log("round", rounds, ": empty pick set -> clicking refresh and continuing");
+          try {
+            const rr = await rectOf("(() => { const b = document.querySelector('.tc-refresh-icon') || document.getElementById('ticon_refresh'); if (!b) return 'null'; const r = b.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
+            if (rr && rr.x !== undefined) await clickAt(Math.round(rr.x + rr.w / 2), Math.round(rr.y + rr.h / 2));
+          } catch {}
+          await sleep(1500);
+          continue;
+        }
+        log(`click set = ${JSON.stringify(ids)} (bgRect=${JSON.stringify(bgRect)})`);
+        for (const rid of ids) {
+          const reg = CONST_GRID.find((r) => r.id === rid);
+          if (!reg) continue;
+          const [x1, y1, x2, y2] = reg.range;
+          const cx = bgRect.x + ((x1 + x2) / 2) * (bgRect.w / 672);
+          const cy = bgRect.y + ((y1 + y2) / 2) * (bgRect.h / 480);
+          await clickAt(Math.round(cx), Math.round(cy));
+          await sleep(90 + Math.random() * 90);
+        }
       }
       await sleep(500 + Math.random() * 400);
       try {

@@ -11,6 +11,8 @@ Strategies, routed by instruction text:
 
 POST /pick  {"image_b64": "...", "instruction": "...",
              "regions": [{"id": 1, "range": [x1,y1,x2,y2]}, ...]}
+POST /seq-pick {"image_b64": "...", "sprite_b64": "..."}
+             -> {"ok":true,"clicks":[{"x","y","score"}...],"min_score":...,"img_w","img_h"}
 GET  /health
 """
 
@@ -226,6 +228,15 @@ def pick(image_b64: str, instruction: str, regions: list) -> dict:
     return _pick_by_clip(image, instruction, regions)
 
 
+def seq_pick(image_b64: str, sprite_b64: str) -> dict:
+    """Icon-sequence ("依次点击：") matcher; see seq_match.py for the pipeline."""
+    from seq_match import solve_seq
+
+    image = np.array(Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB"))
+    sprite = np.array(Image.open(io.BytesIO(base64.b64decode(sprite_b64))).convert("RGB"))
+    return solve_seq(image, sprite)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode()
@@ -242,6 +253,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802
+        if self.path == "/seq-pick":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                data = json.loads(self.rfile.read(length).decode())
+                result = seq_pick(data["image_b64"], data["sprite_b64"])
+                self._send(200, result)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("seq-pick failed")
+                self._send(500, {"ok": False, "error": str(exc)[:300]})
+            return
         if self.path != "/pick":
             self._send(404, {"error": "not found"})
             return

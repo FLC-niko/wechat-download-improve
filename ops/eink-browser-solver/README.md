@@ -11,7 +11,8 @@ App auto_solver (127.0.0.1:9991) ──POST /solve──▶ solver-daemon.mjs (N
     │                                                  ├─ Chromium（Xvfb 有头）
     │                                                  ├─ 本地选格 → clip_service.py (127.0.0.1:9993)
     │                                                  │     ├─ 场景/物体题：cn-clip 图文相似度（多选集合）
-    │                                                  │     └─ 包含文字题：ddddocr / YOLO+Siamese（相似字）
+    │                                                  │     ├─ 包含文字题：ddddocr / YOLO+Siamese（相似字）
+    │                                                  │     └─ 依次点击题：seq_match.py 多尺度模板匹配（sprite 剪影→主图）
     │                                                  └─ ticket/randstr ◀── cap_union_new_verify (errorCode=0)
     └─ WeReadEinkHumanVerification.complete(ticket, randstr) → 账号恢复
 ```
@@ -53,8 +54,8 @@ fake-IP 会让 `GEOIP,CN→Direct` 永远匹配不上，所以必须用显式域
    （`pip install playwright && playwright install --with-deps chromium`，
    本环境路径 `/opt/ms-playwright`）、Xvfb（`apt install xvfb`，`:99`）、
    cn-clip/torch/ddddocr（见 `../eink-captcha-sidecar/patches/image-select-clip/README.md`）。
-2. 复制本目录 `solver-daemon.mjs`、`clip_service.py` 到 `/opt/eink-browser-solver/`；
-   复制 `systemd/*.service` 到 `/etc/systemd/system/`。
+2. 复制本目录 `solver-daemon.mjs`、`clip_service.py`、`seq_match.py` 到
+   `/opt/eink-browser-solver/`；复制 `systemd/*.service` 到 `/etc/systemd/system/`。
 3. 按 `eink-browser-solver.env.example` 写 `/etc/eink-browser-solver.env`
    （`SOLVER_SK` 必须与 App `config.yaml` 中
    `weread.eink.human_verify.auto_solver.secret` 一致），`chmod 600`。
@@ -71,6 +72,25 @@ fake-IP 会让 `GEOIP,CN→Direct` 永远匹配不上，所以必须用显式域
 - 调试样本：`DEBUG_SAVE=1` 时每轮题图与选择存 `DEBUG_DIR`（离线调参用）。
 - App 侧：`E-Ink 自动验证结束: vid=..., code=RECOVERED` 即成功；
   `terror_` 票据会被拒绝；`auto_solver.timeout_seconds` 建议 ≥150（多轮耗时）。
+
+## 依次点击（图标序列）题型（2026-10-18）
+
+题面为“依次点击：”+ 提示小图（黑色剪影图标序列，带噪点防 OCR），主图为照片上
+随机分布的彩色描边图标（672×480），需按提示顺序依次点击。
+
+实现（`seq_match.py`，端点 `POST 127.0.0.1:9993/seq-pick`）参考
+[adnogpu/TXCaptcha](https://github.com/adnogpu/TXCaptcha) 的同款题型方案并做适配：
+
+1. sprite 剪影：自适应暗色/低饱和阈值提取字形，按 bbox 邻近合并碎片；
+2. 主图搜索图：彩色描边（饱和度 98 分位自适应）+ 暗色高对比描边，闭运算后填洞成实心字形；
+3. 匹配：多尺度（0.8–2.2）× 多角度（-40°…40°）`TM_CCOEFF_NORMED`，
+   分数融合相关系数 + recall + precision，每变换取前 5 个抑制峰、全局保留前 10；
+4. 组合：对所有字形的候选做全局非重叠最优组合（DFS，近距惩罚）；
+5. 门控：`min_score < SOLVER_SEQ_MIN_SCORE`（默认 0.62）不点击，改点“换一组”；
+   单次解题 seq 轮数超过 `SOLVER_SEQ_MAX_ROUNDS`（默认 3）快速失败。
+
+调参样本：`DEBUG_DIR/seq-r*-img.jpg`、`seq-r*-sprite.png`、`seq-r*-pick.json`
+（后者含 scores/坐标），线上以 verify 的 errorCode（0 成功 / 51 失败）回归评估。
 
 ## 回滚
 
