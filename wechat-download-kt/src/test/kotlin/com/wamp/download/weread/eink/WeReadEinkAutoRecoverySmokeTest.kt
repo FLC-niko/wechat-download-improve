@@ -122,6 +122,9 @@ class WeReadEinkAutoRecoverySmokeTest {
                 verification = initial,
                 solve = solverClient(sidecar.address.port)::solve,
                 complete = coordinator::complete,
+                // 失败重试必须换新挑战（已消费的 nonce 会直接 ALREADY_USED）。
+                currentVerification = { coordinator.createOrReuse(vid, base) },
+                retryDelayMs = 0L,
             )
             assertEquals(WeReadEinkAutoRecoveryCode.PROBE_FAILED, attempt?.code)
             assertTrue(coordinator.requestHeaders().isEmpty())

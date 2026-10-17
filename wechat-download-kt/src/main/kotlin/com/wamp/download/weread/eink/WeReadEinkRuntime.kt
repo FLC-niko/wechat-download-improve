@@ -74,55 +74,79 @@ internal fun performEinkAutoRecovery(
     verification: WeReadEinkVerificationStatus,
     solve: (entryUrl: String) -> WeReadEinkCaptchaSolveResult,
     complete: (vid: String, nonce: String, ticket: String, randstr: String) -> WeReadEinkVerificationResult,
+    maxProbeCycles: Int = 2,
+    currentVerification: () -> WeReadEinkVerificationStatus = { verification },
+    retryDelayMs: Long = 30_000L,
 ): WeReadEinkAutoRecoveryAttempt? {
     if (!enabled) return null
     if (!isAutoSolverEligible(true, allowlist, vid)) {
         return WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.NOT_ALLOWLISTED)
     }
-    val verifyUrl = verification.verifyUrl
-        ?: return WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.INVALID_RESULT)
-    val nonce = verifyUrl.substringAfterLast('/').takeIf { it.isNotBlank() }
-        ?: return WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.INVALID_RESULT)
-    val solved = runCatching { solve(verifyUrl) }.getOrElse {
-        WeReadEinkCaptchaSolveResult(
-            code = WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE,
-            durationMs = 0L,
+    var totalAttempts = 0
+    var totalDurationMs = 0L
+    var last = WeReadEinkAutoRecoveryAttempt(WeReadEinkAutoRecoveryCode.SOLVE_FAILED)
+    // PROBE_FAILED（票据有效但恢复探测仍 -2041）值得用新票据再打一轮：
+    // 实测重试一次经常通过，避免直接落到人工兜底消息。
+    repeat(maxProbeCycles.coerceAtLeast(1)) { cycle ->
+        val current = if (cycle == 0) verification else currentVerification()
+        if (cycle > 0) {
+            // 给服务端状态传播留一点时间；IO 线程阻塞可接受。
+            Thread.sleep(retryDelayMs.coerceAtLeast(0L))
+        }
+        val verifyUrl = current.verifyUrl
+            ?: return WeReadEinkAutoRecoveryAttempt(
+                WeReadEinkAutoRecoveryCode.INVALID_RESULT, totalAttempts, totalDurationMs,
+            )
+        val nonce = verifyUrl.substringAfterLast('/').takeIf { it.isNotBlank() }
+            ?: return WeReadEinkAutoRecoveryAttempt(
+                WeReadEinkAutoRecoveryCode.INVALID_RESULT, totalAttempts, totalDurationMs,
+            )
+        val solved = runCatching { solve(verifyUrl) }.getOrElse {
+            WeReadEinkCaptchaSolveResult(
+                code = WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE,
+                durationMs = 0L,
+            )
+        }
+        totalAttempts += solved.attempts ?: 0
+        totalDurationMs += solved.durationMs
+        val mapped = when (solved.code) {
+            WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE -> WeReadEinkAutoRecoveryCode.SIDE_CAR_UNAVAILABLE
+            WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAUTHORIZED -> WeReadEinkAutoRecoveryCode.SIDE_CAR_UNAUTHORIZED
+            WeReadEinkCaptchaSolveCode.SOLVE_FAILED -> WeReadEinkAutoRecoveryCode.SOLVE_FAILED
+            WeReadEinkCaptchaSolveCode.INVALID_RESULT -> WeReadEinkAutoRecoveryCode.INVALID_RESULT
+            WeReadEinkCaptchaSolveCode.SOLVED -> null
+        }
+        if (mapped != null) {
+            last = WeReadEinkAutoRecoveryAttempt(mapped, totalAttempts, totalDurationMs)
+            // 仅解题侧偶发失败（SOLVE_FAILED）值得换新挑战再试；基础设施类错误直接返回。
+            if (mapped != WeReadEinkAutoRecoveryCode.SOLVE_FAILED) return last
+            return@repeat
+        }
+        val captcha = solved.captcha
+            ?: return WeReadEinkAutoRecoveryAttempt(
+                WeReadEinkAutoRecoveryCode.INVALID_RESULT, totalAttempts, totalDurationMs,
+            )
+        val completion = runCatching {
+            complete(vid, nonce, captcha.ticket, captcha.randstr)
+        }.getOrElse {
+            last = WeReadEinkAutoRecoveryAttempt(
+                WeReadEinkAutoRecoveryCode.PROBE_FAILED, totalAttempts, totalDurationMs,
+            )
+            return@repeat
+        }
+        last = WeReadEinkAutoRecoveryAttempt(
+            code = when {
+                completion.ok && completion.code == "RECOVERED" -> WeReadEinkAutoRecoveryCode.RECOVERED
+                completion.code == "PROBE_FAILED" -> WeReadEinkAutoRecoveryCode.PROBE_FAILED
+                else -> WeReadEinkAutoRecoveryCode.INVALID_RESULT
+            },
+            attempts = totalAttempts,
+            durationMs = totalDurationMs,
         )
+        if (last.code == WeReadEinkAutoRecoveryCode.RECOVERED) return last
+        if (last.code != WeReadEinkAutoRecoveryCode.PROBE_FAILED) return last
     }
-    val mapped = when (solved.code) {
-        WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAVAILABLE -> WeReadEinkAutoRecoveryCode.SIDE_CAR_UNAVAILABLE
-        WeReadEinkCaptchaSolveCode.SIDE_CAR_UNAUTHORIZED -> WeReadEinkAutoRecoveryCode.SIDE_CAR_UNAUTHORIZED
-        WeReadEinkCaptchaSolveCode.SOLVE_FAILED -> WeReadEinkAutoRecoveryCode.SOLVE_FAILED
-        WeReadEinkCaptchaSolveCode.INVALID_RESULT -> WeReadEinkAutoRecoveryCode.INVALID_RESULT
-        WeReadEinkCaptchaSolveCode.SOLVED -> null
-    }
-    if (mapped != null) {
-        return WeReadEinkAutoRecoveryAttempt(mapped, solved.attempts, solved.durationMs)
-    }
-    val captcha = solved.captcha
-        ?: return WeReadEinkAutoRecoveryAttempt(
-            WeReadEinkAutoRecoveryCode.INVALID_RESULT,
-            solved.attempts,
-            solved.durationMs,
-        )
-    val completion = runCatching {
-        complete(vid, nonce, captcha.ticket, captcha.randstr)
-    }.getOrElse {
-        return WeReadEinkAutoRecoveryAttempt(
-            WeReadEinkAutoRecoveryCode.PROBE_FAILED,
-            solved.attempts,
-            solved.durationMs,
-        )
-    }
-    return WeReadEinkAutoRecoveryAttempt(
-        code = when {
-            completion.ok && completion.code == "RECOVERED" -> WeReadEinkAutoRecoveryCode.RECOVERED
-            completion.code == "PROBE_FAILED" -> WeReadEinkAutoRecoveryCode.PROBE_FAILED
-            else -> WeReadEinkAutoRecoveryCode.INVALID_RESULT
-        },
-        attempts = solved.attempts,
-        durationMs = solved.durationMs,
-    )
+    return last
 }
 
 object WeReadEinkRuntime {
@@ -804,6 +828,7 @@ object WeReadEinkRuntime {
             verification = verification,
             solve = { entryUrl -> WeReadEinkCaptchaSolverClient.fromConfig().solve(entryUrl) },
             complete = WeReadEinkHumanVerification::complete,
+            currentVerification = { WeReadEinkHumanVerification.createOrReuse(vid, AppConfig.siteUrl) },
         )
     }
 
