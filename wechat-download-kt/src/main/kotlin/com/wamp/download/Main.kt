@@ -402,7 +402,15 @@ fun main() {
                     .ifBlank {
                         runCatching { call.receive<Map<String, String>>()["vid"] }.getOrElse { "" } ?: ""
                     }
-                call.respond(com.wamp.download.weread.WeReadWebAuth.refreshLoginQr(vid))
+                val result = com.wamp.download.weread.WeReadWebAuth.refreshLoginQr(vid)
+                // 浏览器表单提交（刷新页按钮）返回 303 跳回刷新页，避免展示 JSON 裸文本；
+                // 其他调用方（脚本/API）仍拿到 JSON。
+                val wantsHtml = call.request.headers["Accept"].orEmpty().contains("text/html")
+                if (wantsHtml) {
+                    call.respondRedirect("/weread/web/login/refresh?vid=$vid", permanent = false)
+                } else {
+                    call.respond(result)
+                }
             }
             post("/api/weread/account/delete") {
                 val body = call.receive<Map<String, String>>()
