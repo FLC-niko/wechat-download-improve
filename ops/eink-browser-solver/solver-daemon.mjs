@@ -83,11 +83,19 @@ class Target {
     });
     this.ws.on("error", () => {});
   }
-  send(method, params = {}) {
+  send(method, params = {}, timeoutMs = 30000) {
     return new Promise((resolve, reject) => {
       if (this.closed) return reject(new Error(`target ${this.name} closed`));
       const id = ++msgId;
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(new Error(`target ${this.name} cmd timeout: ${method}`));
+        }
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
       this.ws.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -473,6 +481,12 @@ async function solveOnce(entryUrl, appid, retries) {
     };
 
     const deadline = startedAt + SOLVE_BUDGET_MS;
+    // 单轮内任何一段慢操作后都检查预算；预算不足直接抛，保证在 App 超时前返回。
+    const ensureBudget = (needMs, stage) => {
+      if (deadline - Date.now() < needMs) {
+        throw new Error(`budget exhausted before ${stage} (need ${needMs}ms)`);
+      }
+    };
     while (Date.now() < deadline && rounds < maxRounds) {
       // 剩余预算不足一轮完整提交时，体面收尾而不是用过期 deadline 制造误报超时。
       if (deadline - Date.now() < 22000) {
@@ -554,6 +568,7 @@ async function solveOnce(entryUrl, appid, retries) {
         await sleep(1200);
         continue;
       }
+      ensureBudget(20000, "pick");
       const pick = await pickRegion(pickImageB64, instr, CONST_GRID);
       if (!pick?.ok) throw new Error(`pick failed: ${pick?.error || "unknown"}`);
       log(`round ${rounds}: pick=${pick.region_id} set=${JSON.stringify(pick.region_ids || [pick.region_id])} method=${pick.method}`);
@@ -601,6 +616,7 @@ async function solveOnce(entryUrl, appid, retries) {
       } catch (e) { log("mask diag failed", String(e).slice(0, 100)); }
 
       // confirm button: click the first visible candidate (.verifyButton / #verifyBtn)
+      ensureBudget(15000, "confirm");
       await sleep(400);
       const reqsBefore = verifyReqCount;
       const countBefore = verifyResponses.length;
@@ -617,6 +633,7 @@ async function solveOnce(entryUrl, appid, retries) {
 
       // wait for the verify outcome of this round (char tasks can take 10-15s
       // to build the payload before the request fires; do not re-click)
+      ensureBudget(12000, "verify-wait");
       const vDeadline = Math.min(deadline, Date.now() + 28000);
       while (Date.now() < vDeadline && verifyResponses.length === countBefore) await sleep(400);
       const resp = verifyResponses[verifyResponses.length - 1];
