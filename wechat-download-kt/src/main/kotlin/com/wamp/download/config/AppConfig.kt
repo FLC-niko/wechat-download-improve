@@ -133,7 +133,7 @@ object AppConfig {
     val wereadEinkAutoSolverSecret: String
         get() = getString("weread.eink.human_verify.auto_solver.secret", "")
     val wereadEinkAutoSolverTimeoutSeconds: Long
-        get() = getLong("weread.eink.human_verify.auto_solver.timeout_seconds", 75L).coerceIn(5L, 120L)
+        get() = getLong("weread.eink.human_verify.auto_solver.timeout_seconds", 75L).coerceIn(5L, 600L)
     val wereadEinkAutoSolverRetries: Int
         get() = getInt("weread.eink.human_verify.auto_solver.retries", 1).coerceIn(1, 2)
     val wereadEinkAutoSolverVidAllowlist: Set<String>
