@@ -215,6 +215,9 @@ object WeReadEinkRuntime {
 
         val humanVerificationReported = AtomicBoolean(false)
 
+        /** 自动解题/恢复是否进行中：并发的 -2041 事件只允许一个恢复流程在跑。 */
+        val autoRecoveryInFlight = AtomicBoolean(false)
+
         val lastHumanVerifyNotificationAt = AtomicLong(0L)
 
         /** 连续被 -2041 的次数：探测退避按 1h→2h→4h→8h→12h 递增，成功后清零。 */
@@ -775,45 +778,63 @@ object WeReadEinkRuntime {
     }
 
     private fun notifyHumanVerification(account: AccountRuntime, error: WeReadEinkApiException) {
-        // 同一次封禁期间按配置间隔提醒；成功恢复后再次 -2041 属于新事件。
-        // CAS 保证并发下只有一条提醒发出。
+        // 提醒静默只抑制提醒消息本身，不再顺带跳过自动解题：否则一次失败会把自动恢复
+        // 一并锁死到静默期（默认 3 小时）结束，账号只能等下一次应用重启才有机会恢复。
+        if (!account.autoRecoveryInFlight.compareAndSet(false, true)) {
+            logger.info("E-Ink 自动验证进行中，跳过重复触发: vid={}", account.vid)
+            return
+        }
         val now = System.currentTimeMillis()
+        // 同一次封禁期间按配置间隔提醒；成功恢复后再次 -2041 属于新事件。
+        // CAS 保证并发下只有一条提醒占用名额；静默只决定提醒，不影响下方自动解题。
+        var notifyAfterAttempt = false
         while (true) {
             val last = account.lastHumanVerifyNotificationAt.get()
             if (humanVerifyNotificationSuppressed(last, now)) {
                 logger.info(
-                    "E-Ink 人工验证提醒静默中（间隔 {} 秒），跳过本次: vid={}, 距上次 {} 分钟",
+                    "E-Ink 人工验证提醒静默中（间隔 {} 秒），仅静默提醒、继续自动解题: vid={}, 距上次 {} 分钟",
                     AppConfig.wereadEinkHumanVerifyReminderInterval,
                     account.vid,
                     (now - last) / 60_000,
                 )
-                return
+                break
             }
-            if (account.lastHumanVerifyNotificationAt.compareAndSet(last, now)) break
+            if (account.lastHumanVerifyNotificationAt.compareAndSet(last, now)) {
+                notifyAfterAttempt = true
+                break
+            }
         }
         account.humanVerificationReported.set(true)
         val verification = WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
-        recoveryScope?.launch {
-            val automaticAttempt = attemptAutomaticHumanVerification(account.vid, verification)
-            if (automaticAttempt != null) {
-                logger.info(
-                    "E-Ink 自动验证结束: vid=${account.vid}, code=${automaticAttempt.code}, " +
-                        "attempts=${automaticAttempt.attempts ?: 0}, duration_ms=${automaticAttempt.durationMs}",
-                )
-            }
-
-            // The automatic probe may consume the challenge and create a replacement. Always
-            // re-read/create the current challenge before notifying so an old nonce is never sent.
-            sendEinkManualFallback(
-                attempt = automaticAttempt,
-                currentVerification = {
-                    WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
-                },
-                notify = { sendHumanVerificationNotification(account, error, it) },
-            )
-        } ?: run {
+        val scope = recoveryScope
+        if (scope == null) {
+            account.autoRecoveryInFlight.set(false)
             account.humanVerificationReported.set(false)
             logger.warn("E-Ink 人工验证通知未发送：应用协程未配置")
+            return
+        }
+        scope.launch {
+            try {
+                val automaticAttempt = attemptAutomaticHumanVerification(account.vid, verification)
+                if (automaticAttempt != null) {
+                    logger.info(
+                        "E-Ink 自动验证结束: vid=${account.vid}, code=${automaticAttempt.code}, " +
+                            "attempts=${automaticAttempt.attempts ?: 0}, duration_ms=${automaticAttempt.durationMs}",
+                    )
+                }
+                if (!notifyAfterAttempt) return@launch
+                // The automatic probe may consume the challenge and create a replacement. Always
+                // re-read/create the current challenge before notifying so an old nonce is never sent.
+                sendEinkManualFallback(
+                    attempt = automaticAttempt,
+                    currentVerification = {
+                        WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
+                    },
+                    notify = { sendHumanVerificationNotification(account, error, it) },
+                )
+            } finally {
+                account.autoRecoveryInFlight.set(false)
+            }
         }
     }
 
