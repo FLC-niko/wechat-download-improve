@@ -1,0 +1,16 @@
+[Unit]
+Description=E-Ink captcha vision picker (CLIP/OCR, loopback only)
+After=network-online.target
+
+[Service]
+Type=simple
+User=topview
+WorkingDirectory=/opt/eink-browser-solver
+ExecStart=/opt/crack-tcaptcha/venv/bin/python /opt/eink-browser-solver/clip_service.py
+Environment=CLIP_PORT=9993
+Environment=CLIP_MODEL_DIR=/opt/crack-tcaptcha/models
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

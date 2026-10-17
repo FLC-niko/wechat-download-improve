@@ -1,0 +1,16 @@
+[Unit]
+Description=E-Ink captcha browser solver daemon
+After=network-online.target eink-clip-service.service
+Wants=eink-clip-service.service
+
+[Service]
+Type=simple
+User=topview
+WorkingDirectory=/opt/eink-browser-solver
+EnvironmentFile=/etc/eink-browser-solver.env
+ExecStart=/usr/bin/node /opt/eink-browser-solver/solver-daemon.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
