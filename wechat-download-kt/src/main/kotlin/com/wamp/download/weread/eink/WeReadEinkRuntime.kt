@@ -3,6 +3,7 @@ package com.wamp.download.weread.eink
 import com.wamp.download.config.AppConfig
 import com.wamp.download.notify.WebhookNotifier
 import com.wamp.download.store.SubscriptionStore
+import com.wamp.download.weread.WeReadAccountPool
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -220,6 +221,9 @@ object WeReadEinkRuntime {
 
         val lastHumanVerifyNotificationAt = AtomicLong(0L)
 
+        /** 上次自动验证尝试时间：同一封禁期间最多每 human_verify_probe_interval 尝试一次。 */
+        val lastHumanVerifyAttemptAt = AtomicLong(0L)
+
         /** 连续被 -2041 的次数：探测退避按 1h→2h→4h→8h→12h 递增，成功后清零。 */
         @Volatile
         var humanVerifyCycleCount: Int = 0
@@ -327,6 +331,10 @@ object WeReadEinkRuntime {
     private fun noteHumanVerifyRecovery(account: AccountRuntime, previousState: String) {
         if (previousState != "HUMAN_VERIFY_REQUIRED" || account.authState != "HEALTHY") return
         WeReadEinkRequestGate.markHumanVerifyRecovered(account.vid)
+        // 新一轮封禁是新的验证事件：重置尝试冷却，确保下次 -2041 能立即再试。
+        account.lastHumanVerifyAttemptAt.set(0L)
+        // 账号级 -2041 同时熔断了 Web 采集：验证通过后恢复账号池状态，等待下一次探测确认。
+        WeReadAccountPool.clearHumanVerificationRequired(account.vid)
         logger.info("E-Ink 账号人工验证已恢复，进入 30 分钟温和请求期: vid=${account.vid}")
     }
 
@@ -777,7 +785,26 @@ object WeReadEinkRuntime {
         }
     }
 
+    /**
+     * Web 采集侧 -2041：账号级风控与 E-Ink 共用，转交浏览器自动验证。
+     * 扫码登录不能解除 -2041，只有官方人工验证可以；这里复用同一套解题流程。
+     */
+    fun requestHumanVerificationRecovery(vid: String, reason: String): Boolean {
+        val account = synchronized(runtimeLock) { accounts[vid] }
+        if (account == null) {
+            logger.info("Web 渠道 -2041：账号未配置 E-Ink 凭证，无法自动验证: vid={}, reason={}", vid, reason)
+            return false
+        }
+        logger.warn("Web 渠道 -2041，转交浏览器自动验证: vid={}, reason={}", vid, reason)
+        notifyHumanVerification(account, reason)
+        return true
+    }
+
     private fun notifyHumanVerification(account: AccountRuntime, error: WeReadEinkApiException) {
+        notifyHumanVerification(account, error.message.orEmpty())
+    }
+
+    private fun notifyHumanVerification(account: AccountRuntime, reason: String) {
         // 提醒静默只抑制提醒消息本身，不再顺带跳过自动解题：否则一次失败会把自动恢复
         // 一并锁死到静默期（默认 3 小时）结束，账号只能等下一次应用重启才有机会恢复。
         if (!account.autoRecoveryInFlight.compareAndSet(false, true)) {
@@ -785,6 +812,21 @@ object WeReadEinkRuntime {
             return
         }
         val now = System.currentTimeMillis()
+        // 同一封禁期间限制尝试频率：Web 侧每 5 分钟的健康检查也会转交恢复请求，
+        // 没有冷却会把解题器打成连续轰炸（每次最多两轮 290s 解题）。
+        val attemptInterval = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L
+        val lastAttempt = account.lastHumanVerifyAttemptAt.get()
+        if (attemptInterval > 0L && lastAttempt > 0L && now - lastAttempt < attemptInterval) {
+            account.autoRecoveryInFlight.set(false)
+            logger.info(
+                "E-Ink 自动验证冷却中（间隔 {} 秒），跳过本次: vid={}, 距上次 {} 分钟",
+                AppConfig.wereadEinkHumanVerifyProbeInterval,
+                account.vid,
+                (now - lastAttempt) / 60_000,
+            )
+            return
+        }
+        account.lastHumanVerifyAttemptAt.set(now)
         // 同一次封禁期间按配置间隔提醒；成功恢复后再次 -2041 属于新事件。
         // CAS 保证并发下只有一条提醒占用名额；静默只决定提醒，不影响下方自动解题。
         var notifyAfterAttempt = false
@@ -830,7 +872,7 @@ object WeReadEinkRuntime {
                     currentVerification = {
                         WeReadEinkHumanVerification.createOrReuse(account.vid, AppConfig.siteUrl)
                     },
-                    notify = { sendHumanVerificationNotification(account, error, it) },
+                    notify = { sendHumanVerificationNotification(account, reason, it) },
                 )
             } finally {
                 account.autoRecoveryInFlight.set(false)
@@ -855,17 +897,17 @@ object WeReadEinkRuntime {
 
     private suspend fun sendHumanVerificationNotification(
         account: AccountRuntime,
-        error: WeReadEinkApiException,
+        reason: String,
         verification: WeReadEinkVerificationStatus,
     ) {
         val textSent = WebhookNotifier.notify(
                 "weread_eink_human_verify",
                 mapOf(
-                    "message" to "微信读书 E-Ink 触发 -2041；请点击验证链接或扫描随后发送的二维码",
+                    "message" to "微信读书账号触发 -2041（E-Ink/Web 共用）；请点击验证链接或扫描随后发送的二维码",
                     "vid" to account.vid,
                     "verify_url" to verification.verifyUrl,
                     "expires_at" to verification.expiresAt?.let(Instant::ofEpochMilli)?.toString(),
-                    "error" to error.message,
+                    "error" to reason.take(500),
                 ),
             )
         val qrSent = verification.verifyUrl?.let { verifyUrl ->

@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonParser
 import com.google.gson.reflect.TypeToken
 import com.wamp.download.config.AppConfig
+import com.wamp.download.weread.eink.WeReadEinkRuntime
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -224,6 +225,8 @@ class WeReadWebClient {
                         // 凭证并熔断采集，不能再次扫码或自动重试来替代人工验证。
                         logger.warn("微信读书要求人工验证，标记账号并停止自动重试: vid=${account.vid}, mpId=$mpId")
                         WeReadAccountPool.markHumanVerificationRequired(account.vid)
+                        // 账号级风控与 E-Ink 共用：转交浏览器自动验证（Token 恢复后可清除）。
+                        WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 采集 -2041")
                         return WeReadPage(emptyList(), account.vid, PageOutcome.HUMAN_VERIFY)
                     }
                     PageKind.RETRYABLE_ERROR -> return WeReadPage(emptyList(), account.vid, PageOutcome.RETRYABLE_ERROR)

@@ -65,10 +65,14 @@ object CredentialHealthChecker {
         }
     }
 
-    /** Web 渠道：探测 ACTIVE 账号，并恢复持久化的 EXPIRED 账号。 */
+    /** Web 渠道：探测 ACTIVE 账号，并恢复持久化的 EXPIRED / 等待人工验证账号。 */
     suspend fun checkWebAccounts() {
         val accounts = WeReadAccountPool.list().filter {
-            it.status in setOf(AccountStatus.ACTIVE, AccountStatus.EXPIRED) && it.hasWebCredentials()
+            it.status in setOf(
+                AccountStatus.ACTIVE,
+                AccountStatus.EXPIRED,
+                AccountStatus.HUMAN_VERIFY_REQUIRED,
+            ) && it.hasWebCredentials()
         }
         if (accounts.isEmpty()) {
             logger.info("凭证检测: 无可探测或可恢复的微信读书 Web 账号")
@@ -77,6 +81,11 @@ object CredentialHealthChecker {
 
         val expired = mutableListOf<Pair<String, WeReadWebAuth.ReloginRequestResult>>()
         for (account in accounts) {
+            if (account.status == AccountStatus.HUMAN_VERIFY_REQUIRED) {
+                // 扫码无法解除 -2041；把等待验证的账号转交浏览器自动验证（内部有尝试冷却）。
+                WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 账号等待人工验证")
+                continue
+            }
             if (account.status == AccountStatus.EXPIRED) {
                 expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
                 continue
@@ -89,6 +98,10 @@ object CredentialHealthChecker {
                 WeReadWebResponseKind.SUCCESS -> {
                     WeReadAccountPool.markProbeSuccess(account.vid)
                     reportedExpiredAccounts.remove(account.vid)
+                }
+                WeReadWebResponseKind.HUMAN_VERIFY -> {
+                    WeReadAccountPool.markHumanVerificationRequired(account.vid)
+                    WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 探测 -2041")
                 }
                 else -> Unit  // 存活 / 频控 / 网络异常均不动作
             }

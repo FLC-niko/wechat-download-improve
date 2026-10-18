@@ -448,6 +448,18 @@ object WeReadAccountPool {
         }
     }
 
+    /** 账号级人工验证已通过（如浏览器自动解题）：恢复启用，等待下一次探测确认。 */
+    fun clearHumanVerificationRequired(vid: String): Boolean {
+        val cleared = mutateIf(vid) { account ->
+            if (account.status != AccountStatus.HUMAN_VERIFY_REQUIRED) return@mutateIf false
+            account.status = AccountStatus.ACTIVE
+            account.disabledReason = ""
+            true
+        }
+        if (cleared) logger.info("微信读书账号人工验证已通过，恢复启用: vid=$vid")
+        return cleared
+    }
+
     /** 手动启用 / 禁用 */
     fun setEnabled(vid: String, enabled: Boolean): Boolean {
         if (!enabled) probeSuccessAt.remove(vid)
