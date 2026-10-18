@@ -613,7 +613,15 @@ async function solveOnce(entryUrl, appid, retries) {
           if (process.env.DEBUG_SAVE === "1") {
             try {
               fs.mkdirSync(DEBUG_DIR, { recursive: true });
+              const stamp = new Date().toISOString().replace(/[:.]/g, "-");
               fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-pick.json`), JSON.stringify({ seq, points: pts, liveUrl: live.url || null }));
+              // 带时间戳留档，避免同名覆盖（线上 errorCode 可对照时间回归调参）。
+              fs.writeFileSync(path.join(DEBUG_DIR, `seq-${stamp}-r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
+              fs.writeFileSync(path.join(DEBUG_DIR, `seq-${stamp}-r${rounds}-sprite.png`), Buffer.from(sprite, "base64"));
+              fs.appendFileSync(
+                path.join(DEBUG_DIR, "seq-attempts.jsonl"),
+                JSON.stringify({ ts: new Date().toISOString(), rounds, min: seq.min_score, scores: seq.scores, points: pts }) + "\n",
+              );
             } catch {}
           }
           const bgR = await rectOf("(() => { const bg = document.getElementById('slideBg'); if (!bg) return 'null'; const r = bg.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
