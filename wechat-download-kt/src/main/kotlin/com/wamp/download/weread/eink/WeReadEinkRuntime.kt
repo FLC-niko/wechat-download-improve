@@ -795,6 +795,9 @@ object WeReadEinkRuntime {
             logger.info("Web 渠道 -2041：账号未配置 E-Ink 凭证，无法自动验证: vid={}, reason={}", vid, reason)
             return false
         }
+        // 标记为等待人工验证：解题完成后的探测成功会以 previousState=HUMAN_VERIFY_REQUIRED
+        // 触发 noteHumanVerifyRecovery，把 Web 账号池同步恢复为 ACTIVE。
+        account.authState = "HUMAN_VERIFY_REQUIRED"
         logger.warn("Web 渠道 -2041，转交浏览器自动验证: vid={}, reason={}", vid, reason)
         notifyHumanVerification(account, reason)
         return true

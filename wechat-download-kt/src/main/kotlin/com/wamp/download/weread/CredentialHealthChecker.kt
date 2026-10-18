@@ -82,8 +82,23 @@ object CredentialHealthChecker {
         val expired = mutableListOf<Pair<String, WeReadWebAuth.ReloginRequestResult>>()
         for (account in accounts) {
             if (account.status == AccountStatus.HUMAN_VERIFY_REQUIRED) {
-                // 扫码无法解除 -2041；把等待验证的账号转交浏览器自动验证（内部有尝试冷却）。
-                WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 账号等待人工验证")
+                // 等待人工验证：先做一次轻量探测；风控已解除则直接恢复，
+                // 仍返回 -2041 才转交浏览器自动验证（内部有尝试冷却）。
+                when (webClient.probeAccount(account)) {
+                    WeReadWebResponseKind.SUCCESS -> {
+                        WeReadAccountPool.clearHumanVerificationRequired(account.vid)
+                        WeReadAccountPool.markProbeSuccess(account.vid)
+                        reportedExpiredAccounts.remove(account.vid)
+                    }
+                    WeReadWebResponseKind.AUTH_EXPIRED -> {
+                        WeReadAccountPool.markAuthExpired(account.vid, "凭证检测:凭证失效(401/-2012)")
+                        expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
+                    }
+                    WeReadWebResponseKind.HUMAN_VERIFY -> {
+                        WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 账号等待人工验证")
+                    }
+                    else -> Unit
+                }
                 continue
             }
             if (account.status == AccountStatus.EXPIRED) {
