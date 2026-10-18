@@ -148,12 +148,29 @@ object WeReadWebAuth {
                     val credentials = pollLoginCredentials(pending.uid, timeoutSeconds = 60)
                     if (credentials == null) continue
                     if (credentials.wrVid != vid) {
-                        logger.warn("扫码账号与目标账号不一致，拒绝覆盖凭证: expected=$vid, actual=${credentials.wrVid}")
+                        // 账号池支持多账号：无 ADB 时人工扫码通常来自另一个微信账号
+                        // （如 909705585），按实际扫码账号入库即可恢复 Web 采集，不覆盖目标凭证。
+                        logger.warn("扫码账号与目标账号不一致，按实际账号入库: expected=$vid, actual=${credentials.wrVid}")
                         // 该二维码已被这次扫码消费：清掉 pending，下一轮直接生成新码而不是复用旧码。
                         pendingLogins.remove(vid, pending)
-                        mismatchReason =
-                            "扫码账号不匹配：需要 $vid，实际扫到 ${credentials.wrVid}；" +
-                                "请改用绑定了 $vid 的微信扫码，或打开刷新页重新获取二维码"
+                        if (saveLoginCredentials(credentials)) {
+                            reloginFailureCount.remove(credentials.wrVid)
+                            nextReloginAttemptAt.remove(credentials.wrVid)
+                            WebhookNotifier.notify(
+                                "weread_account_recovered",
+                                mapOf(
+                                    "message" to "微信读书 Web 扫码成功：已按实际扫码账号 ${credentials.wrVid} 入库；" +
+                                        "目标账号 $vid 保持原状态（手机 ADB 恢复后再处理）",
+                                    "vid" to credentials.wrVid,
+                                    "expected_vid" to vid,
+                                ),
+                            )
+                            // 目标账号的自动扫码按退避放慢，避免手机未开机期间反复推送二维码。
+                            recordReloginFailure(vid)
+                            success = true
+                        } else {
+                            mismatchReason = "扫码账号 ${credentials.wrVid} 凭证入库失败（目标 $vid）"
+                        }
                         break
                     }
                     if (saveLoginCredentials(credentials)) {
