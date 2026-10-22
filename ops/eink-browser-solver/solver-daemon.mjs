@@ -509,6 +509,7 @@ async function solveOnce(entryUrl, appid, retries) {
     let textSkips = 0;
     let lastHandledTs = 0;
     let lastImageTs = 0;
+    let lastClicked = [];
     let needFresh = true; // errorCode 50 = re-answer same question, no new challenge
 
     let cursor = { x: 640 + Math.random() * 40, y: 450 + Math.random() * 40 };
@@ -665,6 +666,7 @@ async function solveOnce(entryUrl, appid, retries) {
           }
           lastSubmittedInstr = instr;
           lastSubmittedUrl = live.url || null;
+          lastClicked = pts.map((p) => [Math.round(p.x), Math.round(p.y)]);
           seqSubmitted = true;
         } else {
           if (seqRounds > SEQ_MAX_ROUNDS) {
@@ -727,6 +729,7 @@ async function solveOnce(entryUrl, appid, retries) {
           continue;
         }
         log(`click set = ${JSON.stringify(ids)} (bgRect=${JSON.stringify(bgRect)})`);
+        lastClicked = ids.slice();
         for (const rid of ids) {
           const reg = CONST_GRID.find((r) => r.id === rid);
           if (!reg) continue;
@@ -773,6 +776,17 @@ async function solveOnce(entryUrl, appid, retries) {
         throw new Error("verify response timeout");
       }
       const code = String(resp.errorCode);
+      if (process.env.DEBUG_SAVE === "1") {
+        try {
+          fs.appendFileSync(
+            path.join(DEBUG_DIR, "verify-outcomes.jsonl"),
+            JSON.stringify({
+              ts: new Date().toISOString(), runStamp, round: rounds,
+              instr: lastSubmittedInstr, clicked: lastClicked, errorCode: code,
+            }) + "\n",
+          );
+        } catch {}
+      }
       if (code === "0") {
         const ticket = String(resp.ticket || "");
         const randstr = String(resp.randstr || "");
