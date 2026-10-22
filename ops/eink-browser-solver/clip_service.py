@@ -238,18 +238,15 @@ def _pick_by_siamese(image: Image.Image, regions: list, target: str, raw_instruc
             LOG.info("upscaled OCR failed: %s", str(exc)[:80])
 
     LOG.info("siamese pick target=%r details=%s ocr=%s -> %s", target, details, ocr_cross, best_id)
-    plural_hint = any(h in raw_instruction for h in ("所有", "全部", "哪些", "几个", "多种"))
     confidence = best_score if isinstance(best_score, float) else -1.0
     low_confidence = False
-    if confidence >= _SIAMESE_MIN_SCORE and best_id is not None:
+    # Observed rule for this captcha: click ALL tiles containing the target character
+    # (landscape glyphs). Verified samples: "丙" tiles read by OCR as 丙 were exactly the
+    # correct set; clicking a single tile or letting Siamese override the OCR set fails.
+    if hits:
+        selected, method = hits, "ocr-set"
+    elif confidence >= _SIAMESE_MIN_SCORE and best_id is not None:
         selected, method = [best_id], "siamese"
-    elif len(hits) == 1:
-        selected, method = hits, "ocr-single"
-    elif len(hits) > 1 and plural_hint:
-        selected, method = hits, "ocr-multi"
-    elif len(hits) > 1:
-        # Multiple OCR hits without a plurality hint is ambiguous: let the daemon refresh.
-        selected, method, low_confidence = [hits[0]], "ocr-multi-ambiguous", True
     elif best_id is not None and confidence > 0:
         selected, method, low_confidence = [best_id], "siamese-low", True
     else:
