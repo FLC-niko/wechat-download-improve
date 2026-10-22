@@ -1,6 +1,7 @@
 package com.wamp.download.task
 
 import com.rabbitmq.client.ConnectionFactory
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Test
 import java.io.File
 
@@ -11,6 +12,8 @@ import java.net.NetworkInterface
 import java.net.Socket
 import javax.net.SocketFactory
 
+// Manual integration test: requires QR fixtures in /tmp and a RabbitMQ broker.
+@Disabled("manual integration test; set BTA_RABBIT_* env vars and prepare /tmp fixtures to run")
 class PublishArticleBtaTaskTest {
 
     @Test
@@ -55,10 +58,10 @@ class PublishArticleBtaTaskTest {
         """.trimIndent()
 
         val factory = ConnectionFactory().apply {
-            host = "175.178.183.71"
+            host = System.getenv("BTA_RABBIT_HOST") ?: "127.0.0.1"
             port = 5672
-            username = "admin"
-            password = "Topview@123666rabbitmq"
+            username = System.getenv("BTA_RABBIT_USER") ?: "guest"
+            password = System.getenv("BTA_RABBIT_PASSWORD") ?: ""
             virtualHost = "xdag"
             isAutomaticRecoveryEnabled = false
             connectionTimeout = 10_000
@@ -164,10 +167,10 @@ class PublishArticleBtaTaskTest {
         """.trimIndent()
 
         val factory = ConnectionFactory().apply {
-            host = "175.178.183.71"
+            host = System.getenv("BTA_RABBIT_HOST") ?: "127.0.0.1"
             port = 5672
-            username = "admin"
-            password = "Topview@123666rabbitmq"
+            username = System.getenv("BTA_RABBIT_USER") ?: "guest"
+            password = System.getenv("BTA_RABBIT_PASSWORD") ?: ""
             virtualHost = "xdag"
             isAutomaticRecoveryEnabled = false
             connectionTimeout = 10_000
