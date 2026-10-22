@@ -58,6 +58,9 @@ internal data class WeReadEinkAutoRecoveryAttempt(
 internal fun isAutoSolverEligible(enabled: Boolean, allowlist: Set<String>, vid: String): Boolean =
     enabled && allowlist.isNotEmpty() && vid in allowlist
 
+/** 人工验证尝试冷却：同一次封禁期间最多每 20 分钟尝试一次自动解题。 */
+internal const val HUMAN_VERIFY_ATTEMPT_COOLDOWN_MS: Long = 20 * 60 * 1000L
+
 /** Resolve the current challenge only after the automatic attempt, which may have consumed it. */
 internal suspend fun sendEinkManualFallback(
     attempt: WeReadEinkAutoRecoveryAttempt?,
@@ -802,6 +805,21 @@ object WeReadEinkRuntime {
     }
 
     /**
+     * 定时恢复调度入口（不受后台任务闸门限制）。只挑选 HUMAN_VERIFY_REQUIRED 账号，
+     * 复用 notifyHumanVerification 的 in-flight 与尝试冷却保护。
+     */
+    fun recoverPendingHumanVerify() {
+        val pending = synchronized(runtimeLock) {
+            accounts.values.filter { it.authState == "HUMAN_VERIFY_REQUIRED" }
+        }
+        if (pending.isEmpty()) return
+        for (account in pending) {
+            logger.info("E-Ink 定时恢复尝试: vid={}", account.vid)
+            notifyHumanVerification(account, "定时恢复尝试")
+        }
+    }
+
+    /**
      * Web 采集侧 -2041：账号级风控与 E-Ink 共用，转交浏览器自动验证。
      * 扫码登录不能解除 -2041，只有官方人工验证可以；这里复用同一套解题流程。
      */
@@ -831,9 +849,10 @@ object WeReadEinkRuntime {
             return
         }
         val now = System.currentTimeMillis()
-        // 同一封禁期间限制尝试频率：Web 侧每 5 分钟的健康检查也会转交恢复请求，
-        // 没有冷却会把解题器打成连续轰炸（每次最多两轮 290s 解题）。
-        val attemptInterval = AppConfig.wereadEinkHumanVerifyProbeInterval * 1000L
+        // 同一封禁期间限制尝试频率：Web 侧每 5 分钟的健康检查、定时恢复调度都会转交
+        // 恢复请求，没有冷却会把解题器打成连续轰炸（每次最多两轮 290s 解题）。
+        // 20 分钟一次：文字题 burst 过去后能较快自愈，又不至于高频空转。
+        val attemptInterval = HUMAN_VERIFY_ATTEMPT_COOLDOWN_MS
         val lastAttempt = account.lastHumanVerifyAttemptAt.get()
         if (attemptInterval > 0L && lastAttempt > 0L && now - lastAttempt < attemptInterval) {
             account.autoRecoveryInFlight.set(false)

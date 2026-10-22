@@ -151,6 +151,19 @@ fun main() {
                 kotlinx.coroutines.delay(AppConfig.wereadEinkHealthCheckInterval * 1000L)
             }
         }
+        // 人工验证恢复不受“实时任务让路”闸门限制：后台探测可能被持续任务饿死，
+        // 导致账号卡在 HUMAN_VERIFY 数小时不尝试解题。内部仍遵守 in-flight 与尝试冷却。
+        scope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(60_000)
+            while (isActive) {
+                try {
+                    WeReadEinkRuntime.recoverPendingHumanVerify()
+                } catch (e: Exception) {
+                    logger.warn("E-Ink 人工验证恢复调度异常: ${e.message}")
+                }
+                kotlinx.coroutines.delay(5 * 60 * 1000L)
+            }
+        }
         scope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(10_000)
             while (isActive) {
