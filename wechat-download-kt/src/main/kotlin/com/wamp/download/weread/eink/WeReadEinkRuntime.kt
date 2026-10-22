@@ -78,6 +78,9 @@ internal fun performEinkAutoRecovery(
     maxProbeCycles: Int = 2,
     currentVerification: () -> WeReadEinkVerificationStatus = { verification },
     retryDelayMs: Long = 30_000L,
+    probe: () -> Boolean = { false },
+    probeRetries: Int = 0,
+    probeDelayMs: Long = 15_000L,
 ): WeReadEinkAutoRecoveryAttempt? {
     if (!enabled) return null
     if (!isAutoSolverEligible(true, allowlist, vid)) {
@@ -91,8 +94,21 @@ internal fun performEinkAutoRecovery(
     repeat(maxProbeCycles.coerceAtLeast(1)) { cycle ->
         val current = if (cycle == 0) verification else currentVerification()
         if (cycle > 0) {
-            // 给服务端状态传播留一点时间；IO 线程阻塞可接受。
-            Thread.sleep(retryDelayMs.coerceAtLeast(0L))
+            if (probeRetries > 0) {
+                // 票据已通过但恢复状态有传播延迟：先轮询探测，确认没恢复再换新票据重解，
+                // 避免"已恢复却再解一次"（二次解题通常只得到 captcha iframe not found）。
+                repeat(probeRetries) {
+                    Thread.sleep(probeDelayMs.coerceAtLeast(0L))
+                    if (probe()) {
+                        return WeReadEinkAutoRecoveryAttempt(
+                            WeReadEinkAutoRecoveryCode.RECOVERED, totalAttempts, totalDurationMs,
+                        )
+                    }
+                }
+            } else {
+                // 给服务端状态传播留一点时间；IO 线程阻塞可接受。
+                Thread.sleep(retryDelayMs.coerceAtLeast(0L))
+            }
         }
         val verifyUrl = current.verifyUrl
             ?: return WeReadEinkAutoRecoveryAttempt(
@@ -895,6 +911,9 @@ object WeReadEinkRuntime {
             solve = { entryUrl -> WeReadEinkCaptchaSolverClient.fromConfig().solve(entryUrl) },
             complete = WeReadEinkHumanVerification::complete,
             currentVerification = { WeReadEinkHumanVerification.createOrReuse(vid, AppConfig.siteUrl) },
+            probe = { probeAccount(vid) },
+            probeRetries = 3,
+            probeDelayMs = 15_000L,
         )
     }
 
