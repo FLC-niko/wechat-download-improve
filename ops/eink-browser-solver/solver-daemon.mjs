@@ -35,6 +35,9 @@ const RECYCLE_SOLVES = parseInt(process.env.SOLVER_RECYCLE_SOLVES || "30", 10);
 // 升级题型“依次点击：”：sprite 剪影序列匹配的最低接受分，以及单次解题内允许的 seq 轮数。
 const SEQ_MIN_SCORE = parseFloat(process.env.SOLVER_SEQ_MIN_SCORE || "0.62");
 const SEQ_MAX_ROUNDS = parseInt(process.env.SOLVER_SEQ_MAX_ROUNDS || "3", 10);
+// 实测近期 seq 题 sprite 会被噪声切碎（3 个图标识别成 5-6 个），高置信点击全错。
+// 默认关闭 seq 点击，只换题/快速失败；待匹配器在真实样本上验证后再打开。
+const SEQ_ENABLED = process.env.SOLVER_SEQ_ENABLED === "1";
 // “包含文字”题低置信时不点击、换一组；超过上限快速失败（误点会抬高风控）。
 const TEXT_MAX_SKIPS = parseInt(process.env.SOLVER_TEXT_MAX_SKIPS || "3", 10);
 const DEBUG_DIR = process.env.DEBUG_DIR || "/tmp/eink-debug";
@@ -638,7 +641,7 @@ async function solveOnce(entryUrl, appid, retries) {
             seq = await seqPick(pickImageB64, sprite);
           } catch (e) { log("seq-pick error:", String(e).slice(0, 120)); }
         }
-        const confident = seq && seq.ok && Array.isArray(seq.clicks) && seq.clicks.length > 0
+        const confident = SEQ_ENABLED && seq && seq.ok && Array.isArray(seq.clicks) && seq.clicks.length > 0
           && typeof seq.min_score === "number" && seq.min_score >= SEQ_MIN_SCORE;
         if (confident && seqRounds <= SEQ_MAX_ROUNDS) {
           const sx = 672 / (seq.img_w || 672);

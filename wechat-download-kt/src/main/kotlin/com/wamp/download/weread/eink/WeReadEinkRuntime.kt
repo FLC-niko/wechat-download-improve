@@ -14,6 +14,7 @@ import java.io.IOException
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -60,6 +61,8 @@ internal fun isAutoSolverEligible(enabled: Boolean, allowlist: Set<String>, vid:
 
 /** 人工验证尝试冷却：同一次封禁期间最多每 20 分钟尝试一次自动解题。 */
 internal const val HUMAN_VERIFY_ATTEMPT_COOLDOWN_MS: Long = 20 * 60 * 1000L
+/** 连续失败时的尝试冷却上限（指数退避：20→40→80→160→240 分钟）。 */
+internal const val HUMAN_VERIFY_ATTEMPT_COOLDOWN_MAX_MS: Long = 4 * 60 * 60 * 1000L
 
 /** Resolve the current challenge only after the automatic attempt, which may have consumed it. */
 internal suspend fun sendEinkManualFallback(
@@ -240,8 +243,11 @@ object WeReadEinkRuntime {
 
         val lastHumanVerifyNotificationAt = AtomicLong(0L)
 
-        /** 上次自动验证尝试时间：同一封禁期间最多每 human_verify_probe_interval 尝试一次。 */
+        /** 上次自动验证尝试时间：同一封禁期间按 20min 起指数退避。 */
         val lastHumanVerifyAttemptAt = AtomicLong(0L)
+
+        /** 连续自动验证失败次数：用于指数退避，恢复成功后清零。 */
+        val humanVerifyFailureCount = AtomicInteger(0)
 
         /** 连续被 -2041 的次数：探测退避按 1h→2h→4h→8h→12h 递增，成功后清零。 */
         @Volatile
@@ -352,6 +358,7 @@ object WeReadEinkRuntime {
         WeReadEinkRequestGate.markHumanVerifyRecovered(account.vid)
         // 新一轮封禁是新的验证事件：重置尝试冷却，确保下次 -2041 能立即再试。
         account.lastHumanVerifyAttemptAt.set(0L)
+        account.humanVerifyFailureCount.set(0)
         // 账号级 -2041 同时熔断了 Web 采集：验证通过后恢复账号池状态，等待下一次探测确认。
         WeReadAccountPool.clearHumanVerificationRequired(account.vid)
         logger.info("E-Ink 账号人工验证已恢复，进入 30 分钟温和请求期: vid=${account.vid}")
@@ -852,7 +859,10 @@ object WeReadEinkRuntime {
         // 同一封禁期间限制尝试频率：Web 侧每 5 分钟的健康检查、定时恢复调度都会转交
         // 恢复请求，没有冷却会把解题器打成连续轰炸（每次最多两轮 290s 解题）。
         // 20 分钟一次：文字题 burst 过去后能较快自愈，又不至于高频空转。
-        val attemptInterval = HUMAN_VERIFY_ATTEMPT_COOLDOWN_MS
+        val attemptInterval = minOf(
+            HUMAN_VERIFY_ATTEMPT_COOLDOWN_MS * (1L shl account.humanVerifyFailureCount.get().coerceAtMost(4)),
+            HUMAN_VERIFY_ATTEMPT_COOLDOWN_MAX_MS,
+        )
         val lastAttempt = account.lastHumanVerifyAttemptAt.get()
         if (attemptInterval > 0L && lastAttempt > 0L && now - lastAttempt < attemptInterval) {
             account.autoRecoveryInFlight.set(false)
@@ -901,6 +911,11 @@ object WeReadEinkRuntime {
                         "E-Ink 自动验证结束: vid=${account.vid}, code=${automaticAttempt.code}, " +
                             "attempts=${automaticAttempt.attempts ?: 0}, duration_ms=${automaticAttempt.durationMs}",
                     )
+                    if (automaticAttempt.code == WeReadEinkAutoRecoveryCode.RECOVERED) {
+                        account.humanVerifyFailureCount.set(0)
+                    } else {
+                        account.humanVerifyFailureCount.incrementAndGet()
+                    }
                 }
                 if (!notifyAfterAttempt) return@launch
                 // The automatic probe may consume the challenge and create a replacement. Always
