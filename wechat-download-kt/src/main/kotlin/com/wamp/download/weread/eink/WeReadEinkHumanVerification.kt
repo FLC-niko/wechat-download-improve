@@ -47,6 +47,8 @@ internal class WeReadEinkHumanVerificationCoordinator(
     private val clock: () -> Long = System::currentTimeMillis,
     private val nonceGenerator: () -> String = ::secureNonce,
     private val probe: (String) -> Boolean,
+    private val probeRetries: Int = 0,
+    private val probeRetryDelayMs: Long = 15_000L,
 ) {
     private class Challenge(
         val vid: String,
@@ -159,7 +161,22 @@ internal class WeReadEinkHumanVerificationCoordinator(
                 }
                 if (activeSession) {
                     try {
-                        probe(vid)
+                        // 票据通过后账号状态有传播延迟：第一次带票据探测，之后无票据重试。
+                        // 手动页面与自动解题保持一致，避免"做对了还让用户再做一题"。
+                        var ok = probe(vid)
+                        if (!ok) {
+                            synchronized(lock) { transientHeaders = emptyMap() }
+                            repeat(probeRetries.coerceAtLeast(0)) {
+                                if (!ok) {
+                                    try { Thread.sleep(probeRetryDelayMs.coerceAtLeast(0L)) } catch (_: InterruptedException) {
+                                        Thread.currentThread().interrupt()
+                                        return@synchronized false
+                                    }
+                                    ok = try { probe(vid) } catch (_: Exception) { false }
+                                }
+                            }
+                        }
+                        ok
                     } finally {
                         synchronized(lock) { transientHeaders = emptyMap() }
                     }
@@ -249,7 +266,10 @@ internal class WeReadEinkHumanVerificationCoordinator(
 }
 
 object WeReadEinkHumanVerification {
+    private val manualProbeRetries =
+        System.getProperty("eink.verify.probeRetries")?.toIntOrNull() ?: 2
     private val coordinator = WeReadEinkHumanVerificationCoordinator(
+        probeRetries = manualProbeRetries,
         probe = { vid ->
             WeReadEinkRequestGate.asVerificationProbe { WeReadEinkRuntime.probeAccount(vid) }
         },

@@ -66,6 +66,8 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // 手动验证的探测重试默认 2 次（生产）；测试里关闭，避免 30s 等待拖慢/超时。
+    systemProperty("eink.verify.probeRetries", "0")
 }
 
 tasks.register<Test>("einkAutoRecoverySmokeTest") {
