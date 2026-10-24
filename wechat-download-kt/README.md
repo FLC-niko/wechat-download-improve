@@ -210,10 +210,12 @@ curl -X POST http://127.0.0.1:8001/api/rabbitmq/dead-letter/reprocess \
 ```bash
 java -cp "build/install/wechat-download-kt/lib/*" \
   com.wamp.download.tools.DeadLetterReprocessMainKt --vhost pro --limit 20 --dry-run
+# 需要复用 E-Ink 凭证解析时加 --use-eink
 # 确认后把 --dry-run 换成 --apply；建议先核对 skipped/account-unresolved
 ```
 
 > 该接口未单独鉴权，依赖服务端口访问控制；生产建议只在内网/本机调用，并始终先 dry-run。
+> CLI 读取 `config.yaml` 的 `rabbitmq.host`，也可用 `RABBITMQ_HOST/PORT/USERNAME/PASSWORD` 覆盖。生产 MQ 不是本机回环地址；本机 `config.yaml` 的 `127.0.0.1` 只是本地样本，服务器上以实际 `config.yaml`/环境变量为准。
 
 ### 4. 发起登录
 

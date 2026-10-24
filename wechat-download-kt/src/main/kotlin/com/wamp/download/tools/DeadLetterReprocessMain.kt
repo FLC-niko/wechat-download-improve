@@ -8,12 +8,14 @@ import com.wamp.download.rabbitmq.RabbitMqClientManager
 import com.wamp.download.store.Database
 import com.wamp.download.weread.WeReadDirectoryResolver
 import com.wamp.download.weread.WeReadSubscriptionRegistrar
+import com.wamp.download.weread.eink.WeReadEinkRuntime
 import kotlinx.coroutines.runBlocking
 
 fun main(args: Array<String>) {
     var vhost = "pro"
     var limit = 10
     var dryRun = true
+    var useEink = false
     var index = 0
     while (index < args.size) {
         when (val arg = args[index]) {
@@ -25,8 +27,9 @@ fun main(args: Array<String>) {
             }
             "--apply" -> dryRun = false
             "--dry-run" -> dryRun = true
+            "--use-eink" -> useEink = true
             "--help", "-h" -> {
-                println("用法: DeadLetterReprocessMainKt [--vhost pro|test] [--limit N] [--dry-run|--apply]")
+                println("用法: DeadLetterReprocessMainKt [--vhost pro|test] [--limit N] [--dry-run|--apply] [--use-eink]")
                 return
             }
             else -> error("未知参数: $arg")
@@ -37,6 +40,7 @@ fun main(args: Array<String>) {
 
     AppConfig.load()
     Database.init()
+    if (useEink) WeReadEinkRuntime.initialize()
     val manager = RabbitMqClientManager()
     try {
         runBlocking {
