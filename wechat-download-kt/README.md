@@ -191,27 +191,29 @@ BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众
 - **错误语义**：`-2010`（用户不存在/无会话）按认证失效处理，不再误判为人工验证；`-2012` 过期、`-2014` 频控、`-2041` 人工验证语义保持不变。
 - **列表兜底**：E-Ink `/mp/chapters` 第一页为空但仍有更多时，会尝试 `article/list`、`mp/cover`，只补文章、不伪造覆盖；`reviewId`/`originalId` 中的 `~` 会还原为 `_`。
 - **`mobileSync` A/B**：`weread.eink.mobile_sync_activation.enabled` 默认关闭；开启后按 `vid_allowlist` 灰度。`/mp/chapters` 遇到 `-2041` 先尝试一次 `mobileSync` 激活，仍失败再走现有自动验证。统计在 `/api/weread/eink/status` 的 `runtime.mobile_sync_activation`。
-- **死信重处理**：`POST /api/rabbitmq/dead-letter/reprocess`，默认 `dry_run=true`、`limit=10`，只支持 `pro/test` vhost；先验证账号可解析，再决定是否重投 BTA。V2 死信优先用 `payload.account.entryUrl` 反查真实公众号，重投时会把错误的 `account.name` / `gzhName` 改写为解析出的真实昵称，避免同一任务再次死信。响应包含逐条 `accountName/resolvedAs/action/reason`，不返回消息正文。实际重投必须显式带 `"confirm": "APPLY"`。
+- **死信重处理**：`POST /api/rabbitmq/dead-letter/reprocess`，默认 `dry_run=true`、`limit=10`，只支持 `pro/test` vhost；先验证账号可解析，再决定是否重投 BTA。V2 死信优先用 `payload.account.entryUrl` 反查真实公众号；legacy/错名死信可用 `account_map` 显式映射（精确源名称，不做模糊匹配）。重投时会把错误的 `account.name` / `gzhName` 改写为解析出的真实昵称，避免同一任务再次死信。响应包含逐条 `accountName/messageType/resolutionSource/resolvedAs/action/reason`，不返回消息正文。实际重投必须显式带 `"confirm": "APPLY"`。
+- **映射安全**：`account_map` 仅本次调用生效，最多 100 条；源名称必须精确匹配，重复/空白/控制字符直接 400。映射目标可以是本地订阅昵称或文章 URL；本地昵称会优先查 SQLite，不依赖微信读书在线状态。映射目标无法解析时消息原样留在 DLQ，不会回退到模糊匹配或 `entryUrl`。实际重投会写入 `x-dlq-mapped-from`、`x-dlq-mapped-to`、`x-dlq-resolution-source` 审计头。
 
 ```bash
-# 1) 先 dry-run
+# 1) 先 dry-run（account_map 可选；legacy 错名死信建议显式映射）
 curl -X POST http://127.0.0.1:8001/api/rabbitmq/dead-letter/reprocess \
   -H 'Content-Type: application/json' \
-  -d '{"vhost":"pro","limit":20,"dry_run":true}'
+  -d '{"vhost":"pro","limit":20,"dry_run":true,"account_map":{"海珠检查":"广州海珠发布"}}'
 
-# 2) 核对 resolvedAs/skipped 后实际重投
+# 2) 核对 resolutionSource=override / resolvedAs 后实际重投
 curl -X POST http://127.0.0.1:8001/api/rabbitmq/dead-letter/reprocess \
   -H 'Content-Type: application/json' \
-  -d '{"vhost":"pro","limit":20,"dry_run":false,"confirm":"APPLY"}'
+  -d '{"vhost":"pro","limit":20,"dry_run":false,"confirm":"APPLY","account_map":{"海珠检查":"广州海珠发布"}}'
 ```
 
 也可用独立 CLI：
 
 ```bash
 java -cp "build/install/wechat-download-kt/lib/*" \
-  com.wamp.download.tools.DeadLetterReprocessMainKt --vhost pro --limit 20 --dry-run
+  com.wamp.download.tools.DeadLetterReprocessMainKt --vhost pro --limit 20 --dry-run \
+  --map '海珠检查=广州海珠发布'
 # 需要复用 E-Ink 凭证解析时加 --use-eink
-# 确认后把 --dry-run 换成 --apply；建议先核对 skipped/account-unresolved
+# 确认后把 --dry-run 换成 --apply；建议先核对 resolutionSource/resolvedAs
 ```
 
 > 该接口未单独鉴权，依赖服务端口访问控制；生产建议只在内网/本机调用，并始终先 dry-run。

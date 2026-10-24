@@ -166,13 +166,14 @@ class RabbitMqService(
         limit: Int,
         dryRun: Boolean,
         registrar: WeReadSubscriptionRegistrar,
+        overrides: DeadLetterAccountOverrides = DeadLetterAccountOverrides.EMPTY,
     ): DeadLetterReprocessResult {
         val manager = when (vhost) {
             "pro" -> proManager
             "test" -> testManager
             else -> throw IllegalArgumentException("仅支持 pro/test vhost，实际: $vhost")
         }
-        return manager.reprocessDeadLetters(limit, dryRun, vhost) { name ->
+        return manager.reprocessDeadLetters(limit, dryRun, vhost, overrides) { name ->
             if (dryRun) {
                 registrar.resolveOnly(name)?.nickname
             } else {

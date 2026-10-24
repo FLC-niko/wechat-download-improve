@@ -24,6 +24,27 @@ class WeReadSubscriptionRegistrarTest {
     }
 
     @Test
+    fun `local subscription resolves without network when target nickname exists`() {
+        withTemporaryDatabase {
+            SubscriptionStore.add(
+                fakeid = "ZmFrZS1iaXo=",
+                nickname = "广州海珠发布",
+                alias = "海珠发布",
+                headImg = "cover",
+            )
+            SubscriptionStore.saveWereadMpId("ZmFrZS1iaXo=", "MP_WXS_3295180586")
+            val registrar = WeReadSubscriptionRegistrar(null)
+
+            val account = registrar.resolveOnly("广州海珠发布")
+
+            assertNotNull(account)
+            assertEquals("ZmFrZS1iaXo=", account.fakeid)
+            assertEquals("MP_WXS_3295180586", account.bookId)
+            assertEquals("广州海珠发布", account.nickname)
+        }
+    }
+
+    @Test
     fun `resolveAndSave persists fakeid mpId and profile`() {
         withTemporaryDatabase {
             val registrar = registrar()

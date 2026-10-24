@@ -4,6 +4,8 @@ import com.google.gson.JsonParser
 
 data class DeadLetterReprocessItem(
     val accountName: String,
+    val messageType: String,
+    val resolutionSource: String,
     val resolvedAs: String? = null,
     val action: String,
     val reason: String? = null,
@@ -19,8 +21,38 @@ data class DeadLetterReprocessResult(
     val items: List<DeadLetterReprocessItem>,
 )
 
+class DeadLetterAccountOverrides private constructor(
+    private val byName: Map<String, String>,
+) {
+    fun targetFor(accountName: String): String? = byName[accountName.trim()]
+
+    companion object {
+        val EMPTY = DeadLetterAccountOverrides(emptyMap())
+
+        fun parse(pairs: Iterable<Pair<String, String>>): DeadLetterAccountOverrides {
+            val map = LinkedHashMap<String, String>()
+            pairs.forEach { (rawKey, rawValue) ->
+                val key = rawKey.trim()
+                val value = rawValue.trim()
+                require(key.isNotEmpty()) { "account_map 的源名称不能为空" }
+                require(value.isNotEmpty()) { "account_map 的目标不能为空: $key" }
+                require(key.none { it.isISOControl() } && value.none { it.isISOControl() }) {
+                    "account_map 不能包含控制字符"
+                }
+                require(map.put(key, value) == null) { "account_map 存在重复源名称: $key" }
+            }
+            require(map.size <= 100) { "account_map 最多 100 条" }
+            return DeadLetterAccountOverrides(map)
+        }
+
+        fun fromMap(map: Map<String, String>): DeadLetterAccountOverrides =
+            parse(map.entries.map { it.key to it.value })
+    }
+}
+
 internal data class DeadLetterTaskHint(
     val accountName: String,
+    val messageType: String,
     val resolveKey: String,
 )
 
@@ -33,11 +65,13 @@ internal object DeadLetterTaskInspector {
             }
             DeadLetterTaskHint(
                 accountName = account.name,
+                messageType = "v2",
                 resolveKey = entryUrl ?: account.name,
             )
         }
         is RabbitTaskMessage.Legacy -> DeadLetterTaskHint(
             accountName = message.task.gzhName,
+            messageType = "legacy",
             resolveKey = message.task.gzhName,
         )
     }

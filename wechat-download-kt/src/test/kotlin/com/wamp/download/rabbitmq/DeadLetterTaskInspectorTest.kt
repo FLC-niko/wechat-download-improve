@@ -19,6 +19,7 @@ class DeadLetterTaskInspectorTest {
 
         val hint = DeadLetterTaskInspector.hint(body)
         assertEquals("广州海珠发布", hint?.accountName)
+        assertEquals("v2", hint?.messageType)
         assertEquals("广州海珠发布", hint?.resolveKey)
     }
 
@@ -38,6 +39,7 @@ class DeadLetterTaskInspectorTest {
 
         val hint = DeadLetterTaskInspector.hint(body)
         assertEquals("海珠检查", hint?.accountName)
+        assertEquals("v2", hint?.messageType)
         assertEquals("https://mp.weixin.qq.com/s/real-article", hint?.resolveKey)
     }
 
@@ -51,6 +53,7 @@ class DeadLetterTaskInspectorTest {
 
         val hint = DeadLetterTaskInspector.hint(body)
         assertEquals("海珠检查", hint?.accountName)
+        assertEquals("legacy", hint?.messageType)
         assertEquals("海珠检查", hint?.resolveKey)
     }
 }

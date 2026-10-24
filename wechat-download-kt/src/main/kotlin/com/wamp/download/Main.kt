@@ -10,6 +10,7 @@ import com.wamp.download.config.AppConfig
 import com.wamp.download.feed.feedRoutes
 import com.wamp.download.notify.LoginReminder
 import com.wamp.download.poller.RssPoller
+import com.wamp.download.rabbitmq.DeadLetterAccountOverrides
 import com.wamp.download.rabbitmq.RabbitMqService
 import com.wamp.download.rabbitmq.RabbitTaskMessage
 import com.wamp.download.store.Database
@@ -291,11 +292,42 @@ fun main() {
                     )
                     return@post
                 }
+                val rawAccountMap = body["account_map"]
+                val accountMapPairs = mutableListOf<Pair<String, String>>()
+                if (rawAccountMap != null) {
+                    if (rawAccountMap !is Map<*, *>) {
+                        call.respond(
+                            io.ktor.http.HttpStatusCode.BadRequest,
+                            mapOf("error" to "account_map 必须是对象"),
+                        )
+                        return@post
+                    }
+                    for ((rawKey, rawValue) in rawAccountMap) {
+                        if (rawKey !is String || rawValue !is String) {
+                            call.respond(
+                                io.ktor.http.HttpStatusCode.BadRequest,
+                                mapOf("error" to "account_map 的 key/value 必须是字符串"),
+                            )
+                            return@post
+                        }
+                        accountMapPairs += rawKey to rawValue
+                    }
+                }
+                val overrides = try {
+                    DeadLetterAccountOverrides.parse(accountMapPairs)
+                } catch (e: IllegalArgumentException) {
+                    call.respond(
+                        io.ktor.http.HttpStatusCode.BadRequest,
+                        mapOf("error" to (e.message ?: "account_map 非法")),
+                    )
+                    return@post
+                }
                 val result = rabbitMqService.reprocessDeadLetters(
                     vhost = vhost,
                     limit = limit,
                     dryRun = dryRun,
                     registrar = com.wamp.download.weread.WeReadSubscriptionRegistrar(WeReadDirectoryResolver()),
+                    overrides = overrides,
                 )
                 call.respond(result)
             }

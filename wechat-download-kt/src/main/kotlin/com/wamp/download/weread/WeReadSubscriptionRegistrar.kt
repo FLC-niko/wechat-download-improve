@@ -12,9 +12,24 @@ class WeReadSubscriptionRegistrar(
     private val logger = LoggerFactory.getLogger(WeReadSubscriptionRegistrar::class.java)
 
     suspend fun resolveOnly(keyword: String): WeReadDirectoryAccount? {
+        val trimmed = keyword.trim()
+        if (trimmed.isEmpty()) return null
+        val local = SubscriptionStore.findByNickname(trimmed)
+        if (local != null) {
+            val bookId = local.wereadMpId.ifBlank {
+                WeReadDirectoryClient.mpIdFromFakeid(local.fakeid).orEmpty()
+            }
+            return WeReadDirectoryAccount(
+                fakeid = local.fakeid,
+                bookId = bookId,
+                nickname = local.nickname,
+                alias = local.alias,
+                headImg = local.headImg,
+            )
+        }
         val resolver = resolver ?: return null
         return try {
-            withContext(Dispatchers.IO) { resolver.resolve(keyword) }
+            withContext(Dispatchers.IO) { resolver.resolve(trimmed) }
         } catch (e: Exception) {
             logger.warn("【账号解析】微信读书解析异常: gzh=$keyword, error=${e.message}")
             null

@@ -23,7 +23,7 @@ class DeadLetterReprocessIntegrationTest {
             virtualHost = "/"
         }
         val body = """
-            {"queueName":"gzh-auto-BTA-queue","image":"","gzhName":"广州海珠发布",
+            {"queueName":"gzh-auto-BTA-queue","image":"","gzhName":"海珠检查",
              "tempTimeStamp":["2024-06-01","2025-07-01"],"url":null,
              "jobId":9003,"correlationId":"dlq-integration-9003"}
         """.trimIndent().toByteArray()
@@ -47,10 +47,22 @@ class DeadLetterReprocessIntegrationTest {
                     virtualHost = "/",
                 )
                 manager.publish("dead-message-queue", body)
-                val result = manager.reprocessDeadLetters(limit = 1, dryRun = false, vhost = "pro") { "广州海珠发布" }
+                var resolvedKey: String? = null
+                val result = manager.reprocessDeadLetters(
+                    limit = 1,
+                    dryRun = false,
+                    vhost = "pro",
+                    overrides = DeadLetterAccountOverrides.fromMap(mapOf("海珠检查" to "广州海珠发布")),
+                ) {
+                    resolvedKey = it
+                    "广州海珠发布"
+                }
+                assertEquals("广州海珠发布", resolvedKey)
                 assertEquals(1, result.scanned)
                 assertEquals(1, result.requeued)
                 assertEquals(0, result.failed)
+                assertEquals("override", result.items.single().resolutionSource)
+                assertEquals("legacy", result.items.single().messageType)
             }
 
             factory.newConnection("dlq-integration-verify").use { verifyConnection ->
