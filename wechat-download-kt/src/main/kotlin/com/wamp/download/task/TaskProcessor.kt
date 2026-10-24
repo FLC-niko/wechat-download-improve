@@ -20,6 +20,8 @@ import com.wamp.download.store.ArticleCoverageStore
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
+import com.wamp.download.weread.WeReadSubscriptionRegistrar
+import com.wamp.download.weread.WeReadSubscriptionResolver
 import com.wamp.download.weread.WeReadWebClient
 import com.wamp.download.weread.eink.WeReadEinkSyncService
 import com.wamp.download.weread.eink.WeReadEinkRuntime
@@ -51,6 +53,7 @@ class TaskProcessor(
     private val einkRequestAllowed: () -> Boolean = WeReadEinkRuntime::canAttemptTaskSync,
     private val einkRequestSucceeded: (WeReadEinkSyncService) -> Unit = WeReadEinkRuntime::recordTaskRequestSuccess,
     private val einkRequestFailed: (WeReadEinkSyncService, Throwable) -> Unit = WeReadEinkRuntime::recordTaskRequestFailure,
+    private val subscriptionResolver: WeReadSubscriptionResolver? = null,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(TaskProcessor::class.java)
@@ -113,6 +116,9 @@ class TaskProcessor(
 
         // 本地订阅是所有回退通道共享的身份，不应因主微信登录失效而被挡住。
         var subscription = SubscriptionStore.findByNickname(task.gzhName)
+        if (subscription == null) {
+            subscription = resolveSubscriptionFromWeRead(task.gzhName)
+        }
         if (subscription == null) {
             if (!ensureMainLoginForLookup(task)) return
             subscription = try {
@@ -244,6 +250,9 @@ class TaskProcessor(
         publishTerminal(task, urls)
         logger.info("【任务处理】完成: gzh=${task.gzhName}, 匹配 ${filtered.size}/${articles.size} 篇, 发布 ${urls.size} 条结果")
     }
+
+    private suspend fun resolveSubscriptionFromWeRead(keyword: String): Subscription? =
+        WeReadSubscriptionRegistrar(subscriptionResolver).resolveAndSave(keyword)
 
     private suspend fun ensureMainLoginForLookup(task: ProcessingTask): Boolean {
         if (!ChannelStateManager.isMainChannelAvailable()) {
@@ -389,7 +398,24 @@ class TaskProcessor(
                 "【E-Ink】同步失败，转 Web 回退: fakeid=${subscription.fakeid.take(8)}..., ${error.message}",
                 error,
             )
-            null
+            val (partial, _) = runCatching {
+                ArticleStore.getByFakeidAndRange(
+                    subscription.fakeid,
+                    startTime = startTs,
+                    endTime = endTs,
+                    limit = 5_000,
+                )
+            }.getOrDefault(emptyList<Article>() to 0)
+            if (partial.isEmpty()) {
+                null
+            } else {
+                SourceFetchResult(
+                    source = "eink",
+                    articles = partial.map { it.toWxArticle() },
+                    coverageComplete = false,
+                    detail = "sync-failed-partial-cache",
+                )
+            }
         }
     }
 

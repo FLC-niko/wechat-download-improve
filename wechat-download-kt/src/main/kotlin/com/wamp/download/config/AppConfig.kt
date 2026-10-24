@@ -115,6 +115,12 @@ object AppConfig {
     val wereadEinkReloginRetryBackoff: Long
         get() = getLong("weread.eink.relogin_retry_backoff", 300L).coerceAtLeast(30L)
 
+    /** -2041 时先尝试一次移动端会话激活；默认关闭，按账号白名单灰度。 */
+    val wereadEinkMobileSyncActivationEnabled: Boolean
+        get() = getBool("weread.eink.mobile_sync_activation.enabled", false)
+    val wereadEinkMobileSyncActivationVidAllowlist: Set<String>
+        get() = getStringList("weread.eink.mobile_sync_activation.vid_allowlist").toSet()
+
     /**
      * 人工验证页加载的验证码脚本与 appid：默认腾讯官方。
      * 联调时可指向本地 sidecar（如 http://127.0.0.1:8765/TCaptcha.js），不改变生产默认行为。

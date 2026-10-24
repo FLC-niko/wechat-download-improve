@@ -15,6 +15,14 @@ class WeReadWebResponseClassifierTest {
     }
 
     @Test
+    fun `用户不存在错误码按认证失效处理而不是人工验证`() {
+        val result = WeReadWebResponseClassifier.classify(200, "{\"errCode\": -2010, \"errMsg\": \"用户不存在\"}")
+
+        assertEquals(WeReadWebResponseKind.AUTH_EXPIRED, result.kind)
+        assertEquals(-2010, result.errCode)
+    }
+
+    @Test
     fun `区分人工验证和 HTTP 频控`() {
         val humanVerify = WeReadWebResponseClassifier.classify(200, "{\"errCode\":-2041}")
         val rateLimited = WeReadWebResponseClassifier.classify(429, "{\"message\":\"too many requests\"}")

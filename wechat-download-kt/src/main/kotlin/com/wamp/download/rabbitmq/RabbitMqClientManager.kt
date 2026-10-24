@@ -240,6 +240,106 @@ class RabbitMqClientManager(
         }
     }
 
+    suspend fun reprocessDeadLetters(
+        limit: Int,
+        dryRun: Boolean,
+        vhost: String,
+        resolve: suspend (String) -> String?,
+    ): DeadLetterReprocessResult = withContext(Dispatchers.IO) {
+        val batchLimit = limit.coerceIn(1, 1_000)
+        getValidChannel()
+        val connection = this@RabbitMqClientManager.connection
+            ?: throw IOException("RabbitMQ 未连接，无法处理死信队列")
+        val ch = connection.createChannel()
+        val items = mutableListOf<DeadLetterReprocessItem>()
+        val unacked = mutableListOf<Long>()
+        val resolutionCache = mutableMapOf<String, String?>()
+        var scanned = 0
+        var requeued = 0
+        var skipped = 0
+        var failed = 0
+        try {
+            ch.confirmSelect()
+            while (scanned < batchLimit) {
+                val response = ch.basicGet(GZH_DEAD_QUEUE, false) ?: break
+                scanned++
+                val deliveryTag = response.envelope.deliveryTag
+                val hint = runCatching {
+                    DeadLetterTaskInspector.hint(response.body)
+                }.getOrNull()
+                if (hint == null || hint.accountName.isBlank()) {
+                    skipped++
+                    unacked += deliveryTag
+                    items += DeadLetterReprocessItem("", "skipped", "undecodable")
+                    continue
+                }
+                val resolvedAs = if (resolutionCache.containsKey(hint.resolveKey)) {
+                    resolutionCache[hint.resolveKey]
+                } else {
+                    runCatching { resolve(hint.resolveKey) }.getOrNull().also {
+                        resolutionCache[hint.resolveKey] = it
+                    }
+                }
+                if (resolvedAs.isNullOrBlank()) {
+                    skipped++
+                    unacked += deliveryTag
+                    items += DeadLetterReprocessItem(hint.accountName, null, "skipped", "account-unresolved")
+                    continue
+                }
+                if (dryRun) {
+                    skipped++
+                    unacked += deliveryTag
+                    items += DeadLetterReprocessItem(hint.accountName, resolvedAs, "would-requeue", "dry-run")
+                    continue
+                }
+
+                val headers = (response.props.headers ?: emptyMap<String, Any>()).toMutableMap()
+                headers.remove("x-original-queue")
+                headers.remove("x-error-message")
+                headers.remove("x-last-error")
+                headers["x-retry-count"] = 0
+                headers["x-dlq-reprocessed"] = true
+                headers["x-dlq-reprocessed-at"] = System.currentTimeMillis()
+                headers["x-dlq-source-queue"] = GZH_DEAD_QUEUE
+                headers["x-dlq-original-account"] = hint.accountName
+                headers["x-dlq-resolved-account"] = resolvedAs
+                val properties = response.props.builder().headers(headers).build()
+                val exchange = if (isXdagVhost) XDAG_EXCHANGE_V2 else EXCHANGE_NEW_MEDIA
+                val routingKey = if (isXdagVhost) XDAG_TASK_QUEUE else GZH_TASK_ROUTING
+                val rewrittenBody = DeadLetterTaskRewriter.rewriteAccountName(response.body, resolvedAs)
+                try {
+                    publishAndConfirm(ch, exchange, routingKey, properties, rewrittenBody)
+                    ch.basicAck(deliveryTag, false)
+                    requeued++
+                    items += DeadLetterReprocessItem(hint.accountName, resolvedAs, "requeued")
+                } catch (e: Exception) {
+                    failed++
+                    unacked += deliveryTag
+                    items += DeadLetterReprocessItem(
+                        hint.accountName,
+                        resolvedAs,
+                        "failed",
+                        e.message ?: e.javaClass.simpleName,
+                    )
+                }
+            }
+            unacked.forEach { tag ->
+                runCatching { ch.basicNack(tag, false, true) }
+            }
+            DeadLetterReprocessResult(
+                vhost = vhost,
+                dryRun = dryRun,
+                scanned = scanned,
+                requeued = requeued,
+                skipped = skipped,
+                failed = failed,
+                items = items,
+            )
+        } finally {
+            runCatching { ch.close() }
+        }
+    }
+
     private fun publishAndConfirm(
         ch: Channel,
         exchange: String,

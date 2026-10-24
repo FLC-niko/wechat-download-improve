@@ -268,6 +268,11 @@ object WeReadEinkRuntime {
     /** 兼容访问：主账号 session（健康检查等旧调用点使用）。 */
     fun session(): WeReadEinkSession? = synchronized(runtimeLock) { primaryAccount()?.session }
 
+    /** 只读选号：供账号解析等低频目录请求使用，不推进任务调度游标。 */
+    fun directorySession(): WeReadEinkSession? = synchronized(runtimeLock) {
+        pickLeastUsedAccount(::taskSyncSuppressed)?.session
+    }
+
     fun canAttemptTaskSync(): Boolean = synchronized(runtimeLock) {
         accounts.values.any { !taskSyncSuppressed(it.authState) }
     }
@@ -1108,6 +1113,11 @@ object WeReadEinkRuntime {
             "last_scheduled_sync_at" to primary?.lastScheduledSyncAt?.takeIf { it > 0L },
             "last_scheduled_sync_result" to (primary?.lastScheduledSyncResult ?: "NEVER"),
             "last_scheduled_sync_target" to primary?.lastScheduledSyncTarget,
+            "mobile_sync_activation" to mapOf(
+                "enabled" to AppConfig.wereadEinkMobileSyncActivationEnabled,
+                "vid_allowlist" to AppConfig.wereadEinkMobileSyncActivationVidAllowlist.sorted(),
+                "stats" to WeReadEinkTerminalActivationStats.snapshot(),
+            ),
         )
     }
 

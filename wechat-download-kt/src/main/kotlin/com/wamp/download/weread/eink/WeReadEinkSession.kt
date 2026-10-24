@@ -32,10 +32,10 @@ data class WeReadEinkRefreshStatus(
  */
 class WeReadEinkSession(
     initialCredentials: WeReadEinkCredentials,
-    transport: WeReadEinkTransport = OkHttpWeReadEinkTransport(),
+    private val transport: WeReadEinkTransport = OkHttpWeReadEinkTransport(),
     private val credentialStore: WeReadEinkCredentialSink? = null,
     baseUrl: String = DEFAULT_BASE_URL,
-    profile: WeReadEinkProfile = DefaultWeReadEinkProfile,
+    private val profile: WeReadEinkProfile = DefaultWeReadEinkProfile,
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val isCurrentSession: () -> Boolean = { true },
     private val persistenceLock: Any? = null,
@@ -95,6 +95,13 @@ class WeReadEinkSession(
     }
 
     fun credentials(): WeReadEinkCredentials = currentCredentials
+
+    fun directoryClient(baseUrl: String = DEFAULT_BASE_URL): com.wamp.download.weread.WeReadDirectoryClient =
+        com.wamp.download.weread.WeReadDirectoryClient(
+            baseUrl = baseUrl,
+            auth = EinkDirectoryAuth(this, profile),
+            transport = transport,
+        )
 
     fun hasPendingPersistence(): Boolean = credentialsPendingPersistence != null
 

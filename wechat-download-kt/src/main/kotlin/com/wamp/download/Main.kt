@@ -18,6 +18,7 @@ import com.wamp.download.task.IdleHistoryPoller
 import com.wamp.download.task.RealtimeTaskActivity
 import com.wamp.download.wx.WxApiClient
 import com.wamp.download.weread.CredentialHealthChecker
+import com.wamp.download.weread.WeReadDirectoryResolver
 import com.wamp.download.weread.eink.WeReadEinkRuntime
 import com.wamp.download.weread.eink.WeReadEinkLoginCoordinator
 import com.wamp.download.weread.eink.weReadEinkVerificationRoutes
@@ -82,6 +83,7 @@ fun main() {
         wxClient = wxClient,
         loginChecker = loginChecker,
         einkSyncServiceProvider = WeReadEinkRuntime::syncService,
+        subscriptionResolver = WeReadDirectoryResolver(),
     )
 
     // 启动闲时历史回源轮询器
@@ -267,6 +269,35 @@ fun main() {
                         "vhosts" to states.mapValues { it.value.name }
                     )
                 ))
+            }
+
+            post("/api/rabbitmq/dead-letter/reprocess") {
+                val body = runCatching { call.receive<Map<String, Any?>>() }.getOrDefault(emptyMap())
+                val vhost = (body["vhost"] as? String) ?: "pro"
+                if (vhost !in setOf("pro", "test")) {
+                    call.respond(
+                        io.ktor.http.HttpStatusCode.BadRequest,
+                        mapOf("error" to "仅支持 pro/test vhost"),
+                    )
+                    return@post
+                }
+                val limit = (body["limit"] as? Number)?.toInt() ?: 10
+                val dryRun = (body["dry_run"] as? Boolean) ?: true
+                val confirm = (body["confirm"] as? String) ?: ""
+                if (!dryRun && confirm != "APPLY") {
+                    call.respond(
+                        io.ktor.http.HttpStatusCode.BadRequest,
+                        mapOf("error" to "实际重投需要 confirm=APPLY；请先 dry_run=true 核对 resolvedAs"),
+                    )
+                    return@post
+                }
+                val result = rabbitMqService.reprocessDeadLetters(
+                    vhost = vhost,
+                    limit = limit,
+                    dryRun = dryRun,
+                    registrar = com.wamp.download.weread.WeReadSubscriptionRegistrar(WeReadDirectoryResolver()),
+                )
+                call.respond(result)
             }
 
             // 微信登录状态查询
