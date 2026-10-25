@@ -187,6 +187,8 @@ object AppConfig {
     // ADB 自动恢复设备探查
     val adbPollIntervalMs: Long
         get() = getLong("adb.poll_interval_ms", 15_000L).coerceAtLeast(1_000L)
+    val adbCommandTimeoutMs: Long
+        get() = getLong("adb.command_timeout_ms", 8_000L).coerceAtLeast(1_000L)
     val adbEnabled: Boolean get() = getBool("adb.enabled", false)
     val adbRecoveryMaxDelayMs: Long
         get() = getLong("adb.recovery_max_delay_ms", 15 * 60_000L).coerceAtLeast(adbPollIntervalMs)

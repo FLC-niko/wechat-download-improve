@@ -17,6 +17,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import org.slf4j.LoggerFactory
@@ -97,8 +98,16 @@ class DeviceRecoveryManager(
     internal suspend fun recover(vid: String): String? {
         val account = WeReadAccountPool.get(vid) ?: return null
         if (account.status == AccountStatus.HUMAN_VERIFY_REQUIRED) return null
+        if (!supervisor.hasCompletedRefresh()) {
+            withTimeoutOrNull(35_000L) {
+                while (!supervisor.hasCompletedRefresh()) delay(250L)
+            }
+        }
         val slot = chooseSlot(account)
         if (slot == null) {
+            if (!supervisor.hasCompletedRefresh()) {
+                return "ADB 设备发现中"
+            }
             if ((attempts[vid]?.attempts ?: 0) == 0) notifyManual(account)
             return "没有可用的 ADB 设备槽位"
         }

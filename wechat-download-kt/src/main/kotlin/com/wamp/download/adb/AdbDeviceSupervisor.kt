@@ -10,6 +10,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -28,6 +29,8 @@ class AdbDeviceSupervisor(
     private val deviceLocks = ConcurrentHashMap<String, Mutex>()
     @Volatile
     private var recoveryMode: RecoveryMode = RecoveryMode.MANUAL_ONLY
+    @Volatile
+    private var lastRefreshAt: Long = 0L
     private var watcherJob: Job? = null
 
     /** 获取物理设备级别的独占互斥锁，彻底避免同机主身/分身或 Web/Eink 自动代扫并发冲突 */
@@ -70,6 +73,7 @@ class AdbDeviceSupervisor(
             logger.warn("检测到 ADB 设备断开: $serial")
         }
 
+        lastRefreshAt = System.currentTimeMillis()
         val nextMode = if (discovered.isNotEmpty()) {
             RecoveryMode.AUTO_RECOVERABLE
         } else {
@@ -90,6 +94,8 @@ class AdbDeviceSupervisor(
     fun isOnline(serial: String): Boolean = devices[serial] != null
 
     fun hasOnlineDevice(): Boolean = devices.isNotEmpty()
+
+    fun hasCompletedRefresh(): Boolean = lastRefreshAt > 0L
 
     /** 返回在线设备的 User 0 / XSpace 槽位，包含真实硬件序列号映射及版本特征。 */
     fun availableSlots(): List<DeviceSlot> = devices.values.flatMap { device ->
@@ -256,14 +262,39 @@ fun interface AdbCommandRunner {
     fun run(arguments: List<String>): AdbCommandResult
 }
 
-class ProcessAdbCommandRunner : AdbCommandRunner {
+class ProcessAdbCommandRunner(
+    private val timeoutMs: Long = AppConfig.adbCommandTimeoutMs,
+) : AdbCommandRunner {
     override fun run(arguments: List<String>): AdbCommandResult {
         val process = ProcessBuilder(listOf("adb") + arguments)
-            .redirectErrorStream(false)
+            .redirectErrorStream(true)
             .start()
-        val stdout = process.inputStream.bufferedReader().use { it.readText() }
-        val stderr = process.errorStream.bufferedReader().use { it.readText() }
-        val exitCode = process.waitFor()
-        return AdbCommandResult(exitCode, stdout, stderr)
+        val output = StringBuilder()
+        val reader = Thread {
+            runCatching {
+                process.inputStream.bufferedReader().use { output.append(it.readText()) }
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+        return try {
+            if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly()
+                process.waitFor(2, TimeUnit.SECONDS)
+                reader.join(1_000)
+                AdbCommandResult(
+                    -1,
+                    output.toString(),
+                    "adb command timeout after ${timeoutMs}ms: ${arguments.joinToString(" ")}",
+                )
+            } else {
+                reader.join(1_000)
+                AdbCommandResult(process.exitValue(), output.toString(), "")
+            }
+        } catch (e: Exception) {
+            process.destroyForcibly()
+            AdbCommandResult(-1, output.toString(), e.message ?: e.javaClass.simpleName)
+        }
     }
 }
