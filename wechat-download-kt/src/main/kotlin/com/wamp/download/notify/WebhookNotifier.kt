@@ -60,7 +60,8 @@ object WebhookNotifier {
     )
 
     private fun enabled(): Boolean =
-        AppConfig.wecomWebhookUrl.isNotEmpty() || AppConfig.feishuWebhookUrl.isNotEmpty()
+        (AppConfig.wecomEnabled && AppConfig.wecomWebhookUrl.isNotEmpty()) ||
+            AppConfig.feishuWebhookUrl.isNotEmpty()
 
     /**
      * 发送文字通知
@@ -94,7 +95,7 @@ object WebhookNotifier {
         var success = false
 
         // 企业微信
-        val wecomUrl = AppConfig.wecomWebhookUrl
+        val wecomUrl = if (AppConfig.wecomEnabled) AppConfig.wecomWebhookUrl else ""
         if (wecomUrl.isNotEmpty()) {
             success = sendWecomMarkdown(wecomUrl, lines) || success
         }
@@ -130,7 +131,7 @@ object WebhookNotifier {
         heading: String = "请扫码登录微信读书",
         targetUrl: String? = null,
     ): QrPushResult {
-        val wecomUrl = AppConfig.wecomWebhookUrl
+        val wecomUrl = if (AppConfig.wecomEnabled) AppConfig.wecomWebhookUrl else ""
         val feishuUrl = AppConfig.feishuWebhookUrl
 
         if (wecomUrl.isEmpty() && feishuUrl.isEmpty()) {

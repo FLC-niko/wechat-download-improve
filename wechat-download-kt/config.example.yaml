@@ -34,6 +34,7 @@ rabbitmq:
   task_retry_delay_ms: 60000
 
 notification:
+  wecom_enabled: true        # 企业微信机器人开关；false 时只发飞书
   wecom_webhook_url: ""      # 企业微信群机器人 Webhook
   feishu_webhook_url: ""     # 飞书机器人 Webhook
   interval: 300              # 同一事件通知最小间隔（秒）

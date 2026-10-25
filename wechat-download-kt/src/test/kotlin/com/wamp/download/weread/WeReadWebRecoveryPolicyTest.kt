@@ -29,6 +29,15 @@ class WeReadWebRecoveryPolicyTest {
     }
 
     @Test
+    fun `automated recovery suppresses the duplicate expired text message`() {
+        assertTrue(CredentialHealthChecker.shouldSuppressExpiredText(WeReadWebAuth.ReloginRequestResult.STARTED))
+        assertTrue(CredentialHealthChecker.shouldSuppressExpiredText(WeReadWebAuth.ReloginRequestResult.ALREADY_RUNNING))
+        assertTrue(CredentialHealthChecker.shouldSuppressExpiredText(WeReadWebAuth.ReloginRequestResult.BACKOFF))
+        assertTrue(!CredentialHealthChecker.shouldSuppressExpiredText(WeReadWebAuth.ReloginRequestResult.AUTO_QR_DISABLED))
+        assertTrue(!CredentialHealthChecker.shouldSuppressExpiredText(WeReadWebAuth.ReloginRequestResult.RECOVERY_UNAVAILABLE))
+    }
+
+    @Test
     fun `health notification only claims orchestration when recovery started`() {
         assertTrue(
             CredentialHealthChecker.recoveryMessage(WeReadWebAuth.ReloginRequestResult.STARTED)

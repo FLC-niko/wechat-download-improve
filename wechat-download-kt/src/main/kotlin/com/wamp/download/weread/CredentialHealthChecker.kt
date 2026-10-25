@@ -127,20 +127,13 @@ object CredentialHealthChecker {
                 "凭证检测: ${expired.size} 个微信读书 Web 账号等待恢复: " +
                     expired.joinToString { "${it.first}=${it.second}" },
             )
-            val deviceRecoveryHandlesLogin = WeReadWebAuth.isDeviceRecoveryConfigured()
             expired.forEach { (vid, result) ->
-                // 设备（ADB/AAOS）已承接登录时不再重复发送机器人扫码提醒：
-                // 之前每次健康检查/重启都会推一条，运维侧收到大量重复登录提示。
-                val handledByDevice = deviceRecoveryHandlesLogin && when (result) {
-                    WeReadWebAuth.ReloginRequestResult.STARTED,
-                    WeReadWebAuth.ReloginRequestResult.ALREADY_RUNNING,
-                    WeReadWebAuth.ReloginRequestResult.BACKOFF,
-                    -> true
-                    else -> false
-                }
-                if (handledByDevice) {
+                // STARTED/ALREADY_RUNNING/BACKOFF 都表示二维码或设备登录流程已承接，
+                // 不再额外发一条“账号失效”文字，避免同一账号收到文字 + 二维码两条消息。
+                val handledAutomatically = shouldSuppressExpiredText(result)
+                if (handledAutomatically) {
                     logger.info(
-                        "凭证检测: Web 账号已由设备(AAOS)自动登录承接，跳过机器人扫码提醒: " +
+                        "凭证检测: Web 账号已由设备/二维码流程承接，跳过重复文字通知: " +
                             "vid=$vid, result=$result",
                     )
                 } else if (reportedExpiredAccounts.add(vid)) {
@@ -157,6 +150,14 @@ object CredentialHealthChecker {
         } else {
             logger.info("凭证检测: 微信读书 Web 账号全部存活（${accounts.size} 个）")
         }
+    }
+
+    internal fun shouldSuppressExpiredText(result: WeReadWebAuth.ReloginRequestResult): Boolean = when (result) {
+        WeReadWebAuth.ReloginRequestResult.STARTED,
+        WeReadWebAuth.ReloginRequestResult.ALREADY_RUNNING,
+        WeReadWebAuth.ReloginRequestResult.BACKOFF,
+        -> true
+        else -> false
     }
 
     internal fun recoveryMessage(result: WeReadWebAuth.ReloginRequestResult): String = when (result) {

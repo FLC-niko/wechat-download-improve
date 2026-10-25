@@ -51,6 +51,7 @@ object AppConfig {
     val taskRetryDelayMs: Long get() = getLong("rabbitmq.task_retry_delay_ms", 60_000L)
 
     // 通知配置
+    val wecomEnabled: Boolean get() = getBool("notification.wecom_enabled", true)
     val wecomWebhookUrl: String get() = getString("notification.wecom_webhook_url", "")
     val feishuWebhookUrl: String get() = getString("notification.feishu_webhook_url", "")
     val webhookNotificationInterval: Long get() = getLong("notification.interval", 300L)

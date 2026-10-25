@@ -4,7 +4,6 @@ import com.wamp.download.adb.AdbUserOperations
 import com.wamp.download.adb.DeviceSlot
 import com.wamp.download.adb.AdbDeviceSupervisor
 import com.wamp.download.config.AppConfig
-import com.wamp.download.notify.WebhookNotifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -243,16 +242,16 @@ class DeviceRecoveryManager(
     }
 
     private suspend fun notifyManual(account: WeReadAccount) {
-        // 当 ADB 设备离线或无可用槽位时，回退至生成带图二维码通知供人工扫码
+        // 设备恢复失败时只发一条带账号信息的二维码消息，不再追加一条文字通知。
         val started = runCatching {
-            WeReadWebAuth.startLogin(targetVid = account.vid, requireNotification = true)
+            WeReadWebAuth.startLogin(
+                targetVid = account.vid,
+                requireNotification = true,
+                message = "手机自动登录未完成，请使用微信扫码登录微信读书（目标账号: ${account.vid}）",
+            )
         }.getOrDefault(false)
         if (!started) {
-            WebhookNotifier.notify("weread_login_qr", mapOf(
-                "message" to "微信读书账号等待设备恢复或人工扫码（无可用 ADB 设备）",
-                "vid" to account.vid,
-                "bound_serial" to account.boundSerial,
-            ))
+            logger.warn("人工扫码二维码生成/推送未完成: vid=${account.vid}")
         }
     }
 }

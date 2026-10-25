@@ -531,7 +531,11 @@ object WeReadWebAuth {
      *
      * @return true=登录成功
      */
-    fun startLogin(targetVid: String? = null, requireNotification: Boolean = false): Boolean {
+    fun startLogin(
+        targetVid: String? = null,
+        requireNotification: Boolean = false,
+        message: String = "请使用微信扫码登录微信读书（公众号采集回退通道）",
+    ): Boolean {
         val (uid, scanUrl) = createLogin() ?: return false
         val qrFileName = targetVid?.let { "weread_web_${it}.png" } ?: "weread_web_qrcode.png"
         // 将扫码链接生成二维码图片并推送到通知机器人
@@ -549,7 +553,7 @@ object WeReadWebAuth {
             val delivery = kotlinx.coroutines.runBlocking {
                 WebhookNotifier.pushQrcode(
                     qrPng,
-                    "请使用微信扫码登录微信读书（公众号采集回退通道）",
+                    message,
                     fileName = qrFileName,
                     localFileAvailable = localFileAvailable,
                 )
@@ -562,7 +566,7 @@ object WeReadWebAuth {
         } else {
             val notified = kotlinx.coroutines.runBlocking {
                 WebhookNotifier.notify("weread_login_qr", mapOf(
-                    "message" to "微信读书需要重新登录，请打开链接扫码",
+                    "message" to message,
                     "scan_url" to scanUrl,
                     "vid" to targetVid,
                 ))
