@@ -49,7 +49,8 @@ class DeviceRecoveryManager(
     }
 
     fun request(vid: String) {
-        if (WeReadAccountPool.get(vid)?.status.let { it == null || it == AccountStatus.HUMAN_VERIFY_REQUIRED }) {
+        val account = WeReadAccountPool.get(vid)
+        if (account == null || account.status != AccountStatus.EXPIRED) {
             waiting.remove(vid)
             attempts.remove(vid)
             return
@@ -104,7 +105,7 @@ class DeviceRecoveryManager(
         }
         // 升级为物理硬件级独占互斥锁，彻底避免同一手机主身与分身并发执行
         val lock = supervisor.getDeviceLock(slot)
-        return lock.withLock {
+        val failure = lock.withLock {
             val maxAttempts = 3
             var lastFailureReason = "ADB 扫码流程未完成"
             for (attempt in 1..maxAttempts) {
@@ -175,6 +176,11 @@ class DeviceRecoveryManager(
             }
             lastFailureReason
         }
+        if (failure != null) {
+            logger.warn("ADB 自动恢复未完成，回退人工扫码二维码: vid=$vid, reason=$failure")
+            notifyManual(account)
+        }
+        return failure
     }
 
     private fun recordFailure(vid: String, reason: String) {
@@ -208,9 +214,21 @@ class DeviceRecoveryManager(
             .firstOrNull { it.serial == account.boundSerial && account.boundUserId in it.userIds }
             ?.let { DeviceSlot(it.serial, account.boundUserId, it.hardwareSerial) }
         if (exact != null) return exact
-        // 未绑定槽位的新账号或弹性设备策略均可借用首个可用在线槽位
+        // 未绑定槽位的新账号或弹性设备策略可借用在线槽位；
+        // 但 FIXED_DEVICE 不能抢占已绑定给其他账号的物理槽位，避免扫码账号不匹配。
         if (account.boundSerial.isBlank() || account.bindingStrategy == "ELASTIC_DEVICE") {
-            return supervisor.availableSlots().firstOrNull()
+            val claimed = if (account.bindingStrategy == "ELASTIC_DEVICE") {
+                emptySet()
+            } else {
+                WeReadAccountPool.list()
+                    .asSequence()
+                    .filter { it.vid != account.vid && it.boundSerial.isNotBlank() }
+                    .map { it.boundSerial to it.boundUserId }
+                    .toSet()
+            }
+            return supervisor.availableSlots().firstOrNull { slot ->
+                (slot.hardwareSerial.ifBlank { slot.serial } to slot.userId) !in claimed
+            }
         }
         return null
     }

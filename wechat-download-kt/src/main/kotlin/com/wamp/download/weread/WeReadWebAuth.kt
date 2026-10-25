@@ -113,10 +113,13 @@ object WeReadWebAuth {
             return ReloginRequestResult.BACKOFF
         }
         // ADB recovery has its own explicit adb.enabled gate and must not be coupled to the
-        // human QR-notification preference.
-        deviceRecoveryHandler?.let {
-            it(vid)
-            return ReloginRequestResult.STARTED
+        // human QR-notification preference. Only EXPIRED accounts are delegated; an ACTIVE
+        // account with high refreshFailCount still uses the normal manual QR flow.
+        if (account.status == AccountStatus.EXPIRED) {
+            deviceRecoveryHandler?.let {
+                it(vid)
+                return ReloginRequestResult.STARTED
+            }
         }
         if (automatic && !AppConfig.wereadAutoQrNotificationEnabled) {
             return ReloginRequestResult.AUTO_QR_DISABLED
