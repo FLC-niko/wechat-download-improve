@@ -127,6 +127,7 @@ object CredentialHealthChecker {
                 "凭证检测: ${expired.size} 个微信读书 Web 账号等待恢复: " +
                     expired.joinToString { "${it.first}=${it.second}" },
             )
+            val unhandled = mutableListOf<Pair<String, WeReadWebAuth.ReloginRequestResult>>()
             expired.forEach { (vid, result) ->
                 // STARTED/ALREADY_RUNNING/BACKOFF 都表示二维码或设备登录流程已承接，
                 // 不再额外发一条“账号失效”文字，避免同一账号收到文字 + 二维码两条消息。
@@ -137,15 +138,20 @@ object CredentialHealthChecker {
                             "vid=$vid, result=$result",
                     )
                 } else if (reportedExpiredAccounts.add(vid)) {
-                    WebhookNotifier.notify(
-                        "weread_accounts_expired",
-                        mapOf(
-                            "message" to recoveryMessage(result),
-                            "vid" to vid,
-                            "recovery_result" to result.name,
-                        ),
-                    )
+                    unhandled += vid to result
                 }
+            }
+            if (unhandled.isNotEmpty()) {
+                WebhookNotifier.notify(
+                    "weread_accounts_expired",
+                    mapOf(
+                        "message" to unhandled.joinToString("；") { (vid, result) ->
+                            "$vid: ${recoveryMessage(result)}"
+                        },
+                        "vid" to unhandled.joinToString(",") { it.first },
+                        "recovery_result" to unhandled.joinToString(",") { it.second.name },
+                    ),
+                )
             }
         } else {
             logger.info("凭证检测: 微信读书 Web 账号全部存活（${accounts.size} 个）")

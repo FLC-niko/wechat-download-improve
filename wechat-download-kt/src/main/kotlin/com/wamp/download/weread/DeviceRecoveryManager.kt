@@ -185,8 +185,12 @@ class DeviceRecoveryManager(
             lastFailureReason
         }
         if (failure != null) {
-            logger.warn("ADB 自动恢复未完成，回退人工扫码二维码: vid=$vid, reason=$failure")
-            notifyManual(account)
+            if (!supervisor.hasOnlineDevice()) {
+                logger.warn("ADB 自动恢复未完成且无在线设备，回退人工扫码二维码: vid=$vid, reason=$failure")
+                notifyManual(account)
+            } else {
+                logger.warn("ADB 自动恢复未完成，保留设备重试，不发送 Web 二维码: vid=$vid, reason=$failure")
+            }
         }
         return failure
     }
