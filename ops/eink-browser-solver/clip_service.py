@@ -47,6 +47,28 @@ _tokenize = None
 _ocr = None
 _ocr_lock = threading.Lock()
 
+TEXT_MODE = os.environ.get("SOLVER_TEXT_MODE", "legacy")
+TEXT_BUNDLE = os.environ.get("SOLVER_TEXT_BUNDLE", "")
+_text_predictor = None
+_text_predictor_lock = threading.Lock()
+
+
+def _get_text_predictor():
+    global _text_predictor
+    if not TEXT_BUNDLE:
+        raise ValueError("SOLVER_TEXT_BUNDLE is required for text fusion")
+    if _text_predictor is None:
+        with _text_predictor_lock:
+            if _text_predictor is None:
+                from text_runtime import TextPredictor
+                _text_predictor = TextPredictor(
+                    TEXT_BUNDLE, int(os.environ.get("CLIP_THREADS", "4")))
+    return _text_predictor
+
+
+def _text_fusion(image, regions, target):
+    return _get_text_predictor().pick(image, regions, target)
+
 
 def _load():
     global _model, _preprocess, _tokenize
@@ -303,11 +325,26 @@ def _pick_by_clip(image: Image.Image, instruction: str, regions: list) -> dict:
 
 
 def pick(image_b64: str, instruction: str, regions: list) -> dict:
-    _load()
     image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
     target = _char_search_target(instruction)
     if target and "文字" in instruction:
-        return _pick_by_siamese(image, regions, target, instruction)
+        if TEXT_MODE not in ("legacy", "shadow", "fusion"):
+            raise ValueError("SOLVER_TEXT_MODE must be legacy, shadow, or fusion")
+        fusion = None
+        if TEXT_MODE != "legacy":
+            try:
+                fusion = _text_fusion(image, regions, target)
+            except Exception:
+                LOG.exception("text fusion failed; using legacy picker")
+        if TEXT_MODE == "fusion" and fusion is not None:
+            return fusion
+        legacy = _pick_by_siamese(image, regions, target, instruction)
+        if fusion is not None:
+            legacy["text_shadow"] = fusion
+        elif TEXT_MODE != "legacy":
+            legacy["text_fallback"] = "fusion-unavailable"
+        return legacy
+    _load()
     import torch
 
     torch.set_num_threads(int(os.environ.get("CLIP_THREADS", "4")))
@@ -334,7 +371,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/health":
-            self._send(200, {"status": "ok", "model": MODEL_NAME, "loaded": _model is not None})
+            self._send(200, {"status": "ok", "model": MODEL_NAME, "loaded": _model is not None,
+                             "text_mode": TEXT_MODE,
+                             "text_loaded": _text_predictor is not None,
+                             "text_version": getattr(_text_predictor, "version", None)})
         else:
             self._send(404, {"error": "not found"})
 
@@ -367,14 +407,21 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     LOG.info("loading models before serving...")
-    _load()
-    threading.Thread(target=_load_ocr, daemon=True).start()
-    try:
-        from crack_tcaptcha.solvers import word_ocr as wo
+    if TEXT_MODE not in ("legacy", "shadow", "fusion"):
+        raise ValueError("invalid SOLVER_TEXT_MODE")
+    if TEXT_MODE != "legacy":
+        # Load and checksum the selected bundle before advertising readiness.
+        _get_text_predictor()
+    if os.environ.get("CLIP_SCENE_ENABLED", "1") == "1":
+        _load()
+    if TEXT_MODE != "fusion":
+        threading.Thread(target=_load_ocr, daemon=True).start()
+        try:
+            from crack_tcaptcha.solvers import word_ocr as wo
 
-        wo.warmup()
-        LOG.info("word_click models warmed up")
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning("word_click warmup failed: %s", exc)
+            wo.warmup()
+            LOG.info("word_click models warmed up")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("word_click warmup failed: %s", exc)
     LOG.info("vision pick service on 127.0.0.1:%d", PORT)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

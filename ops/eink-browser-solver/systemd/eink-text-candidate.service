@@ -1,0 +1,19 @@
+[Unit]
+Description=Isolated E-Ink text candidate, loopback port 9994
+After=network-online.target
+
+[Service]
+Type=simple
+User=topview
+WorkingDirectory=/home/topview/captcha/text-current/service
+ExecStart=/opt/crack-tcaptcha/venv/bin/python /home/topview/captcha/text-current/service/clip_service.py
+Environment=CLIP_PORT=9994
+Environment=CLIP_SCENE_ENABLED=0
+Environment=SOLVER_TEXT_MODE=fusion
+Environment=SOLVER_TEXT_BUNDLE=/home/topview/captcha/text-current/bundle
+Environment=CLIP_THREADS=4
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
