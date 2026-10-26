@@ -20,3 +20,6 @@ data/
 
 __pycache__/
 *.pyc
+
+# Private OCR datasets, model artifacts and remote rollback evidence
+.local/eink-*/
