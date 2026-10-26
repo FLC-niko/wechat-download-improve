@@ -1,0 +1,9 @@
+[Unit]
+Description=Aggregate existing E-Ink A/B verifier outcome evidence
+
+[Service]
+Type=oneshot
+User=topview
+WorkingDirectory=/home/topview/captcha/text-shadow-service
+ExecStart=/usr/bin/python3 /home/topview/captcha/text-shadow-service/summarize_text_ab.py
+UMask=0077

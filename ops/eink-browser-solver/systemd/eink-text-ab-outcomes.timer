@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh E-Ink A/B outcome evidence every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Unit=eink-text-ab-outcomes.service
+
+[Install]
+WantedBy=timers.target

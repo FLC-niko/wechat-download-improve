@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "phase": "text-v2-20261026",
+  "percent": 0,
+  "expected_version": "6cc80d5cde1b81ec",
+  "remote_timeout": 2.5,
+  "local_timeout": 4.0,
+  "cooldown": 30.0
+}
