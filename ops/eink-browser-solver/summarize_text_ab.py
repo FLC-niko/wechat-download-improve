@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 
 
-def summarize(debug, phase):
+def summarize(debug, phase, percent=None):
     outcomes = Path(debug) / "verify-outcomes.jsonl"
     rows = {}
     if outcomes.exists():
@@ -36,6 +36,8 @@ def summarize(debug, phase):
             ab = json.loads(pick.read_text())["pick"]["ab"]
             if ab["phase"] != phase or ab["source"] != "live":
                 continue
+            if percent is not None and ab.get("percent") != percent:
+                continue
             cohort, served = ab["cohort"], ab["served"]
             if cohort not in ("A", "B") or served not in ("legacy", "cpu_fusion", "gpu_fusion"):
                 continue
@@ -52,7 +54,8 @@ def summarize(debug, phase):
         summary[key] = {"observed_rounds": count, "accepted": codes["0"],
                         "observed_acceptance_rate": codes["0"] / count,
                         "verifier_codes": dict(codes)}
-    return {"phase": phase, "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    return {"phase": phase, "percent": percent,
+            "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "groups": summary, "status": "observational; no automatic promotion",
             "limitations": "Only submitted rounds with a recorded response are counted; skipped rounds are excluded. "
                            "Nonzero codes include environment/session failures; not recognition ground truth. "
@@ -67,7 +70,7 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     config = json.loads(Path(args.config).read_text())
-    report = summarize(args.debug, config["phase"])
+    report = summarize(args.debug, config["phase"], config["percent"])
     output = Path(args.output)
     temporary = output.with_name(output.name + ".tmp")
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2))

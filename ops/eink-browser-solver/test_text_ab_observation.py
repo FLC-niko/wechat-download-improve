@@ -36,6 +36,23 @@ class ObservationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(summarize(temp, "p")["groups"], {})
 
+    def test_current_percentage_does_not_mix_previous_rollout_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            records = []
+            for i, (percent, code) in enumerate(((10, "0"), (50, "51")), 1):
+                stamp = f"2026-10-27T03-00-00-00{i}Z"
+                records.append({"runStamp": stamp, "round": 1, "errorCode": code})
+                (root / f"r1-{stamp}-pick.json").write_text(json.dumps({"pick": {"ab": {
+                    "phase": "p", "source": "live", "percent": percent,
+                    "cohort": "B", "served": "gpu_fusion"}}}))
+            (root / "verify-outcomes.jsonl").write_text("\n".join(json.dumps(r) for r in records))
+            current = summarize(root, "p", 50)
+            self.assertEqual(current["percent"], 50)
+            self.assertEqual(current["groups"]["B:gpu_fusion"]["observed_rounds"], 1)
+            self.assertEqual(current["groups"]["B:gpu_fusion"]["verifier_codes"], {"51": 1})
+            self.assertEqual(summarize(root, "p")["groups"]["B:gpu_fusion"]["observed_rounds"], 2)
+
     def test_failed_percentage_activation_restores_original_file(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
