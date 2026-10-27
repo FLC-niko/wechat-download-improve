@@ -1,7 +1,8 @@
-# 文字题 A/B 上线与 5090 离线回退（2026-10-26）
+# 文字题 A/B 上线与 5090 离线回退（更新于 2026-10-27）
 
-当前应用机 `10.21.76.61` 已开启 **10% 文字题实验流量**，其余 90% 继续使用旧版。
-同一图片和目标字的分组固定，重试不重新抽签；小样本比例不会精确等于 10%。
+当前应用机 `10.21.76.61` 已开启 **50/50 文字题 A/B**：约 50% 旧版、50% 融合。
+同一比例下，图片和目标字决定分组，重试不重新抽签；小样本不一定恰好各占一半。
+本次保留分桶种子，放量后原 B 组继续为 B，一部分原 A 组进入 B。
 场景题与序列题沿用原服务。没有因部署主动增加外部验证尝试。
 
 ## 处理链路
@@ -52,11 +53,13 @@ worker 监听 5090 回环 9997，SSH 反向隧道只监听应用机回环 9996�
 不含账号、ticket 或 randstr。路由事件在
 `/home/topview/captcha/text-ab-events.jsonl`，每份 10 MiB，保留 5 份轮转备份。
 `GET http://127.0.0.1:9995/health` 提供当前比例、熔断状态和本进程各路线上请求计数。
+该请求计数跨放量阶段累计；下面的验证结果汇总按当前比例单独统计，两者口径不同。
 
 已有 daemon 的 `DEBUG_SAVE=1` 继续记录选格和验证结果，无需改动或重启 daemon。
 新增 `eink-text-ab-outcomes.timer` 每分钟将已有的 pick 与 verify-outcomes 按轮次关联，
 汇总到 `/home/topview/captcha/text-ab-outcomes.json`，区分 A 旧版、B GPU、B CPU
-与 B 旧版兜底，只统计本阶段 live 记录。
+与 B 旧版兜底，只统计本阶段 live 记录及其 `ab.percent` 与当前配置一致的轮次。
+10% 和 50% 的验证结果不混算；历史明细保留，需要时可另行回溯。
 
 汇总中 errorCode=0 记为已接受；其他代码可能包含网络、会话与限流因素，不能全部
 当成识别错误，也不自动变成人工标签。低置信度跳过、未提交、无验证响应的轮次不在
@@ -66,16 +69,25 @@ worker 监听 5090 回环 9997，SSH 反向隧道只监听应用机回环 9996�
 上线后首次检查（2026-10-26 17:33，Asia/Shanghai）尚无本阶段新文字题 live 请求，
 线上分组结果为空；已完成的回放/故障演练均不冒充线上收益。
 
-目前只开启第一阶段 10%，**不按时间自动放量**。建议积累至少 30 个 B 组有响应轮次
-及同期 A 组对照后，连同回退、超时、漏选/多选的人审结果决定是否到 25%；该数量
-是初步运营检查点，不构成统计显著性保证。随后仍分阶段检查 50%、100%。
+2026-10-27 10:55 检查时，10% 阶段只有 15 次文字题请求（A 14、B 1）；A 有
+13 次验证响应、2 次接受，B 唯一一次为空选格且低置信度，未提交验证。
+用户明确要求增加 B 组样本，因此在 **2026-10-27 10:59:10（Asia/Shanghai）**
+将比例从 10% 调到 **50%**，跳过原先建议的 25% 中间阶段。该调整不表示已有
+线上准确率提升的结论。修改后已核对正式入口 `percent=50`、配置无错误，
+旧服务、CPU 融合和 GPU 融合均健康，无需重启服务。
+
+当前保持 50/50，**不按时间自动继续放量**。观察时同时查看验证接受率、低置信度
+跳过情况、回退、超时及人工标注；积累足够数据后再决定是否全量。
+切换记录：`/home/topview/captcha/text-ab-changes/rollout-50-20261027T105910.json`。
+10% 配置原件：`/home/topview/captcha/text-ab.json.20261027T025910814451Z`。
 
 应用机调整比例（已授权的正常运维操作，命令立即生效）：
 
 ```sh
 python3 /home/topview/captcha/text-shadow-service/text_ab_control.py --percent 0
 python3 /home/topview/captcha/text-shadow-service/text_ab_control.py --percent 10
-# 后续经过观测再使用 25、50、100，不在本次自动执行。
+python3 /home/topview/captcha/text-shadow-service/text_ab_control.py --percent 50
+# 当前为50%；0恢复全部旧版，10回到首阶段；不自动执行100。
 ```
 
 控制工具每次私有备份原配置；健康检查不匹配时自动恢复。0% 是日常即时回滚入口，
@@ -89,11 +101,16 @@ python3 /home/topview/captcha/text-shadow-service/text_ab_control.py --percent 1
 旧生产完整快照、run-02 和 run-03 高准确率候选快照均继续保留，详见
 [TEXT_MODEL_RUNBOOK.md](TEXT_MODEL_RUNBOOK.md)。
 
-当前 10% 灰度完整快照：
+首阶段 10% 灰度完整快照（继续保留）：
 `/home/topview/captcha/snapshots/20261026-text-ab10-run03`，65 文件，manifest SHA256：
 `43a0103c1c18de9ac7946c9dba0bee629c1da7a0ab8dea737b6ac9232fb2d0d7`。
 已逐文件校验，包含本机模型、路由代码、灰度配置与观测单元；共享 Python/场景模型
 运行时继续锚定原生产完整快照，原快照必须一并保留。
+
+当前 50% 灰度完整快照：
+`/home/topview/captcha/snapshots/20261027-text-ab50-run03`，66 文件，manifest SHA256：
+`fa3776c24521f883a37c15e33c9dc8779f25cd17fe9040adfcbb36ec542bcc1f`。
+已逐文件校验，包含50%配置及按比例隔离的统计脚本，保留同一模型和运行时锚点。
 
 应用机上线时原文件备份：
 `/home/topview/captcha/text-ab-deployment-20261026/pre-install-files`。
