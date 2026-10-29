@@ -4,10 +4,26 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
+import kotlin.test.assertFalse
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class WeReadEinkRequestGateTest {
+
+    @Test
+    fun `startup grace and active verification defer background work only`() {
+        val vid = "gate-background-${System.nanoTime()}"
+        val later = System.currentTimeMillis() + 1_860_000L
+        assertFalse(WeReadEinkRequestGate.canRunBackgroundRequests(vid))
+        assertTrue(WeReadEinkRequestGate.canRunBackgroundRequests(vid, later))
+        WeReadEinkRequestGate.beginVerification(vid)
+        try {
+            assertFalse(WeReadEinkRequestGate.canRunBackgroundRequests(vid, later))
+        } finally {
+            WeReadEinkRequestGate.endVerification(vid)
+        }
+        assertTrue(WeReadEinkRequestGate.canRunBackgroundRequests(vid, later))
+    }
 
     @Test
     fun `verification probe takes the gate before yielding background requests`() {

@@ -160,8 +160,9 @@ adapter:
 任务路径如下：
 
 ```text
-BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众号身份
-  → E-Ink（默认开启，需先扫码取得凭证）→ appmsgpublish（默认关闭）→ WeRead Web → SQLite 合并
+BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众号身份（未入库时先走微信读书目录解析）
+  → E-Ink（默认开启；/mp/chapters 空页时用 article/list、mp/cover 兜底）
+  → appmsgpublish（默认关闭）→ WeRead Web → SQLite 合并
   → 覆盖度决策 → 发布一条 ATD → Inbox COMPLETED → ACK
 ```
 
@@ -181,6 +182,42 @@ BTA 解码 → Inbox 租约/幂等 → 校验时间窗口 → 本地解析公众
 - 借鉴 `weread-omni`：E-Ink `/mp/chapters`、synckey 增量、`-2014/-2041` 明确错误语义和 refresh token 会话模型。当前将 E-Ink 作为首选采集通道；未配置凭证时自动跳过，不阻塞 Web 与缓存兜底。
 - 借鉴 `weread-mp`：Web `/web/mp/articles` 使用最老文章 `createTime` 作为下一页游标，短页表示到底。
 - 结合 `we-mp-rss` 的频控反馈：按账号冷却、全局串行与最小请求间隔，避免多个入口各自限流造成叠加请求。
+
+## 账号解析、列表兜底与死信重处理
+
+- **账号解析兜底**：任务名不在本地订阅库时，先通过微信读书目录接口解析并落库：
+  `store/search?scope=2`（按名称）、`mp/getreviewid`（按文章 URL）、`mp/list`、`shelf/sync`、`subscription/books`。
+  解析成功会写入 `subscriptions` 与 `weread_mpid`，失败才回退主微信通道。名称解析要求精确匹配（忽略空白），避免把任务错配到相似公众号；历史错名任务优先用 V2 `entryUrl` 反查。
+- **错误语义**：`-2010`（用户不存在/无会话）按认证失效处理，不再误判为人工验证；`-2012` 过期、`-2014` 频控、`-2041` 人工验证语义保持不变。
+- **列表兜底**：E-Ink `/mp/chapters` 第一页为空但仍有更多时，会尝试 `article/list`、`mp/cover`，只补文章、不伪造覆盖；`reviewId`/`originalId` 中的 `~` 会还原为 `_`。
+- **`mobileSync` A/B**：`weread.eink.mobile_sync_activation.enabled` 默认关闭；开启后按 `vid_allowlist` 灰度。`/mp/chapters` 遇到 `-2041` 先尝试一次 `mobileSync` 激活，仍失败再走现有自动验证。统计在 `/api/weread/eink/status` 的 `runtime.mobile_sync_activation`。
+- **死信重处理**：`POST /api/rabbitmq/dead-letter/reprocess`，默认 `dry_run=true`、`limit=10`，只支持 `pro/test` vhost；先验证账号可解析，再决定是否重投 BTA。V2 死信优先用 `payload.account.entryUrl` 反查真实公众号；legacy/错名死信可用 `account_map` 显式映射（精确源名称，不做模糊匹配）。重投时会把错误的 `account.name` / `gzhName` 改写为解析出的真实昵称，避免同一任务再次死信。响应包含逐条 `accountName/messageType/resolutionSource/resolvedAs/action/reason`，不返回消息正文。实际重投必须显式带 `"confirm": "APPLY"`。
+- **映射安全**：`account_map` 仅本次调用生效，最多 100 条；源名称必须精确匹配，重复/空白/控制字符直接 400。映射目标可以是本地订阅昵称或文章 URL；本地昵称会优先查 SQLite，不依赖微信读书在线状态。映射目标无法解析时消息原样留在 DLQ，不会回退到模糊匹配或 `entryUrl`。实际重投会写入 `x-dlq-mapped-from`、`x-dlq-mapped-to`、`x-dlq-resolution-source` 审计头。
+
+```bash
+# 1) 先 dry-run（account_map 可选；legacy 错名死信建议显式映射）
+curl -X POST http://127.0.0.1:8001/api/rabbitmq/dead-letter/reprocess \
+  -H 'Content-Type: application/json' \
+  -d '{"vhost":"pro","limit":20,"dry_run":true,"account_map":{"海珠检查":"广州海珠发布"}}'
+
+# 2) 核对 resolutionSource=override / resolvedAs 后实际重投
+curl -X POST http://127.0.0.1:8001/api/rabbitmq/dead-letter/reprocess \
+  -H 'Content-Type: application/json' \
+  -d '{"vhost":"pro","limit":20,"dry_run":false,"confirm":"APPLY","account_map":{"海珠检查":"广州海珠发布"}}'
+```
+
+也可用独立 CLI：
+
+```bash
+java -cp "build/install/wechat-download-kt/lib/*" \
+  com.wamp.download.tools.DeadLetterReprocessMainKt --vhost pro --limit 20 --dry-run \
+  --map '海珠检查=广州海珠发布'
+# 需要复用 E-Ink 凭证解析时加 --use-eink
+# 确认后把 --dry-run 换成 --apply；建议先核对 resolutionSource/resolvedAs
+```
+
+> 该接口未单独鉴权，依赖服务端口访问控制；生产建议只在内网/本机调用，并始终先 dry-run。
+> CLI 读取 `config.yaml` 的 `rabbitmq.host`，也可用 `RABBITMQ_HOST/PORT/USERNAME/PASSWORD` 覆盖。生产 MQ 不是本机回环地址；本机 `config.yaml` 的 `127.0.0.1` 只是本地样本，服务器上以实际 `config.yaml`/环境变量为准。
 
 ### 4. 发起登录
 

@@ -1,0 +1,33 @@
+name: ops-artifact
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/**'
+      - '.github/workflows/ops-artifact.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Package ops bundle
+        run: |
+          set -euo pipefail
+          TAG="ops-${GITHUB_SHA::12}"
+          tar -czf "${TAG}.tar.gz" -C ops \
+            eink-browser-solver cloudflared-watchdog deploy eink-captcha-sidecar
+          sha256sum "${TAG}.tar.gz" > "${TAG}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ops-bundle
+          path: ops-*.tar.gz*
+          retention-days: 14

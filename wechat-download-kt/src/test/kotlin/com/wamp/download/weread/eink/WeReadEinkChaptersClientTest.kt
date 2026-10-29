@@ -114,6 +114,104 @@ class WeReadEinkChaptersClientTest {
     }
 
     @Test
+    fun `human verify triggers one mobile sync activation and retries`() {
+        WeReadEinkTerminalActivationStats.resetForTest()
+        try {
+            val transport = RecordingTransport(
+                WeReadEinkResponse(200, "{\"errCode\":-2041,\"errMsg\":\"verify\"}"),
+                WeReadEinkResponse(200, "{\"data\":[],\"hasMore\":0}"),
+            )
+            var activations = 0
+            val client = WeReadEinkChaptersClient(
+                credentials = credentials(),
+                transport = transport,
+                baseUrl = "https://eink.example.test",
+                requestGate = { _, block -> block() },
+                mobileSyncActivationEnabled = true,
+                mobileSyncActivationAllowed = { true },
+                mobileSyncActivation = {
+                    activations++
+                    true
+                },
+            )
+
+            val page = client.fetchArticles("MP_WXS_1")
+
+            assertEquals(0, page.returnedCount)
+            assertEquals(1, activations)
+            assertEquals(2, transport.requests.size)
+            val stats = WeReadEinkTerminalActivationStats.snapshot().getValue("1") as Map<*, *>
+            assertEquals(1L, stats["attempted"])
+            assertEquals(1L, stats["succeeded"])
+        } finally {
+            WeReadEinkTerminalActivationStats.resetForTest()
+        }
+    }
+
+    @Test
+    fun `mobile sync activation is not repeated after it still gets human verify`() {
+        WeReadEinkTerminalActivationStats.resetForTest()
+        try {
+            val transport = RecordingTransport(
+                WeReadEinkResponse(200, "{\"errCode\":-2041}"),
+                WeReadEinkResponse(200, "{\"errCode\":-2041}"),
+            )
+            var activations = 0
+            val client = WeReadEinkChaptersClient(
+                credentials = credentials(),
+                transport = transport,
+                baseUrl = "https://eink.example.test",
+                requestGate = { _, block -> block() },
+                mobileSyncActivationEnabled = true,
+                mobileSyncActivationAllowed = { true },
+                mobileSyncActivation = {
+                    activations++
+                    true
+                },
+            )
+
+            assertFailsWith<WeReadEinkApiException> { client.fetchArticles("MP_WXS_1") }
+
+            assertEquals(1, activations)
+            assertEquals(2, transport.requests.size)
+            val stats = WeReadEinkTerminalActivationStats.snapshot().getValue("1") as Map<*, *>
+            assertEquals(1L, stats["still_human_verify"])
+        } finally {
+            WeReadEinkTerminalActivationStats.resetForTest()
+        }
+    }
+
+    @Test
+    fun `cover and article list provide fallback list entries`() {
+        val transport = RecordingTransport(
+            WeReadEinkResponse(
+                200,
+                """{"reviewId":"MP_WXS_1_abc~def","title":"Cover","createTime":1700000000}""",
+            ),
+            WeReadEinkResponse(
+                200,
+                """{"reviews":[{"reviewId":"r1","createTime":1700000001,"mpInfo":{"originalId":"a1","title":"One"}}]}""",
+            ),
+        )
+        val client = WeReadEinkChaptersClient(
+            credentials = credentials(),
+            transport = transport,
+            baseUrl = "https://eink.example.test",
+            stringRequestGate = { _, block -> block() },
+        )
+
+        val cover = client.fetchCover("MP_WXS_1")
+        val list = client.fetchArticleList("MP_WXS_1")
+
+        assertEquals("MP_WXS_1_abc~def", cover?.reviewId)
+        assertEquals("Cover", cover?.title)
+        assertEquals(1700000000L, cover?.createTime)
+        assertEquals(listOf("r1"), list.map { it.reviewId })
+        assertEquals("/mp/cover", transport.requests[0].url.encodedPath)
+        assertEquals("/article/list", transport.requests[1].url.encodedPath)
+    }
+
+    @Test
     fun `missing data array is a parse error`() {
         val transport = RecordingTransport(WeReadEinkResponse(200, "{\"synckey\":1}"))
         val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test")

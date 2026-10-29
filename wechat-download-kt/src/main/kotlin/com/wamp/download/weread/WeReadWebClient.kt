@@ -371,10 +371,11 @@ class WeReadWebClient {
                         val id = mpInfo["originalId"] as? String
                             ?: return@mapNotNull null
                         if (id.isEmpty()) return@mapNotNull null
+                        val normalizedId = WeReadLinkNormalizer.normalizeShortId(id)
                         WeReadArticle(
-                            id = id,
+                            id = normalizedId,
                             title = mpInfo["title"] as? String ?: "",
-                            link = "https://mp.weixin.qq.com/s/$id",
+                            link = "https://mp.weixin.qq.com/s/$normalizedId",
                             cover = mpInfo["pic_url"] as? String ?: "",
                             publishTime = (mpInfo["time"] as? Number)?.toLong()
                                 ?: (subMap["createTime"] as? Number)?.toLong() ?: 0L,
@@ -413,10 +414,11 @@ class WeReadWebClient {
             val articles = listJson.mapNotNull { m ->
                 val id = (m["id"] as? String) ?: (m["articleId"] as? String) ?: (m["article_id"] as? String)
                     ?: return@mapNotNull null
+                val normalizedId = WeReadLinkNormalizer.normalizeShortId(id)
                 WeReadArticle(
-                    id = id,
+                    id = normalizedId,
                     title = m["title"] as? String ?: "",
-                    link = "https://mp.weixin.qq.com/s/$id",
+                    link = "https://mp.weixin.qq.com/s/$normalizedId",
                     cover = (m["picUrl"] as? String) ?: (m["coverUrl"] as? String) ?: "",
                     publishTime = ((m["publishTime"] as? Number) ?: (m["publish_time"] as? Number))?.toLong() ?: 0L,
                 )

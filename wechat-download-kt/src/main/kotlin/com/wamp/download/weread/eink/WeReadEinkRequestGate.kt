@@ -74,8 +74,14 @@ internal object WeReadEinkRequestGate {
         warmupUntil[vid] = System.currentTimeMillis() + warmupMs
     }
 
-    private fun isWarmingUp(vid: String): Boolean =
-        (warmupUntil[vid] ?: 0L) > System.currentTimeMillis()
+    // A restart must not immediately resume cache filling after a recent recovery.
+    private val backgroundStartupUntil = System.currentTimeMillis() + HUMAN_VERIFY_WARMUP_MS
+
+    internal fun canRunBackgroundRequests(vid: String, now: Long = System.currentTimeMillis()): Boolean =
+        now >= backgroundStartupUntil && !isWarmingUp(vid, now) && !isVerificationActive(vid)
+
+    private fun isWarmingUp(vid: String, now: Long = System.currentTimeMillis()): Boolean =
+        (warmupUntil[vid] ?: 0L) > now
 
     fun beginVerification(vid: String) {
         verificationActive.add(vid)

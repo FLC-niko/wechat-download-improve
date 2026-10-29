@@ -35,6 +35,11 @@ const RECYCLE_SOLVES = parseInt(process.env.SOLVER_RECYCLE_SOLVES || "30", 10);
 // 升级题型“依次点击：”：sprite 剪影序列匹配的最低接受分，以及单次解题内允许的 seq 轮数。
 const SEQ_MIN_SCORE = parseFloat(process.env.SOLVER_SEQ_MIN_SCORE || "0.62");
 const SEQ_MAX_ROUNDS = parseInt(process.env.SOLVER_SEQ_MAX_ROUNDS || "3", 10);
+// 实测近期 seq 题 sprite 会被噪声切碎（3 个图标识别成 5-6 个），高置信点击全错。
+// 默认关闭 seq 点击，只换题/快速失败；待匹配器在真实样本上验证后再打开。
+const SEQ_ENABLED = process.env.SOLVER_SEQ_ENABLED === "1";
+// “包含文字”题低置信时不点击、换一组；超过上限快速失败（误点会抬高风控）。
+const TEXT_MAX_SKIPS = parseInt(process.env.SOLVER_TEXT_MAX_SKIPS || "3", 10);
 const DEBUG_DIR = process.env.DEBUG_DIR || "/tmp/eink-debug";
 const CONST_GRID = [
   { id: 1, range: [0, 34, 220, 254] },
@@ -434,10 +439,40 @@ async function solveOnce(entryUrl, appid, retries) {
         if (iframe) break;
       }
     }
+    if (!iframe && !pageCompletionTicket) {
+      // 验证码组件偶发未加载：整页重载一次再等，不要直接判失败。
+      log("captcha iframe not found after 30s -> reload and retry once");
+      await page.send("Page.reload", { ignoreCache: true }).catch(() => {});
+      await sleep(2500);
+      for (let i = 0; i < 50; i++) {
+        const r = await page.send("Runtime.evaluate", { expression: "typeof TencentCaptcha === 'function'", returnByValue: true }).catch(() => null);
+        if (r?.result?.value === true) break;
+        await sleep(400);
+      }
+      await page.send("Runtime.evaluate", { expression: "document.getElementById('verify') && document.getElementById('verify').click()" }).catch(() => {});
+      const t0 = Date.now();
+      while (Date.now() - t0 < 20000) {
+        if (pageCompletionTicket) break;
+        iframe = await findIframeTarget(500);
+        if (iframe) break;
+      }
+      if (iframe) log("iframe found after page reload");
+    }
     if (pageCompletionTicket) {
       return { ok: true, attempts: 0, ticket: pageCompletionTicket.ticket, randstr: pageCompletionTicket.randstr, costS: (Date.now() - startedAt) / 1000 };
     }
-    if (!iframe) throw new Error("captcha iframe not found");
+    if (!iframe) {
+      if (process.env.DEBUG_SAVE === "1") {
+        try {
+          const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+          const shot = await page.send("Page.captureScreenshot", { format: "jpeg", quality: 60 }).catch(() => null);
+          if (shot?.data) fs.writeFileSync(path.join(DEBUG_DIR, `iframe-missing-${stamp}.jpg`), Buffer.from(shot.data, "base64"));
+          const html = await page.send("Runtime.evaluate", { expression: "document.documentElement.outerHTML.slice(0, 200000)", returnByValue: true }).catch(() => null);
+          if (html?.result?.value) fs.writeFileSync(path.join(DEBUG_DIR, `iframe-missing-${stamp}.html`), String(html.result.value));
+        } catch {}
+      }
+      throw new Error("captcha iframe not found");
+    }
     let ifr = new Target(iframe.webSocketDebuggerUrl, "iframe");
     await ifr.waitReady();
     await ifr.send("Network.enable").catch(() => {});
@@ -471,10 +506,13 @@ async function solveOnce(entryUrl, appid, retries) {
     let lastSubmittedUrl = null;
 
     const maxRounds = Math.max(2, MAX_ROUNDS);
+    const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
     let rounds = 0;
     let seqRounds = 0;
+    let textSkips = 0;
     let lastHandledTs = 0;
     let lastImageTs = 0;
+    let lastClicked = [];
     let needFresh = true; // errorCode 50 = re-answer same question, no new challenge
 
     let cursor = { x: 640 + Math.random() * 40, y: 450 + Math.random() * 40 };
@@ -578,8 +616,8 @@ async function solveOnce(entryUrl, appid, retries) {
           });
           fs.mkdirSync(DEBUG_DIR, { recursive: true });
           fs.writeFileSync(path.join(DEBUG_DIR, "seq-dom.json"), String(dump?.result?.value || "{}"));
-          fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
-          if (spriteB64) fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-sprite.png`), Buffer.from(spriteB64, "base64"));
+          fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-${runStamp}-img.jpg`), Buffer.from(pickImageB64, "base64"));
+          if (spriteB64) fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-${runStamp}-sprite.png`), Buffer.from(spriteB64, "base64"));
           log("seq-mode DOM dumped (依次点击)");
         } catch (e) { log("seq dom dump failed:", String(e).slice(0, 100)); }
       }
@@ -603,7 +641,7 @@ async function solveOnce(entryUrl, appid, retries) {
             seq = await seqPick(pickImageB64, sprite);
           } catch (e) { log("seq-pick error:", String(e).slice(0, 120)); }
         }
-        const confident = seq && seq.ok && Array.isArray(seq.clicks) && seq.clicks.length > 0
+        const confident = SEQ_ENABLED && seq && seq.ok && Array.isArray(seq.clicks) && seq.clicks.length > 0
           && typeof seq.min_score === "number" && seq.min_score >= SEQ_MIN_SCORE;
         if (confident && seqRounds <= SEQ_MAX_ROUNDS) {
           const sx = 672 / (seq.img_w || 672);
@@ -614,10 +652,7 @@ async function solveOnce(entryUrl, appid, retries) {
             try {
               fs.mkdirSync(DEBUG_DIR, { recursive: true });
               const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-              fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-pick.json`), JSON.stringify({ seq, points: pts, liveUrl: live.url || null }));
-              // 带时间戳留档，避免同名覆盖（线上 errorCode 可对照时间回归调参）。
-              fs.writeFileSync(path.join(DEBUG_DIR, `seq-${stamp}-r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
-              fs.writeFileSync(path.join(DEBUG_DIR, `seq-${stamp}-r${rounds}-sprite.png`), Buffer.from(sprite, "base64"));
+              fs.writeFileSync(path.join(DEBUG_DIR, `seq-r${rounds}-${runStamp}-pick.json`), JSON.stringify({ runStamp, seq, points: pts, liveUrl: live.url || null }));
               fs.appendFileSync(
                 path.join(DEBUG_DIR, "seq-attempts.jsonl"),
                 JSON.stringify({ ts: new Date().toISOString(), rounds, min: seq.min_score, scores: seq.scores, points: pts }) + "\n",
@@ -634,6 +669,7 @@ async function solveOnce(entryUrl, appid, retries) {
           }
           lastSubmittedInstr = instr;
           lastSubmittedUrl = live.url || null;
+          lastClicked = pts.map((p) => [Math.round(p.x), Math.round(p.y)]);
           seqSubmitted = true;
         } else {
           if (seqRounds > SEQ_MAX_ROUNDS) {
@@ -660,8 +696,8 @@ async function solveOnce(entryUrl, appid, retries) {
         if (process.env.DEBUG_SAVE === "1") {
           try {
             fs.mkdirSync(DEBUG_DIR, { recursive: true });
-            fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-img.jpg`), Buffer.from(pickImageB64, "base64"));
-            fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-pick.json`), JSON.stringify({ instruction: instr, pick, regions: CONST_GRID, liveUrl: live.url || null, src: live.b64 ? "dom" : "net" }));
+            fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-${runStamp}-img.jpg`), Buffer.from(pickImageB64, "base64"));
+            fs.writeFileSync(path.join(DEBUG_DIR, `r${rounds}-${runStamp}-pick.json`), JSON.stringify({ runStamp, instruction: instr, pick, regions: CONST_GRID, liveUrl: live.url || null, src: live.b64 ? "dom" : "net" }));
           } catch {}
         }
 
@@ -670,6 +706,22 @@ async function solveOnce(entryUrl, appid, retries) {
         );
         if (!bgRect || bgRect.w === undefined) throw new Error("slideBg not found");
         let ids = (Array.isArray(pick.region_ids) && pick.region_ids.length ? pick.region_ids : [pick.region_id]).filter((x) => typeof x === "number" && x >= 1 && x <= 6);
+        const textTask = /包含文字/.test(instr);
+        if (textTask && (pick.low_confidence === true || !ids.length)) {
+          textSkips++;
+          if (textSkips > TEXT_MAX_SKIPS) {
+            throw new Error(`text tasks unresolved (skips=${textSkips}, method=${pick.method})`);
+          }
+          log(`text pick low confidence (method=${pick.method}, conf=${pick.confidence}) -> refresh ${textSkips}/${TEXT_MAX_SKIPS}`);
+          try {
+            const rr = await rectOf("(() => { const b = document.querySelector('.tc-refresh-icon') || document.getElementById('ticon_refresh'); if (!b) return 'null'; const r = b.getBoundingClientRect(); return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()");
+            if (rr && rr.x !== undefined) await clickAt(Math.round(rr.x + rr.w / 2), Math.round(rr.y + rr.h / 2));
+          } catch {}
+          lastSubmittedInstr = instr;
+          lastSubmittedUrl = live.url || null;
+          await sleep(1200);
+          continue;
+        }
         if (!ids.length) {
           log("round", rounds, ": empty pick set -> clicking refresh and continuing");
           try {
@@ -680,6 +732,7 @@ async function solveOnce(entryUrl, appid, retries) {
           continue;
         }
         log(`click set = ${JSON.stringify(ids)} (bgRect=${JSON.stringify(bgRect)})`);
+        lastClicked = ids.slice();
         for (const rid of ids) {
           const reg = CONST_GRID.find((r) => r.id === rid);
           if (!reg) continue;
@@ -726,6 +779,17 @@ async function solveOnce(entryUrl, appid, retries) {
         throw new Error("verify response timeout");
       }
       const code = String(resp.errorCode);
+      if (process.env.DEBUG_SAVE === "1") {
+        try {
+          fs.appendFileSync(
+            path.join(DEBUG_DIR, "verify-outcomes.jsonl"),
+            JSON.stringify({
+              ts: new Date().toISOString(), runStamp, round: rounds,
+              instr: lastSubmittedInstr, clicked: lastClicked, errorCode: code,
+            }) + "\n",
+          );
+        } catch {}
+      }
       if (code === "0") {
         const ticket = String(resp.ticket || "");
         const randstr = String(resp.randstr || "");

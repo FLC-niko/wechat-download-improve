@@ -47,6 +47,28 @@ _tokenize = None
 _ocr = None
 _ocr_lock = threading.Lock()
 
+TEXT_MODE = os.environ.get("SOLVER_TEXT_MODE", "legacy")
+TEXT_BUNDLE = os.environ.get("SOLVER_TEXT_BUNDLE", "")
+_text_predictor = None
+_text_predictor_lock = threading.Lock()
+
+
+def _get_text_predictor():
+    global _text_predictor
+    if not TEXT_BUNDLE:
+        raise ValueError("SOLVER_TEXT_BUNDLE is required for text fusion")
+    if _text_predictor is None:
+        with _text_predictor_lock:
+            if _text_predictor is None:
+                from text_runtime import TextPredictor
+                _text_predictor = TextPredictor(
+                    TEXT_BUNDLE, int(os.environ.get("CLIP_THREADS", "4")))
+    return _text_predictor
+
+
+def _text_fusion(image, regions, target):
+    return _get_text_predictor().pick(image, regions, target)
+
 
 def _load():
     global _model, _preprocess, _tokenize
@@ -94,12 +116,17 @@ def _char_search_target(instruction: str) -> str:
     return "".join(ch for ch in target if "\u4e00" <= ch <= "\u9fff" or ch.isalnum())
 
 
-def _ocr_texts(image: Image.Image, regions: list) -> list:
+def _ocr_texts(image: Image.Image, regions: list, scale: float = 1.0) -> list:
     _load_ocr()
     results = []
     for region in regions:
         x1, y1, x2, y2 = _crop_box(image, region)
         crop = image.crop((x1, y1, x2, y2))
+        if scale != 1.0:
+            crop = crop.resize(
+                (max(1, int(crop.width * scale)), max(1, int(crop.height * scale))),
+                Image.LANCZOS,
+            )
         buf = io.BytesIO()
         crop.save(buf, format="PNG")
         try:
@@ -108,6 +135,58 @@ def _ocr_texts(image: Image.Image, regions: list) -> list:
             text = f"<ocr-error {exc}>"
         results.append({"id": region["id"], "text": text[:40]})
     return results
+
+
+_FONT_PATHS_CACHE = None
+_SIAMESE_MIN_SCORE = float(os.environ.get("SIAMESE_MIN_SCORE", "0.30"))
+
+
+def _font_paths() -> list:
+    global _FONT_PATHS_CACHE
+    if _FONT_PATHS_CACHE is not None:
+        return _FONT_PATHS_CACHE
+    import glob
+
+    paths = []
+    try:
+        from crack_tcaptcha.solvers import word_ocr as wo
+
+        paths.append(str(wo._FONT_PATH))
+    except Exception:  # noqa: BLE001
+        pass
+    for pattern in (
+        "/usr/share/fonts/truetype/wqy/*.ttc",
+        "/usr/share/fonts/truetype/wqy/*.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
+    ):
+        paths.extend(sorted(glob.glob(pattern)))
+    seen, out = set(), []
+    for item in paths:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    _FONT_PATHS_CACHE = out[:4]
+    return _FONT_PATHS_CACHE
+
+
+def _render_char_variants(char: str) -> list:
+    """Render the target char with several fonts; the captcha font is unknown."""
+    from PIL import ImageDraw, ImageFont
+
+    variants = []
+    for path in _font_paths():
+        try:
+            img = Image.new("RGB", (52, 52), color="white")
+            draw = ImageDraw.Draw(img)
+            font = ImageFont.truetype(path, 40)
+            bbox = font.getbbox(char)
+            x = (52 - (bbox[2] - bbox[0])) // 2
+            draw.text((x, -3), char, fill=(227, 178, 56), font=font)
+            variants.append(np.ascontiguousarray(np.array(img)[..., ::-1]))
+        except Exception:  # noqa: BLE001
+            continue
+    return variants
 
 
 def _pick_by_siamese(image: Image.Image, regions: list, target: str, raw_instruction: str) -> dict:
@@ -143,8 +222,10 @@ def _pick_by_siamese(image: Image.Image, regions: list, target: str, raw_instruc
                     crops.append(c)
             for ch in chars:
                 try:
-                    ref = wo._render_char(ch)
-                    sims = wo._siamese_score_batch(crops, ref) if crops else []
+                    refs = _render_char_variants(ch) or [wo._render_char(ch)]
+                    sims = []
+                    for ref in refs:
+                        sims.extend(wo._siamese_score_batch(crops, ref) if crops else [])
                     per_char[ch] = round(max(sims), 3) if sims else -1.0
                 except Exception as exc:  # noqa: BLE001
                     per_char[ch] = f"err:{str(exc)[:40]}"
@@ -160,32 +241,54 @@ def _pick_by_siamese(image: Image.Image, regions: list, target: str, raw_instruc
     except Exception as exc:  # noqa: BLE001
         ocr_cross = [{"error": str(exc)[:80]}]
 
+    def _hits(items):
+        if not items or not isinstance(items[0], dict) or "id" not in items[0]:
+            return []
+        return [item["id"] for item in items if any(ch in item.get("text", "") for ch in set(target))]
+
+    hits = _hits(ocr_cross)
+    if not hits:
+        # Native-resolution OCR often misses stylized glyphs; retry on 2x upscaled tiles.
+        try:
+            ocr_up = _ocr_texts(image, regions, scale=2.0)
+            up_hits = _hits(ocr_up)
+            if up_hits:
+                ocr_cross = ocr_up
+                hits = up_hits
+                LOG.info("upscaled OCR found target %r on %s", target, hits)
+        except Exception as exc:  # noqa: BLE001
+            LOG.info("upscaled OCR failed: %s", str(exc)[:80])
+
     LOG.info("siamese pick target=%r details=%s ocr=%s -> %s", target, details, ocr_cross, best_id)
-    method = "siamese"
-    if best_score <= 0.0:
-        # siamese produced no usable signal; fall back to OCR text hit
-        if ocr_cross and isinstance(ocr_cross[0], dict) and "id" in ocr_cross[0]:
-            scored = []
-            for item in ocr_cross:
-                hit = sum(1 for ch in set(target) if ch in item.get("text", ""))
-                scored.append((hit, item["id"]))
-            scored.sort(reverse=True)
-            if scored and scored[0][0] > 0:
-                best_id = scored[0][1]
-                method = "ocr-fallback"
-    selected = [best_id] if best_id is not None else []
-    if ocr_cross and isinstance(ocr_cross[0], dict) and "id" in ocr_cross[0]:
-        hits = [item["id"] for item in ocr_cross if any(ch in item.get("text", "") for ch in set(target))]
-        if hits:
-            selected = hits
-            method = "ocr-set"
-    if not [x for x in selected if x]:
-        LOG.info("char-search found no signal for %r; falling back to CLIP", target)
-        fallback = _pick_by_clip(image, raw_instruction, regions)
-        fallback["method"] = "clip-fallback"
-        return fallback
-    LOG.info("siamese/ocr set target=%r -> %s (method=%s)", target, selected, method)
-    return {"ok": True, "region_id": selected[0], "region_ids": selected, "method": method, "target": target, "details": details, "ocr": ocr_cross}
+    confidence = best_score if isinstance(best_score, float) else -1.0
+    low_confidence = False
+    # Observed rule for this captcha: click ALL tiles containing the target character
+    # (landscape glyphs). Verified samples: "丙" tiles read by OCR as 丙 were exactly the
+    # correct set; clicking a single tile or letting Siamese override the OCR set fails.
+    if hits:
+        selected, method = hits, "ocr-set"
+    elif confidence >= _SIAMESE_MIN_SCORE and best_id is not None:
+        selected, method = [best_id], "siamese"
+    elif best_id is not None and confidence > 0:
+        selected, method, low_confidence = [best_id], "siamese-low", True
+    else:
+        # No usable signal. Blind CLIP picks on single-char tasks are almost always wrong.
+        selected, method, low_confidence = [], "none", True
+    LOG.info(
+        "char-search target=%r -> %s (method=%s, conf=%.3f, low=%s)",
+        target, selected, method, confidence, low_confidence,
+    )
+    return {
+        "ok": True,
+        "region_id": selected[0] if selected else None,
+        "region_ids": selected,
+        "method": method,
+        "confidence": confidence,
+        "low_confidence": low_confidence,
+        "target": target,
+        "details": details,
+        "ocr": ocr_cross,
+    }
 
 
 def _pick_by_clip(image: Image.Image, instruction: str, regions: list) -> dict:
@@ -203,9 +306,14 @@ def _pick_by_clip(image: Image.Image, instruction: str, regions: list) -> dict:
     ranked = [sims[i] for i in order]
     margin = ranked[0] - ranked[1] if len(ranked) > 1 else ranked[0]
     best = regions[order[0]]["id"]
-    threshold = max(0.30, ranked[0] * 0.85)
-    selected = [regions[i]["id"] for i in order if sims[i] >= threshold] or [best]
-    selected = selected[:4]
+    plural_hint = any(h in instruction for h in ("所有", "全部", "哪些", "几个", "多种", "找出"))
+    if plural_hint:
+        threshold = max(0.30, ranked[0] * 0.85)
+        selected = [regions[i]["id"] for i in order if sims[i] >= threshold] or [best]
+        selected = selected[:4]
+    else:
+        # Recorded rounds: single picks were right 81% of the time, multi picks only 44%.
+        selected = [best]
     LOG.info(
         "clip pick instruction=%r sims=%s margin=%.3f -> regions=%s",
         instruction,
@@ -217,11 +325,26 @@ def _pick_by_clip(image: Image.Image, instruction: str, regions: list) -> dict:
 
 
 def pick(image_b64: str, instruction: str, regions: list) -> dict:
-    _load()
     image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
     target = _char_search_target(instruction)
     if target and "文字" in instruction:
-        return _pick_by_siamese(image, regions, target, instruction)
+        if TEXT_MODE not in ("legacy", "shadow", "fusion"):
+            raise ValueError("SOLVER_TEXT_MODE must be legacy, shadow, or fusion")
+        fusion = None
+        if TEXT_MODE != "legacy":
+            try:
+                fusion = _text_fusion(image, regions, target)
+            except Exception:
+                LOG.exception("text fusion failed; using legacy picker")
+        if TEXT_MODE == "fusion" and fusion is not None:
+            return fusion
+        legacy = _pick_by_siamese(image, regions, target, instruction)
+        if fusion is not None:
+            legacy["text_shadow"] = fusion
+        elif TEXT_MODE != "legacy":
+            legacy["text_fallback"] = "fusion-unavailable"
+        return legacy
+    _load()
     import torch
 
     torch.set_num_threads(int(os.environ.get("CLIP_THREADS", "4")))
@@ -248,7 +371,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/health":
-            self._send(200, {"status": "ok", "model": MODEL_NAME, "loaded": _model is not None})
+            self._send(200, {"status": "ok", "model": MODEL_NAME, "loaded": _model is not None,
+                             "text_mode": TEXT_MODE,
+                             "text_loaded": _text_predictor is not None,
+                             "text_version": getattr(_text_predictor, "version", None)})
         else:
             self._send(404, {"error": "not found"})
 
@@ -281,14 +407,21 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     LOG.info("loading models before serving...")
-    _load()
-    threading.Thread(target=_load_ocr, daemon=True).start()
-    try:
-        from crack_tcaptcha.solvers import word_ocr as wo
+    if TEXT_MODE not in ("legacy", "shadow", "fusion"):
+        raise ValueError("invalid SOLVER_TEXT_MODE")
+    if TEXT_MODE != "legacy":
+        # Load and checksum the selected bundle before advertising readiness.
+        _get_text_predictor()
+    if os.environ.get("CLIP_SCENE_ENABLED", "1") == "1":
+        _load()
+    if TEXT_MODE != "fusion":
+        threading.Thread(target=_load_ocr, daemon=True).start()
+        try:
+            from crack_tcaptcha.solvers import word_ocr as wo
 
-        wo.warmup()
-        LOG.info("word_click models warmed up")
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning("word_click warmup failed: %s", exc)
+            wo.warmup()
+            LOG.info("word_click models warmed up")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("word_click warmup failed: %s", exc)
     LOG.info("vision pick service on 127.0.0.1:%d", PORT)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

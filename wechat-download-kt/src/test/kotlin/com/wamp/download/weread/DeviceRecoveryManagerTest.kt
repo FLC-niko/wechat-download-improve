@@ -113,6 +113,55 @@ class DeviceRecoveryManagerTest {
     }
 
     @Test
+    fun `未绑定 FIXED_DEVICE 账号不抢占其他账号已绑定的物理槽位`() {
+        val supervisor = mockSupervisor(listOf("dev-1"), usersMap = mapOf("dev-1" to listOf(0)))
+        val manager = DeviceRecoveryManager(supervisor, scope = CoroutineScope(SupervisorJob() + Dispatchers.IO))
+        val bound = WeReadAccount(
+            vid = "bound-vid",
+            credentials = WeReadWebCredentials(wrVid = "bound-vid", wrSkey = "dummy"),
+            boundSerial = "HW-DEV-1",
+            boundUserId = 0,
+            bindingStrategy = "FIXED_DEVICE",
+        )
+        val unbound = WeReadAccount(
+            vid = "unbound-vid",
+            credentials = WeReadWebCredentials(wrVid = "unbound-vid", wrSkey = "dummy"),
+            boundSerial = "",
+            boundUserId = 0,
+            bindingStrategy = "FIXED_DEVICE",
+        )
+        WeReadAccountPool.setForTest(bound)
+        WeReadAccountPool.setForTest(unbound)
+        try {
+            assertNull(manager.chooseSlot(unbound))
+        } finally {
+            WeReadAccountPool.removeForTest("bound-vid")
+            WeReadAccountPool.removeForTest("unbound-vid")
+        }
+    }
+
+    @Test
+    fun `非 EXPIRED 账号不会进入设备恢复队列`() {
+        val supervisor = mockSupervisor(listOf("dev-1"))
+        val manager = DeviceRecoveryManager(supervisor, scope = CoroutineScope(SupervisorJob() + Dispatchers.IO))
+        val active = WeReadAccount(
+            vid = "active-vid",
+            credentials = WeReadWebCredentials(wrVid = "active-vid", wrSkey = "dummy"),
+            boundSerial = "HW-DEV-1",
+            boundUserId = 0,
+            bindingStrategy = "FIXED_DEVICE",
+            status = AccountStatus.ACTIVE,
+        )
+        WeReadAccountPool.setForTest(active)
+        try {
+            manager.request("active-vid")
+            assertEquals(emptyList(), manager.pendingVids())
+        } finally {
+            WeReadAccountPool.removeForTest("active-vid")
+        }
+    }
+
+    @Test
     fun `recover 在无可用设备槽位时返回失败原因并不抛出异常`() = kotlinx.coroutines.runBlocking {
         val supervisor = mockSupervisor(emptyList()) // 无在线设备
         val manager = DeviceRecoveryManager(supervisor, scope = CoroutineScope(SupervisorJob() + Dispatchers.IO))

@@ -8,6 +8,30 @@ import kotlin.test.assertTrue
 
 class WeReadEinkRuntimePolicyTest {
     @Test
+    fun `recovering account is available for tasks while background uses another account`() {
+        val recovering = "recovering-${System.nanoTime()}"
+        val healthy = "healthy-${System.nanoTime()}"
+        WeReadEinkRequestGate.markHumanVerifyRecovered(recovering, warmupMs = 3_600_000L)
+        val now = System.currentTimeMillis()
+        val candidates = listOf(
+            WeReadEinkAccountCandidate(recovering, 1L, "HEALTHY"),
+            WeReadEinkAccountCandidate(healthy, 2L, "HEALTHY"),
+        )
+        assertEquals(recovering, WeReadEinkRuntime.leastUsedEinkAccount(
+            candidates, WeReadEinkRuntime::taskSyncSuppressed,
+        )?.vid)
+        // Past startup grace, but still inside the recovering account's warmup.
+        assertEquals(healthy, WeReadEinkRuntime.leastUsedEinkAccount(
+            candidates, WeReadEinkRuntime::scheduledSyncSuppressed,
+            eligible = { WeReadEinkRequestGate.canRunBackgroundRequests(it, now + 1_860_000L) },
+        )?.vid)
+        assertEquals(recovering, WeReadEinkRuntime.leastUsedEinkAccount(
+            candidates, WeReadEinkRuntime::scheduledSyncSuppressed,
+            eligible = { WeReadEinkRequestGate.canRunBackgroundRequests(it, now + 3_660_000L) },
+        )?.vid)
+    }
+
+    @Test
     fun `自动求解必须显式开启且账号位于非空白名单`() {
         assertFalse(isAutoSolverEligible(false, setOf("vid-test"), "vid-test"))
         assertFalse(isAutoSolverEligible(true, emptySet(), "vid-test"))

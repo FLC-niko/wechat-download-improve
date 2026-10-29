@@ -18,6 +18,10 @@ class WeReadEinkResponseClassifierTest {
             WeReadEinkResponseKind.HUMAN_VERIFY,
             WeReadEinkResponseClassifier.classify(WeReadEinkResponse(200, "{\"errCode\":-2041}")).kind,
         )
+        assertEquals(
+            WeReadEinkResponseKind.AUTH_EXPIRED,
+            WeReadEinkResponseClassifier.classify(WeReadEinkResponse(200, "{\"errCode\":-2010}")).kind,
+        )
     }
 
     @Test

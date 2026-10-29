@@ -4,7 +4,6 @@ import com.wamp.download.adb.AdbUserOperations
 import com.wamp.download.adb.DeviceSlot
 import com.wamp.download.adb.AdbDeviceSupervisor
 import com.wamp.download.config.AppConfig
-import com.wamp.download.notify.WebhookNotifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +17,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import org.slf4j.LoggerFactory
@@ -49,7 +49,8 @@ class DeviceRecoveryManager(
     }
 
     fun request(vid: String) {
-        if (WeReadAccountPool.get(vid)?.status.let { it == null || it == AccountStatus.HUMAN_VERIFY_REQUIRED }) {
+        val account = WeReadAccountPool.get(vid)
+        if (account == null || account.status != AccountStatus.EXPIRED) {
             waiting.remove(vid)
             attempts.remove(vid)
             return
@@ -97,14 +98,22 @@ class DeviceRecoveryManager(
     internal suspend fun recover(vid: String): String? {
         val account = WeReadAccountPool.get(vid) ?: return null
         if (account.status == AccountStatus.HUMAN_VERIFY_REQUIRED) return null
+        if (!supervisor.hasCompletedRefresh()) {
+            withTimeoutOrNull(35_000L) {
+                while (!supervisor.hasCompletedRefresh()) delay(250L)
+            }
+        }
         val slot = chooseSlot(account)
         if (slot == null) {
+            if (!supervisor.hasCompletedRefresh()) {
+                return "ADB 设备发现中"
+            }
             if ((attempts[vid]?.attempts ?: 0) == 0) notifyManual(account)
             return "没有可用的 ADB 设备槽位"
         }
         // 升级为物理硬件级独占互斥锁，彻底避免同一手机主身与分身并发执行
         val lock = supervisor.getDeviceLock(slot)
-        return lock.withLock {
+        val failure = lock.withLock {
             val maxAttempts = 3
             var lastFailureReason = "ADB 扫码流程未完成"
             for (attempt in 1..maxAttempts) {
@@ -175,6 +184,15 @@ class DeviceRecoveryManager(
             }
             lastFailureReason
         }
+        if (failure != null) {
+            if (!supervisor.hasOnlineDevice()) {
+                logger.warn("ADB 自动恢复未完成且无在线设备，回退人工扫码二维码: vid=$vid, reason=$failure")
+                notifyManual(account)
+            } else {
+                logger.warn("ADB 自动恢复未完成，保留设备重试，不发送 Web 二维码: vid=$vid, reason=$failure")
+            }
+        }
+        return failure
     }
 
     private fun recordFailure(vid: String, reason: String) {
@@ -208,9 +226,21 @@ class DeviceRecoveryManager(
             .firstOrNull { it.serial == account.boundSerial && account.boundUserId in it.userIds }
             ?.let { DeviceSlot(it.serial, account.boundUserId, it.hardwareSerial) }
         if (exact != null) return exact
-        // 未绑定槽位的新账号或弹性设备策略均可借用首个可用在线槽位
+        // 未绑定槽位的新账号或弹性设备策略可借用在线槽位；
+        // 但 FIXED_DEVICE 不能抢占已绑定给其他账号的物理槽位，避免扫码账号不匹配。
         if (account.boundSerial.isBlank() || account.bindingStrategy == "ELASTIC_DEVICE") {
-            return supervisor.availableSlots().firstOrNull()
+            val claimed = if (account.bindingStrategy == "ELASTIC_DEVICE") {
+                emptySet()
+            } else {
+                WeReadAccountPool.list()
+                    .asSequence()
+                    .filter { it.vid != account.vid && it.boundSerial.isNotBlank() }
+                    .map { it.boundSerial to it.boundUserId }
+                    .toSet()
+            }
+            return supervisor.availableSlots().firstOrNull { slot ->
+                (slot.hardwareSerial.ifBlank { slot.serial } to slot.userId) !in claimed
+            }
         }
         return null
     }
@@ -225,16 +255,16 @@ class DeviceRecoveryManager(
     }
 
     private suspend fun notifyManual(account: WeReadAccount) {
-        // 当 ADB 设备离线或无可用槽位时，回退至生成带图二维码通知供人工扫码
+        // 设备恢复失败时只发一条带账号信息的二维码消息，不再追加一条文字通知。
         val started = runCatching {
-            WeReadWebAuth.startLogin(targetVid = account.vid, requireNotification = true)
+            WeReadWebAuth.startLogin(
+                targetVid = account.vid,
+                requireNotification = true,
+                message = "手机自动登录未完成，请使用微信扫码登录微信读书（目标账号: ${account.vid}）",
+            )
         }.getOrDefault(false)
         if (!started) {
-            WebhookNotifier.notify("weread_login_qr", mapOf(
-                "message" to "微信读书账号等待设备恢复或人工扫码（无可用 ADB 设备）",
-                "vid" to account.vid,
-                "bound_serial" to account.boundSerial,
-            ))
+            logger.warn("人工扫码二维码生成/推送未完成: vid=${account.vid}")
         }
     }
 }

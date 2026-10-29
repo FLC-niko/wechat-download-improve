@@ -1,0 +1,13 @@
+[Unit]
+Description=Private optional text worker reverse tunnel to application server
+After=network-online.target eink-text-gpu.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o ConnectTimeout=8 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%h/captcha/text-gpu-tunnel/known_hosts -i %h/captcha/text-gpu-tunnel/id_ed25519 -R 127.0.0.1:9996:127.0.0.1:9997 topview@10.21.76.61
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

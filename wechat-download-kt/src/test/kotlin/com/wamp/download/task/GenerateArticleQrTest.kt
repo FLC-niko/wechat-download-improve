@@ -2,19 +2,19 @@ package com.wamp.download.task
 
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
+import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import java.awt.Color
 import java.awt.image.BufferedImage
 import java.io.File
-import java.security.MessageDigest
-import java.util.Base64
-import java.util.Locale
+import java.nio.file.Path
 import javax.imageio.ImageIO
 
 class GenerateArticleQrTest {
 
     @Test
-    fun generateArticleQr() {
+    fun generateArticleQr(@TempDir dir: Path) {
         val articleUrl = "https://mp.weixin.qq.com/s/Nyj2R3NKpCcZGO20GFpZFg"
         val size = 600
         val writer = QRCodeWriter()
@@ -27,28 +27,22 @@ class GenerateArticleQrTest {
             }
         }
 
-        val outFile = File("/tmp/article_qr.jpg")
+        val outFile = dir.resolve("article_qr.jpg").toFile()
         ImageIO.write(image, "JPEG", outFile)
-        println("Generated: ${outFile.absolutePath}, size=${outFile.length()}")
+        check(outFile.length() > 0) { "QR file was not written" }
 
-        val bytes = outFile.readBytes()
-        val base64 = Base64.getEncoder().encodeToString(bytes)
-        val sha256 = MessageDigest.getInstance("SHA-256")
-            .digest(bytes)
-            .joinToString("") { "%02x".format(Locale.US, it.toInt() and 0xff) }
-
-        File("/tmp/article_qr_b64.txt").writeText(base64)
-        File("/tmp/article_qr_sha256.txt").writeText(sha256)
-        File("/tmp/article_qr_size.txt").writeText(bytes.size.toString())
-
-        println("SHA256: $sha256")
-        println("SizeBytes: ${bytes.size}")
-        println("Base64Len: ${base64.length}")
+        val img = ImageIO.read(outFile)
+        val source = com.google.zxing.client.j2se.BufferedImageLuminanceSource(img)
+        val bitmap = com.google.zxing.BinaryBitmap(com.google.zxing.common.HybridBinarizer(source))
+        val decoded = com.google.zxing.MultiFormatReader().decode(bitmap)
+        check(decoded.text == articleUrl) { "QR round-trip mismatch: ${decoded.text}" }
     }
 
     @Test
     fun decodePulledQr() {
-        val img = ImageIO.read(File("/tmp/pulled_qr.jpg"))
+        val file = File("/tmp/pulled_qr.jpg")
+        Assumptions.assumeTrue(file.exists(), "manual QR artifact /tmp/pulled_qr.jpg not present")
+        val img = ImageIO.read(file)
         val source = com.google.zxing.client.j2se.BufferedImageLuminanceSource(img)
         val bitmap = com.google.zxing.BinaryBitmap(com.google.zxing.common.HybridBinarizer(source))
         val result = com.google.zxing.MultiFormatReader().decode(bitmap)

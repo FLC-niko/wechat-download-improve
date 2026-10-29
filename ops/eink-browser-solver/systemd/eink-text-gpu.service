@@ -1,0 +1,20 @@
+[Unit]
+Description=Optional E-Ink text fusion worker on GPU0
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/captcha/text-gpu-current/service
+ExecStart=%h/miniconda3/envs/A2DO/bin/python %h/captcha/text-gpu-current/service/text_gpu_service.py
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=TEXT_DEVICE=cuda:0
+Environment=TEXT_GPU_MEMORY_FRACTION=0.10
+Environment=TEXT_GPU_PORT=9997
+Environment=CLIP_THREADS=2
+Environment=SOLVER_TEXT_BUNDLE=%h/captcha/text-gpu-current/bundle
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

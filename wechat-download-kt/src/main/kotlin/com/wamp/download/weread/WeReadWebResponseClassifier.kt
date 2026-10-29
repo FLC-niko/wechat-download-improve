@@ -22,7 +22,8 @@ internal object WeReadWebResponseClassifier {
     fun classify(httpCode: Int, raw: String): WeReadWebResponseClassification {
         val error = parseError(raw)
         val kind = when {
-            httpCode == 401 || error.errCode == -2012 -> WeReadWebResponseKind.AUTH_EXPIRED
+            httpCode == 401 || error.errCode == -2012 || error.errCode == -2010 ->
+                WeReadWebResponseKind.AUTH_EXPIRED
             error.errCode == -2041 -> WeReadWebResponseKind.HUMAN_VERIFY
             httpCode == 429 || error.errCode == -2014 -> WeReadWebResponseKind.RATE_LIMITED
             httpCode in 500..599 -> WeReadWebResponseKind.RETRYABLE_HTTP_ERROR

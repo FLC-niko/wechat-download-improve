@@ -4,6 +4,7 @@ import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.wamp.download.config.AppConfig
+import com.wamp.download.weread.WeReadLinkNormalizer
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.io.IOException
@@ -66,6 +67,14 @@ class WeReadEinkChaptersClient(
     private val retryBaseDelayMs: Long = AppConfig.wereadEinkRetryBaseDelay * 1000L,
     private val waitProvider: (Long) -> Unit = { Thread.sleep(it) },
     private val verificationHeaders: () -> Map<String, String> = WeReadEinkHumanVerification::requestHeaders,
+    private val mobileSyncActivationEnabled: Boolean = AppConfig.wereadEinkMobileSyncActivationEnabled,
+    private val mobileSyncActivationAllowed: (String) -> Boolean = { vid ->
+        val allowlist = AppConfig.wereadEinkMobileSyncActivationVidAllowlist
+        allowlist.isEmpty() || vid in allowlist
+    },
+    private val mobileSyncActivation: (WeReadEinkCredentials) -> Boolean = { _ ->
+        session?.directoryClient(baseUrl)?.activateTerminalSession() ?: false
+    },
 ) {
     fun fetchArticles(
         accountId: String,
@@ -109,12 +118,34 @@ class WeReadEinkChaptersClient(
         requestCredentials: WeReadEinkCredentials,
     ): WeReadEinkArticlesPage {
         var transientFailures = 0
+        var activationAttempted = false
+        var activationSucceeded = false
         while (true) {
             try {
                 return requestGate(requestCredentials.vid) {
                     requestPage(accountId, count, synckey, offset, requestedOffset, requestCredentials)
                 }
             } catch (error: WeReadEinkApiException) {
+                if (error.kind == WeReadEinkResponseKind.HUMAN_VERIFY &&
+                    !activationAttempted &&
+                    mobileSyncActivationEnabled &&
+                    mobileSyncActivationAllowed(requestCredentials.vid)
+                ) {
+                    activationAttempted = true
+                    WeReadEinkTerminalActivationStats.recordAttempt(requestCredentials.vid)
+                    val activated = runCatching {
+                        mobileSyncActivation(requestCredentials)
+                    }.getOrDefault(false)
+                    if (activated) {
+                        activationSucceeded = true
+                        WeReadEinkTerminalActivationStats.recordSuccess(requestCredentials.vid)
+                        continue
+                    }
+                    WeReadEinkTerminalActivationStats.recordFailure(requestCredentials.vid)
+                }
+                if (error.kind == WeReadEinkResponseKind.HUMAN_VERIFY && activationSucceeded) {
+                    WeReadEinkTerminalActivationStats.recordStillHumanVerify(requestCredentials.vid)
+                }
                 val retryable = error.kind == WeReadEinkResponseKind.RATE_LIMITED ||
                     error.kind == WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
                 if (!retryable || transientFailures >= maxTransientRetries) throw error
@@ -350,27 +381,140 @@ class WeReadEinkChaptersClient(
             )
             for (c in urlCandidates) {
                 if (!c.isNullOrBlank() && (c.startsWith("http://") || c.startsWith("https://"))) {
-                    return c
+                    return WeReadLinkNormalizer.normalizeArticleUrl(c)
                 }
             }
-            
+
             val originalId = mpInfo.get("originalId")?.asString?.trim().orEmpty()
-            if (originalId.isNotBlank()) {
-                if (originalId.startsWith("http://") || originalId.startsWith("https://")) {
-                    return originalId
-                }
-                if (originalId.startsWith("/s")) {
-                    return "https://mp.weixin.qq.com$originalId"
-                }
-                if (originalId.contains("__biz=") || originalId.startsWith("?")) {
-                    return "https://mp.weixin.qq.com/s?${originalId.removePrefix("?")}"
-                }
-                return "https://mp.weixin.qq.com/s/$originalId" 
-            }
-            return null
+            return WeReadLinkNormalizer.articleUrlFromOriginalId(originalId)
         } catch (e: Exception) {
             return null
         }
+    }
+
+    fun fetchCover(accountId: String): WeReadEinkArticle? {
+        require(accountId.isNotBlank()) { "accountId must not be blank" }
+        val root = requestJsonWithRetries(
+            path = listOf("mp", "cover"),
+            query = listOf("bookId" to accountId),
+        )
+        val reviewId = stringField(root, "reviewId") ?: stringField(root, "review_id") ?: return null
+        if (reviewId.isBlank()) return null
+        val mpInfo = root.getAsJsonObject("mpInfo")?.let(::parseMpInfo)
+        val title = stringField(root, "title") ?: mpInfo?.title
+        val createTime = longField(root, "createTime") ?: mpInfo?.time
+        val pic = stringField(root, "pic") ?: stringField(root, "avatar") ?: mpInfo?.picUrl
+        val name = stringField(root, "name") ?: mpInfo?.mpName
+        return WeReadEinkArticle(
+            reviewId = reviewId,
+            title = title,
+            createTime = createTime,
+            mpInfo = mpInfo ?: WeReadEinkMpInfo(
+                picUrl = pic,
+                title = title,
+                mpName = name,
+                time = createTime,
+            ),
+        )
+    }
+
+    fun fetchArticleList(accountId: String): List<WeReadEinkArticle> {
+        require(accountId.isNotBlank()) { "accountId must not be blank" }
+        val root = requestJsonWithRetries(
+            path = listOf("article", "list"),
+            query = listOf("bookId" to accountId, "synckey" to "0"),
+        )
+        val elements = root.getAsJsonArray("reviews")
+            ?: root.getAsJsonArray("data")
+            ?: root.getAsJsonObject("data")?.getAsJsonArray("list")
+            ?: return emptyList()
+        return elements.mapNotNull { element ->
+            if (element.isJsonObject) parseArticle(element) else null
+        }
+    }
+
+    private fun requestJsonWithRetries(
+        path: List<String>,
+        query: List<Pair<String, String>>,
+    ): JsonObject {
+        val activeCredentials = session?.credentialsForRequest() ?: credentials
+        return try {
+            requestJsonWithRetries(path, query, activeCredentials)
+        } catch (error: WeReadEinkApiException) {
+            if (error.kind != WeReadEinkResponseKind.AUTH_EXPIRED || session == null) throw error
+            val refreshed = session.refreshIfAccessTokenWas(activeCredentials.accessToken)
+            try {
+                requestJsonWithRetries(path, query, refreshed)
+            } catch (retryError: WeReadEinkApiException) {
+                if (retryError.kind == WeReadEinkResponseKind.AUTH_EXPIRED) {
+                    session.reportAuthenticationFailure(retryError)
+                }
+                throw retryError
+            }
+        }
+    }
+
+    private fun requestJsonWithRetries(
+        path: List<String>,
+        query: List<Pair<String, String>>,
+        requestCredentials: WeReadEinkCredentials,
+    ): JsonObject {
+        var transientFailures = 0
+        while (true) {
+            try {
+                val raw = stringRequestGate(requestCredentials.vid) {
+                    requestJson(path, query, requestCredentials)
+                } ?: throw WeReadEinkParseException("empty response for /${path.joinToString("/")}")
+                return parseObject(raw)
+            } catch (error: WeReadEinkApiException) {
+                val retryable = error.kind == WeReadEinkResponseKind.RATE_LIMITED ||
+                    error.kind == WeReadEinkResponseKind.RETRYABLE_HTTP_ERROR
+                if (!retryable || transientFailures >= maxTransientRetries) throw error
+                val multiplier = 1L shl transientFailures.coerceAtMost(10)
+                waitProvider(retryBaseDelayMs * multiplier + Random.nextLong(0L, 250L))
+                transientFailures++
+            } catch (error: IOException) {
+                if (transientFailures >= maxTransientRetries) throw error
+                val multiplier = 1L shl transientFailures.coerceAtMost(10)
+                waitProvider(retryBaseDelayMs * multiplier + Random.nextLong(0L, 250L))
+                transientFailures++
+            }
+        }
+    }
+
+    private fun requestJson(
+        path: List<String>,
+        query: List<Pair<String, String>>,
+        requestCredentials: WeReadEinkCredentials,
+    ): String {
+        val builder = baseUrl.toHttpUrl().newBuilder()
+        path.forEach { builder.addPathSegment(it) }
+        query.forEach { builder.addQueryParameter(it.first, it.second) }
+        val response = transport.execute(
+            WeReadEinkRequest(
+                method = "GET",
+                url = builder.build(),
+                headers = profile.versionHeaders + profile.authHeaders(requestCredentials) + verificationHeaders(),
+            ),
+        )
+        val classification = WeReadEinkResponseClassifier.classify(response)
+        if (classification.kind != WeReadEinkResponseKind.SUCCESS) {
+            throw WeReadEinkApiException(
+                kind = classification.kind,
+                statusCode = response.statusCode,
+                errCode = classification.errCode,
+                errMsg = classification.errMsg,
+            )
+        }
+        return response.body
+    }
+
+    private fun parseObject(raw: String): JsonObject {
+        val root = runCatching { JsonParser.parseString(raw) }.getOrNull()
+        if (root == null || !root.isJsonObject) {
+            throw WeReadEinkParseException("WeRead returned a non-object body")
+        }
+        return root.asJsonObject
     }
 
     private companion object {

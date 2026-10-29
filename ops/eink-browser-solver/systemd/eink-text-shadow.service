@@ -1,0 +1,22 @@
+[Unit]
+Description=E-Ink gradual text A/B routing with independent local fallback
+After=network-online.target eink-clip-service.service eink-text-candidate.service
+
+[Service]
+Type=simple
+User=topview
+WorkingDirectory=/home/topview/captcha/text-shadow-service
+ExecStart=/usr/bin/python3 /home/topview/captcha/text-shadow-service/text_ab_router.py
+Environment=TEXT_SHADOW_PORT=9995
+Environment=TEXT_PRIMARY_URL=http://127.0.0.1:9993/pick
+Environment=TEXT_CANDIDATE_URL=http://127.0.0.1:9994/pick
+Environment=TEXT_SHADOW_DIR=/home/topview/captcha/text-shadow
+Environment=TEXT_REMOTE_URL=http://127.0.0.1:9996/pick
+Environment=TEXT_AB_CONFIG=/home/topview/captcha/text-ab.json
+Environment=TEXT_AB_EVENTS=/home/topview/captcha/text-ab-events.jsonl
+UMask=0077
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

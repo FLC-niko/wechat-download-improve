@@ -9,6 +9,7 @@ import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import com.wamp.download.config.AppConfig
 import com.wamp.download.store.InboxStore
+import com.wamp.download.weread.WeReadSubscriptionRegistrar
 
 /**
  * RabbitMQ 服务 — 组织四个 vhost 的连接与消费
@@ -159,6 +160,27 @@ class RabbitMqService(
     }
 
     fun snapshot(): Map<String, VhostConnectionState> = supervisor?.snapshot() ?: emptyMap()
+
+    suspend fun reprocessDeadLetters(
+        vhost: String,
+        limit: Int,
+        dryRun: Boolean,
+        registrar: WeReadSubscriptionRegistrar,
+        overrides: DeadLetterAccountOverrides = DeadLetterAccountOverrides.EMPTY,
+    ): DeadLetterReprocessResult {
+        val manager = when (vhost) {
+            "pro" -> proManager
+            "test" -> testManager
+            else -> throw IllegalArgumentException("仅支持 pro/test vhost，实际: $vhost")
+        }
+        return manager.reprocessDeadLetters(limit, dryRun, vhost, overrides) { name ->
+            if (dryRun) {
+                registrar.resolveOnly(name)?.nickname
+            } else {
+                registrar.resolveAndSave(name)?.nickname
+            }
+        }
+    }
 
     fun stop() {
         supervisor?.stop()

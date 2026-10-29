@@ -89,6 +89,15 @@ object SubscriptionStore {
         }
     }
 
+    fun updateProfile(fakeid: String, nickname: String, alias: String, headImg: String) = Database.query {
+        if (nickname.isBlank() && alias.isBlank() && headImg.isBlank()) return@query 0
+        Subscriptions.update({ Subscriptions.fakeid eq fakeid }) {
+            if (nickname.isNotBlank()) it[Subscriptions.nickname] = nickname
+            if (alias.isNotBlank()) it[Subscriptions.alias] = alias
+            if (headImg.isNotBlank()) it[Subscriptions.headImg] = headImg
+        }
+    }
+
     /** 按微信读书 mpId 反查公众号，找不到返回 null */
     fun findByWereadMpId(mpId: String): Subscription? = Database.query {
         Subscriptions.selectAll()

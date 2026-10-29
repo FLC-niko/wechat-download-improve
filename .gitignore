@@ -17,3 +17,9 @@ data/
 
 # 本地机密文档（含明文凭据，禁止提交）
 交接文档.md
+
+__pycache__/
+*.pyc
+
+# Private OCR datasets, model artifacts and remote rollback evidence
+.local/eink-*/

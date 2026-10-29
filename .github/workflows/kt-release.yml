@@ -1,0 +1,111 @@
+name: kt-release
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'wechat-download-kt/src/**'
+      - 'wechat-download-kt/build.gradle.kts'
+      - 'wechat-download-kt/settings.gradle.kts'
+      - 'wechat-download-kt/gradle/**'
+      - 'wechat-download-kt/gradlew'
+      - '.github/workflows/kt-release.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'wechat-download-kt/src/**'
+      - 'wechat-download-kt/build.gradle.kts'
+      - 'wechat-download-kt/settings.gradle.kts'
+      - 'wechat-download-kt/gradle/**'
+      - 'wechat-download-kt/gradlew'
+      - '.github/workflows/kt-release.yml'
+
+concurrency:
+  group: kt-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.pkg.outputs.tag }}
+      sha: ${{ steps.pkg.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Test
+        working-directory: wechat-download-kt
+        run: ./gradlew test --stacktrace
+      - name: Build distribution
+        working-directory: wechat-download-kt
+        run: ./gradlew installDist -x test
+      - name: Package artifact
+        id: pkg
+        run: |
+          set -euo pipefail
+          TAG="kt-${GITHUB_SHA::12}"
+          mkdir -p dist
+          tar -C wechat-download-kt/build/install -czf "dist/${TAG}.tar.gz" wechat-download-kt
+          SHA="$(sha256sum "dist/${TAG}.tar.gz" | cut -d' ' -f1)"
+          echo "${SHA}" > "dist/${TAG}.tar.gz.sha256"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kt-dist
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kt-dist
+          path: dist
+      - name: Install cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb >/dev/null
+          cloudflared --version
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+      - name: Deploy over Cloudflare Tunnel
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          TAG: ${{ needs.build.outputs.tag }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=25 \
+            -o "ProxyCommand=cloudflared access ssh --hostname %h --service-token-id ${CF_ACCESS_CLIENT_ID} --service-token-secret ${CF_ACCESS_CLIENT_SECRET}" \
+            deploy@deploy.989gdut989.dpdns.org "deploy-kt-upload ${TAG} ${SHA}" < "dist/${TAG}.tar.gz"

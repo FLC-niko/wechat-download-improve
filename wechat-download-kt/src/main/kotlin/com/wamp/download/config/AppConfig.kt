@@ -51,6 +51,7 @@ object AppConfig {
     val taskRetryDelayMs: Long get() = getLong("rabbitmq.task_retry_delay_ms", 60_000L)
 
     // 通知配置
+    val wecomEnabled: Boolean get() = getBool("notification.wecom_enabled", true)
     val wecomWebhookUrl: String get() = getString("notification.wecom_webhook_url", "")
     val feishuWebhookUrl: String get() = getString("notification.feishu_webhook_url", "")
     val webhookNotificationInterval: Long get() = getLong("notification.interval", 300L)
@@ -114,6 +115,12 @@ object AppConfig {
         get() = getBool("weread.eink.auto_qr_notification_enabled", true)
     val wereadEinkReloginRetryBackoff: Long
         get() = getLong("weread.eink.relogin_retry_backoff", 300L).coerceAtLeast(30L)
+
+    /** -2041 时先尝试一次移动端会话激活；默认关闭，按账号白名单灰度。 */
+    val wereadEinkMobileSyncActivationEnabled: Boolean
+        get() = getBool("weread.eink.mobile_sync_activation.enabled", false)
+    val wereadEinkMobileSyncActivationVidAllowlist: Set<String>
+        get() = getStringList("weread.eink.mobile_sync_activation.vid_allowlist").toSet()
 
     /**
      * 人工验证页加载的验证码脚本与 appid：默认腾讯官方。
@@ -180,6 +187,8 @@ object AppConfig {
     // ADB 自动恢复设备探查
     val adbPollIntervalMs: Long
         get() = getLong("adb.poll_interval_ms", 15_000L).coerceAtLeast(1_000L)
+    val adbCommandTimeoutMs: Long
+        get() = getLong("adb.command_timeout_ms", 8_000L).coerceAtLeast(1_000L)
     val adbEnabled: Boolean get() = getBool("adb.enabled", false)
     val adbRecoveryMaxDelayMs: Long
         get() = getLong("adb.recovery_max_delay_ms", 15 * 60_000L).coerceAtLeast(adbPollIntervalMs)

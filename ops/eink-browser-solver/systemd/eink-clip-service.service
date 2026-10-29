@@ -9,6 +9,7 @@ WorkingDirectory=/opt/eink-browser-solver
 ExecStart=/opt/crack-tcaptcha/venv/bin/python /opt/eink-browser-solver/clip_service.py
 Environment=CLIP_PORT=9993
 Environment=CLIP_MODEL_DIR=/opt/crack-tcaptcha/models
+EnvironmentFile=-/etc/eink-text.env
 Restart=always
 RestartSec=3
 

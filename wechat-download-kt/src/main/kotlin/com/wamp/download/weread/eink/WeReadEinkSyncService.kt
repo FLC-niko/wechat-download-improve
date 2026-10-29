@@ -7,7 +7,7 @@ import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.store.WeReadEinkSyncStateStore
 import com.wamp.download.config.AppConfig
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import com.wamp.download.weread.WeReadLinkNormalizer
 import org.slf4j.LoggerFactory
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
@@ -197,6 +197,26 @@ class WeReadEinkSyncService(
                 fetchedArticles += page.articles.size
                 nextSynckey = page.synckey ?: nextSynckey
 
+                if (pages == 1 && requestedOffset == null && page.articles.isEmpty() &&
+                    (page.hasMore == 1 || page.nextOffset != null)
+                ) {
+                    val supplemental = runCatching {
+                        client.fetchArticleList(mpId)
+                    }.getOrDefault(emptyList())
+                    val cover = if (supplemental.isEmpty()) {
+                        runCatching { client.fetchCover(mpId) }.getOrNull()?.let(::listOf).orEmpty()
+                    } else {
+                        emptyList()
+                    }
+                    val candidates = supplemental + cover
+                    if (candidates.isNotEmpty()) {
+                        val mapped = candidates.mapNotNull { it.toArticle(fakeid, client) }
+                            .filter { it.publishTime > 0L }
+                        savedArticles += ArticleStore.saveAll(fakeid, mapped, source = "eink-fallback")
+                        fetchedArticles += candidates.size
+                    }
+                }
+
                 val nextOffset = nextOffset(page)
                 val naturalEnd = nextOffset == null
                 if (nextOffset != null && nextOffset <= page.requestedOffset) {
@@ -376,10 +396,21 @@ class WeReadEinkSyncService(
     ): Article? {
         var link = mpInfo?.docUrl
             ?.trim()
-            ?.let { candidate -> candidate.toHttpUrlOrNull()?.toString() }
+            ?.takeIf { it.isNotEmpty() }
+            ?.let(WeReadLinkNormalizer::normalizeArticleUrl)
 
         if (link == null && cachedArticle?.link?.isNotBlank() == true) {
             link = cachedArticle.link
+        }
+
+        if (link == null && !reviewId.isNullOrBlank()) {
+            link = WeReadLinkNormalizer.shortLinkFromReviewId(reviewId)
+        }
+
+        if (link == null) {
+            link = mpInfo?.originalId?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(WeReadLinkNormalizer::articleUrlFromOriginalId)
         }
 
         if (link == null && !reviewId.isNullOrBlank()) {
