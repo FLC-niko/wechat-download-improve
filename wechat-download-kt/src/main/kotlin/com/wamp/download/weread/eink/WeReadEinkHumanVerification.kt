@@ -118,6 +118,11 @@ internal class WeReadEinkHumanVerificationCoordinator(
 
     fun requestHeaders(): Map<String, String> = synchronized(lock) { transientHeaders }
 
+    /** 供 Web 渠道把一次性验证码票据挂到当前线程的请求头上（重放原请求）。 */
+    fun updateHeaders(headers: Map<String, String>) {
+        synchronized(lock) { transientHeaders = headers }
+    }
+
     fun complete(
         vid: String,
         nonce: String,
@@ -309,6 +314,20 @@ object WeReadEinkHumanVerification {
     fun canOpen(vid: String, nonce: String): Boolean = coordinator.canOpen(vid, nonce)
 
     fun findVidByNonce(nonce: String): String? = coordinator.findVidByNonce(nonce)
+
+    /**
+     * 把一次性验证码票据挂到当前线程的请求头上执行 block（Web 端 -2041 用
+     * `x-wr-ticket`/`x-wr-randstr` 重放原请求）。票据只在 block 执行期间可见。
+     */
+    fun <T> withTicket(ticket: String, randstr: String, block: () -> T): T =
+        WeReadEinkRequestGate.asVerificationProbe {
+            coordinator.updateHeaders(mapOf("wr_ticket" to ticket, "wr_randstr" to randstr))
+            try {
+                block()
+            } finally {
+                coordinator.updateHeaders(emptyMap())
+            }
+        }
 
     fun complete(vid: String, nonce: String, ticket: String?, randstr: String?): WeReadEinkVerificationResult {
         val result = coordinator.complete(vid, nonce, ticket, randstr)

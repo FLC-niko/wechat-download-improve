@@ -25,9 +25,13 @@ object WeReadWebHumanVerification {
     }
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
     private val lastAttemptAt = ConcurrentHashMap<String, Long>()
+    private val lastReplayAt = ConcurrentHashMap<String, Long>()
 
     /** 同一次封禁期间最多每 20 分钟尝试一次自动解题，避免把验证码服务打成连续轰炸。 */
     private const val ATTEMPT_COOLDOWN_MS = 20 * 60 * 1000L
+
+    /** 文章请求 -2041 的同步票据重放冷却：2 分钟内最多一次，避免每题都打爆 sidecar。 */
+    private const val REPLAY_COOLDOWN_MS = 2 * 60 * 1000L
 
     fun requestRecovery(vid: String, reason: String): Boolean {
         val account = WeReadAccountPool.get(vid) ?: return false
@@ -102,6 +106,48 @@ object WeReadWebHumanVerification {
     private fun probeWeb(vid: String): Boolean {
         val account = WeReadAccountPool.get(vid) ?: return false
         return WeReadWebClient().probeAccount(account) == WeReadWebResponseKind.SUCCESS
+    }
+
+    /**
+     * -2041 命中时同步解一次验证码，并把票据用于重放**当前失败的文章请求**。
+     *
+     * Web 前端在 -2041 时就是用 `x-wr-ticket`/`x-wr-randstr` 重放原请求；票据
+     * 一次性，若先拿去探活就被消耗掉，文章请求仍会继续 -2041。
+     *
+     * @return null 表示未启用/冷却中/解题失败，调用方按原逻辑标记人工验证。
+     */
+    fun <T> solveAndReplay(vid: String, reason: String, block: () -> T): T? {
+        val account = WeReadAccountPool.get(vid) ?: return null
+        if (!account.hasWebCredentials()) return null
+        val enabled = AppConfig.wereadEinkAutoSolverEnabled
+        val allowlist = AppConfig.wereadEinkAutoSolverVidAllowlist
+        if (!enabled || (allowlist.isNotEmpty() && vid !in allowlist)) return null
+        val now = System.currentTimeMillis()
+        val last = lastReplayAt[vid] ?: 0L
+        if (last > 0L && now - last < REPLAY_COOLDOWN_MS) {
+            logger.info("Web -2041 票据重放冷却中，跳过: vid={}, 距上次 {} 秒", vid, (now - last) / 1000)
+            return null
+        }
+        lastReplayAt[vid] = now
+        val verification = WeReadEinkHumanVerification.createOrReuse(vid, AppConfig.siteUrl)
+        val verifyUrl = verification.verifyUrl ?: return null
+        val solved = try {
+            WeReadEinkCaptchaSolverClient.fromConfig().solve(verifyUrl)
+        } catch (e: Exception) {
+            logger.warn("Web -2041 同步解题异常: vid={}, {}", vid, e.message)
+            return null
+        }
+        val captcha = solved.captcha ?: run {
+            logger.info("Web -2041 同步解题未拿到票据: vid={}, code={}", vid, solved.code)
+            return null
+        }
+        logger.info(
+            "Web -2041 票据重放开始: vid={}, reason={}, attempts={}",
+            vid,
+            reason,
+            solved.attempts ?: 0,
+        )
+        return WeReadEinkHumanVerification.withTicket(captcha.ticket, captcha.randstr) { block() }
     }
 
     private fun notifyManual(vid: String, reason: String) {

@@ -302,54 +302,71 @@ class WeReadWebClient {
             .addQueryParameter("offset", offset.toString())
             .addQueryParameter("count", AppConfig.wereadPageSize.toString())
             .build()
-        val req = authRequest(Request.Builder().url(url), creds).build()
-
-        client.newCall(req).execute().use { resp ->
-            val raw = resp.body?.string().orEmpty()
-            val classification = WeReadWebResponseClassifier.classify(resp.code, raw)
-            when (classification.kind) {
-                WeReadWebResponseKind.AUTH_EXPIRED -> {
-                    logger.warn("微信读书凭证失效 (http=${resp.code}, errCode=${classification.errCode}): vid=${creds.wrVid}")
-                    return AccountPageResult(PageKind.EXPIRED)
+        fun attempt(): AccountPageResult {
+            val req = authRequest(Request.Builder().url(url), creds).build()
+            return client.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val classification = WeReadWebResponseClassifier.classify(resp.code, raw)
+                when (classification.kind) {
+                    WeReadWebResponseKind.AUTH_EXPIRED -> {
+                        logger.warn("微信读书凭证失效 (http=${resp.code}, errCode=${classification.errCode}): vid=${creds.wrVid}")
+                        return AccountPageResult(PageKind.EXPIRED)
+                    }
+                    WeReadWebResponseKind.RATE_LIMITED -> {
+                        logger.warn("微信读书请求频控 (http=${resp.code}): offset=$offset, vid=${creds.wrVid}")
+                        return AccountPageResult(PageKind.RATE_LIMITED)
+                    }
+                    WeReadWebResponseKind.HUMAN_VERIFY -> {
+                        logger.warn("微信读书请求需要人工验证 (errCode=${classification.errCode}): vid=${creds.wrVid}")
+                        return AccountPageResult(PageKind.HUMAN_VERIFY)
+                    }
+                    WeReadWebResponseKind.RETRYABLE_HTTP_ERROR -> {
+                        logger.warn("微信读书临时服务错误: HTTP ${resp.code}, offset=$offset, vid=${creds.wrVid}")
+                        return AccountPageResult(PageKind.RETRYABLE_ERROR)
+                    }
+                    WeReadWebResponseKind.APPLICATION_ERROR -> {
+                        logger.warn(
+                            "微信读书业务错误: HTTP ${resp.code}, errCode=${classification.errCode}, " +
+                                "errMsg=${classification.errMsg}, offset=$offset, vid=${creds.wrVid}",
+                        )
+                        return AccountPageResult(PageKind.ERROR)
+                    }
+                    WeReadWebResponseKind.HTTP_ERROR -> {
+                        logger.warn("微信读书获取文章失败: HTTP ${resp.code}, errCode=${classification.errCode}, offset=$offset, vid=${creds.wrVid}")
+                        return AccountPageResult(PageKind.ERROR)
+                    }
+                    WeReadWebResponseKind.SUCCESS -> Unit
                 }
-                WeReadWebResponseKind.RATE_LIMITED -> {
-                    logger.warn("微信读书请求频控 (http=${resp.code}): offset=$offset, vid=${creds.wrVid}")
-                    return AccountPageResult(PageKind.RATE_LIMITED)
-                }
-                WeReadWebResponseKind.HUMAN_VERIFY -> {
-                    logger.warn("微信读书请求需要人工验证 (errCode=${classification.errCode}): vid=${creds.wrVid}")
-                    return AccountPageResult(PageKind.HUMAN_VERIFY)
-                }
-                WeReadWebResponseKind.RETRYABLE_HTTP_ERROR -> {
-                    logger.warn("微信读书临时服务错误: HTTP ${resp.code}, offset=$offset, vid=${creds.wrVid}")
-                    return AccountPageResult(PageKind.RETRYABLE_ERROR)
-                }
-                WeReadWebResponseKind.APPLICATION_ERROR -> {
-                    logger.warn(
-                        "微信读书业务错误: HTTP ${resp.code}, errCode=${classification.errCode}, " +
-                            "errMsg=${classification.errMsg}, offset=$offset, vid=${creds.wrVid}",
+                val parsed = parseArticleList(raw)
+                if (!parsed.validResponse) {
+                    // A gateway may return HTTP 200 HTML/empty/array content. Treat only a JSON
+                    // object with an unknown schema as a parse failure; malformed content is
+                    // transient and should use the bounded page retry path.
+                    val isJsonObject = runCatching { JsonParser.parseString(raw).isJsonObject }
+                        .getOrDefault(false)
+                    return AccountPageResult(
+                        if (isJsonObject) PageKind.PARSE_ERROR else PageKind.RETRYABLE_ERROR,
                     )
-                    return AccountPageResult(PageKind.ERROR)
                 }
-                WeReadWebResponseKind.HTTP_ERROR -> {
-                    logger.warn("微信读书获取文章失败: HTTP ${resp.code}, errCode=${classification.errCode}, offset=$offset, vid=${creds.wrVid}")
-                    return AccountPageResult(PageKind.ERROR)
-                }
-                WeReadWebResponseKind.SUCCESS -> Unit
+                AccountPageResult(PageKind.SUCCESS, parsed)
             }
-            val parsed = parseArticleList(raw)
-            if (!parsed.validResponse) {
-                // A gateway may return HTTP 200 HTML/empty/array content. Treat only a JSON
-                // object with an unknown schema as a parse failure; malformed content is
-                // transient and should use the bounded page retry path.
-                val isJsonObject = runCatching { JsonParser.parseString(raw).isJsonObject }
-                    .getOrDefault(false)
-                return AccountPageResult(
-                    if (isJsonObject) PageKind.PARSE_ERROR else PageKind.RETRYABLE_ERROR,
-                )
-            }
-            return AccountPageResult(PageKind.SUCCESS, parsed)
         }
+
+        val first = attempt()
+        if (first.kind != PageKind.HUMAN_VERIFY) return first
+        // -2041：同步解一次验证码，把票据用于重放**这次**文章请求。
+        // 票据一次性，不能先拿去探活，否则文章请求仍会继续 -2041。
+        val replayed = WeReadWebHumanVerification.solveAndReplay(
+            account.vid,
+            "Web 采集 -2041",
+        ) { attempt() }
+        if (replayed?.kind == PageKind.SUCCESS) {
+            WeReadAccountPool.clearHumanVerificationRequired(account.vid)
+            WeReadAccountPool.markProbeSuccess(account.vid)
+            logger.info("Web -2041 票据重放成功: vid=${account.vid}, offset=$offset")
+            return replayed
+        }
+        return first
     }
 
     internal fun parseArticleList(raw: String): ArticleParseResult {
