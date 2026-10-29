@@ -46,6 +46,8 @@ object WeReadCookieStore {
         var newSkey = creds.wrSkey
         var newVid = creds.wrVid
         var newRt = creds.wrRt
+        var newQl = creds.wrQl
+        var newPf = creds.wrPf
         var changed = false
 
         for (header in setCookies) {
@@ -58,6 +60,8 @@ object WeReadCookieStore {
                 "wr_skey" -> if (value.isNotEmpty()) { newSkey = value; changed = true }
                 "wr_vid" -> if (value.isNotEmpty()) { newVid = value; changed = true }
                 "wr_rt" -> if (value.isNotEmpty()) { newRt = value; changed = true }
+                "wr_ql" -> if (value.isNotEmpty()) { newQl = value; changed = true }
+                "wr_pf" -> if (value.isNotEmpty()) { newPf = value; changed = true }
             }
         }
 
@@ -69,6 +73,8 @@ object WeReadCookieStore {
                 wrSkey = newSkey,
                 wrVid = newVid,
                 wrRt = newRt,
+                wrQl = newQl,
+                wrPf = newPf,
                 username = username ?: creds.username,
                 lastRefreshTime = System.currentTimeMillis(),
                 refreshFailCount = 0,
@@ -100,12 +106,21 @@ object WeReadCookieStore {
     }
 
     /** 登录成功后设置完整凭证（以 webLoginVid 写入账号池） */
-    fun setLoggedIn(wrSkey: String, wrVid: String, wrRt: String, username: String): Boolean {
+    fun setLoggedIn(
+        wrSkey: String,
+        wrVid: String,
+        wrRt: String,
+        username: String,
+        wrQl: String = "",
+        wrPf: String = "1",
+    ): Boolean {
         return WeReadAccountPool.upsertCredentials(
             WeReadWebCredentials(
                 wrSkey = wrSkey,
                 wrVid = wrVid,
                 wrRt = wrRt,
+                wrQl = wrQl,
+                wrPf = wrPf,
                 username = username,
                 loginTime = Instant.now().toEpochMilli(),
                 lastRefreshTime = Instant.now().toEpochMilli(),

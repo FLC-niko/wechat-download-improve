@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonParser
 import com.google.gson.reflect.TypeToken
 import com.wamp.download.config.AppConfig
+import com.wamp.download.weread.eink.WeReadEinkHumanVerification
 import com.wamp.download.weread.eink.WeReadEinkRuntime
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
@@ -144,7 +145,7 @@ class WeReadWebClient {
     }
 
     private fun authRequest(builder: Request.Builder, creds: WeReadWebCredentials): Request.Builder {
-        return builder
+        builder
             .header("x-vid", creds.wrVid)
             .header("x-skey", creds.wrSkey)
             .header("Cookie", creds.toCookieString())
@@ -157,6 +158,14 @@ class WeReadWebClient {
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Dest", "empty")
             .header("User-Agent", randomUA())
+        // -2041 人工验证票据：E-Ink 用 wr_ticket/wr_randstr，Web 端前端重放时用
+        // x-wr-ticket/x-wr-randstr（见 weread 前端 bundle 的 -2041 处理）。
+        // 票据只在验证探测线程可见且一次性使用。
+        WeReadEinkHumanVerification.requestHeaders().let { headers ->
+            headers["wr_ticket"]?.let { builder.header("x-wr-ticket", it) }
+            headers["wr_randstr"]?.let { builder.header("x-wr-randstr", it) }
+        }
+        return builder
     }
 
     // --- 请求节流（防多任务并发叠加触发风控） ---
@@ -212,7 +221,21 @@ class WeReadWebClient {
                     }
                     PageKind.EXPIRED -> {
                         lastOutcome = PageOutcome.AUTH_EXPIRED
-                        // 新版 Web accessToken 没有 refreshToken，不能用 HEAD 请求伪装续签。
+                        // wr_skey（约 90 分钟）过期时优先用 wr_rt 自动续期，避免每次都退回扫码。
+                        if (WeReadWebAuth.renewSession(account.vid, "Web 采集 401/-2012")) {
+                            val refreshed = WeReadAccountPool.get(account.vid) ?: account
+                            val retried = fetchArticlesForAccount(refreshed, mpId, offset)
+                            if (retried.kind == PageKind.SUCCESS) {
+                                WeReadAccountPool.markSuccess(account.vid)
+                                return WeReadPage(
+                                    articles = retried.parsed.articles,
+                                    accountVid = account.vid,
+                                    outcome = if (retried.parsed.articles.isEmpty()) PageOutcome.NO_MORE_DATA else PageOutcome.DATA,
+                                    nextOffset = retried.parsed.nextOffset,
+                                    endReached = retried.parsed.endReached,
+                                )
+                            }
+                        }
                         WeReadAccountPool.markAuthExpired(account.vid, "凭证失效(401/-2012)")
                         WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
                     }
@@ -225,8 +248,11 @@ class WeReadWebClient {
                         // 凭证并熔断采集，不能再次扫码或自动重试来替代人工验证。
                         logger.warn("微信读书要求人工验证，标记账号并停止自动重试: vid=${account.vid}, mpId=$mpId")
                         WeReadAccountPool.markHumanVerificationRequired(account.vid)
-                        // 账号级风控与 E-Ink 共用：转交浏览器自动验证（Token 恢复后可清除）。
-                        WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 采集 -2041")
+                        // 账号级风控与 E-Ink 共用同一套腾讯验证码；有 Web 凭证时优先走
+                        // Web 探测（x-wr-ticket），否则回退 E-Ink 恢复。
+                        if (!WeReadWebHumanVerification.requestRecovery(account.vid, "Web 采集 -2041")) {
+                            WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 采集 -2041")
+                        }
                         return WeReadPage(emptyList(), account.vid, PageOutcome.HUMAN_VERIFY)
                     }
                     PageKind.RETRYABLE_ERROR -> return WeReadPage(emptyList(), account.vid, PageOutcome.RETRYABLE_ERROR)

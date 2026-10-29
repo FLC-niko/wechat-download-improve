@@ -5,12 +5,17 @@ import com.wamp.download.config.AppConfig
 /**
  * 微信读书官方 Web 端凭证（wr_skey 系列 cookie）
  *
- * 通过 Web 扫码登录获得。新版值实际是 accessToken，接口不返回 refreshToken 或可靠过期日期。
+ * Web 扫码登录会经过 `/web/login/weblogin` + `/web/login/session/init`，后者下发
+ * wr_skey（约 90 分钟）、wr_rt（约 360 天）、wr_ql、wr_pf。wr_rt 是续期令牌：
+ * `/web/login/renewal` 可以在 wr_skey 过期后换发新的 wr_skey，因此 Web 渠道
+ * 不再需要每次都依赖扫码/ADB。
  */
 data class WeReadWebCredentials(
-    val wrSkey: String = "",           // 新版登录中保存 accessToken（字段名为兼容旧存储）
+    val wrSkey: String = "",           // accessToken / wr_skey（约 90 分钟）
     val wrVid: String = "",            // 用户 ID
-    val wrRt: String = "",             // refresh token（session/init 返回）
+    val wrRt: String = "",             // refresh token（session/init 下发，约 360 天）
+    val wrQl: String = "",             // session/init 下发的 wr_ql，续期时作为 ql 参数
+    val wrPf: String = "",             // session/init 下发的 wr_pf
     val username: String = "",         // 显示名（便于识别账号）
     val loginTime: Long = 0L,          // 登录时间戳（毫秒）
     var lastRefreshTime: Long = 0L,    // 最后刷新时间（毫秒），主动刷新时更新
@@ -18,16 +23,19 @@ data class WeReadWebCredentials(
 ) {
     /** 序列化为 Cookie 头（供请求携带） */
     fun toCookieString(): String = buildString {
-        if (wrSkey.isNotEmpty()) append("wr_skey=$wrSkey; ")
         if (wrVid.isNotEmpty()) append("wr_vid=$wrVid; ")
-        if (wrRt.isNotEmpty()) append("wr_rt=$wrRt")
-        if (isEmpty()) append("")
+        if (wrSkey.isNotEmpty()) append("wr_skey=$wrSkey; ")
+        if (wrRt.isNotEmpty()) append("wr_rt=$wrRt; ")
+        if (wrPf.isNotEmpty()) append("wr_pf=$wrPf; ")
+        if (wrQl.isNotEmpty()) append("wr_ql=$wrQl")
     }.trimEnd(' ', ';')
 
-    /** 旧调度兼容字段；新版 Web accessToken 不支持主动续签。 */
-    @Deprecated("Web accessToken has no refresh flow; use E-Ink credentials")
+    /** 是否具备自动续期能力（持有 wr_rt 即可在 wr_skey 过期后换发）。 */
+    fun canRenew(): Boolean = wrVid.isNotBlank() && wrRt.isNotBlank()
+
+    /** 旧调度兼容字段：持有 wr_rt 时按刷新周期主动续期。 */
     fun needRefresh(): Boolean =
-        wrSkey.isNotEmpty() &&
+        canRenew() &&
             (lastRefreshTime <= 0L || System.currentTimeMillis() - lastRefreshTime >= AppConfig.wereadRefreshInterval * 1000)
 
     private fun isEmpty(): Boolean = wrSkey.isEmpty() && wrVid.isEmpty() && wrRt.isEmpty()

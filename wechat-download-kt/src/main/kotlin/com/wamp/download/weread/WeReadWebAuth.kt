@@ -11,10 +11,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -389,10 +392,10 @@ object WeReadWebAuth {
     fun createLogin(): Pair<String, String>? {
         return try {
             val req = Request.Builder()
-                .url("$baseUrl/api/auth/getLoginUid")
+                .url("$baseUrl/web/login/getuid")
                 .header("Referer", "$baseUrl/")
                 .header("User-Agent", UA)
-                .get()
+                .post(EMPTY_JSON.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
@@ -401,7 +404,8 @@ object WeReadWebAuth {
                 }
                 val body = JsonParser.parseString(resp.body?.string().orEmpty()).asJsonObject
                 val uid = body.get("uid")?.asString ?: return null
-                val scanUrl = "$baseUrl/web/confirm?uid=$uid"
+                // pf=1 走桌面确认页；confirm 页会按 pf 决定双重验证码流程。
+                val scanUrl = "$baseUrl/web/confirm?pf=1&uid=$uid"
                 logger.info("微信读书二维码已生成: uid=$uid")
                 uid to scanUrl
             }
@@ -429,13 +433,155 @@ object WeReadWebAuth {
             wrVid = credentials.wrVid,
             wrRt = credentials.wrRt,
             username = credentials.username,
+            wrQl = credentials.wrQl,
+            wrPf = credentials.wrPf,
         )
     }
 
-    /** 轮询扫码结果但不修改全局 Cookie，供指定账号恢复流程使用。 */
+    /**
+     * 轮询扫码结果但不修改全局 Cookie，供指定账号恢复流程使用。
+     *
+     * 优先走老版 `getinfo` + `weblogin`：该路径返回 refreshToken，随后 `session/init`
+     * 下发 wr_rt/wr_ql/wr_pf，使 Web 渠道可在 wr_skey 过期后自动续期。
+     * 老接口不可用时回退新版 getLoginInfo（只有 accessToken，无续期能力）。
+     */
     fun pollLoginCredentials(uid: String, timeoutSeconds: Long = 120): WeReadWebCredentials? {
-        val start = System.currentTimeMillis()
-        val deadline = start + timeoutSeconds * 1000
+        val deadline = System.currentTimeMillis() + timeoutSeconds * 1000
+        pollLoginCredentialsOld(uid, deadline)?.let { return it }
+        if (System.currentTimeMillis() >= deadline) return null
+        return pollLoginCredentialsNew(uid, deadline)
+    }
+
+    private fun pollLoginCredentialsOld(uid: String, deadline: Long): WeReadWebCredentials? {
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val payload = JsonObject().apply { addProperty("uid", uid) }
+                val req = Request.Builder()
+                    .url("$baseUrl/web/login/getinfo")
+                    .header("Referer", "$baseUrl/")
+                    .header("User-Agent", UA)
+                    .header("Origin", baseUrl)
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+                val info = client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val obj = runCatching {
+                        JsonParser.parseString(resp.body?.string().orEmpty()).asJsonObject
+                    }.getOrNull() ?: return@use null
+                    val vid = obj.get("vid")?.asString
+                    val skey = obj.get("skey")?.asString
+                    val code = obj.get("code")?.asString
+                    if (vid.isNullOrEmpty() || skey.isNullOrEmpty() || code.isNullOrEmpty()) return@use null
+                    OldLoginInfo(vid, skey, code, obj.get("otp")?.asString)
+                } ?: continue
+                if (!info.otp.isNullOrBlank()) {
+                    logger.warn("微信读书 Web 登录需要双重验证码(otp)，当前自动化不支持，转人工扫码")
+                    return null
+                }
+                return weblogin(uid, info)
+            } catch (e: Exception) {
+                logger.warn("轮询微信读书扫码状态(旧接口)异常: ${e.message}")
+            }
+            Thread.sleep(2000)
+        }
+        return null
+    }
+
+    private fun weblogin(uid: String, info: OldLoginInfo): WeReadWebCredentials? {
+        return try {
+            val payload = JsonObject().apply {
+                addProperty("vid", info.vid)
+                addProperty("skey", info.skey)
+                addProperty("code", info.code)
+                addProperty("fp", "")
+                addProperty("isAutoLogout", 0)
+                addProperty("uid", uid)
+            }
+            val req = Request.Builder()
+                .url("$baseUrl/web/login/weblogin")
+                .header("Referer", "$baseUrl/")
+                .header("User-Agent", UA)
+                .header("Origin", baseUrl)
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val obj = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull()
+                    ?: return null
+                val accessToken = obj.get("accessToken")?.asString
+                val refreshToken = obj.get("refreshToken")?.asString
+                val vid = obj.get("vid")?.asString ?: info.vid
+                if (accessToken.isNullOrEmpty()) {
+                    logger.warn("微信读书 weblogin 未返回 accessToken: ${raw.take(160)}")
+                    return null
+                }
+                establishSessionCookies(
+                    WeReadWebCredentials(
+                        wrSkey = accessToken,
+                        wrVid = vid,
+                        wrRt = refreshToken.orEmpty(),
+                        wrPf = "1",
+                        wrQl = "0",
+                        username = fetchUsername(vid),
+                        loginTime = System.currentTimeMillis(),
+                        lastRefreshTime = System.currentTimeMillis(),
+                    ),
+                )
+            }
+        } catch (e: Exception) {
+            logger.warn("微信读书 weblogin 异常: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * 用登录结果调用 session/init，拿到完整 cookie（wr_rt/wr_ql/wr_pf）。
+     * 失败时退回登录响应里的 refreshToken（URL 编码后作为 wr_rt cookie 使用）。
+     */
+    private fun establishSessionCookies(input: WeReadWebCredentials): WeReadWebCredentials {
+        return try {
+            val payload = JsonObject().apply {
+                addProperty("vid", input.wrVid)
+                addProperty("skey", input.wrSkey)
+                addProperty("rt", input.wrRt)
+                addProperty("pf", input.wrPf.ifBlank { "1" })
+                addProperty("ql", input.wrQl)
+            }
+            val req = Request.Builder()
+                .url("$baseUrl/web/login/session/init")
+                .header("Cookie", input.toCookieString())
+                .header("Referer", "$baseUrl/")
+                .header("User-Agent", UA)
+                .header("Origin", baseUrl)
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val cookies = resp.headers.values("Set-Cookie")
+                val map = cookies.mapNotNull { header ->
+                    val pair = header.substringBefore(';').trim()
+                    val idx = pair.indexOf('=')
+                    if (idx <= 0) null else pair.substring(0, idx).trim() to pair.substring(idx + 1).trim()
+                }.filter { it.second.isNotEmpty() }.toMap()
+                val merged = input.copy(
+                    wrVid = map["wr_vid"] ?: input.wrVid,
+                    wrSkey = map["wr_skey"] ?: input.wrSkey,
+                    wrRt = map["wr_rt"] ?: urlEncodeCookie(input.wrRt),
+                    wrQl = map["wr_ql"] ?: input.wrQl,
+                    wrPf = map["wr_pf"] ?: input.wrPf,
+                )
+                logger.info(
+                    "微信读书 session/init: vid=${merged.wrVid}, hasRt=${merged.wrRt.isNotEmpty()}, " +
+                        "ql=${merged.wrQl}, pf=${merged.wrPf}",
+                )
+                merged
+            }
+        } catch (e: Exception) {
+            logger.warn("微信读书 session/init 失败（续期能力可能不可用）: ${e.message}")
+            input.copy(wrRt = urlEncodeCookie(input.wrRt))
+        }
+    }
+
+    private fun pollLoginCredentialsNew(uid: String, deadline: Long): WeReadWebCredentials? {
         while (System.currentTimeMillis() < deadline) {
             try {
                 val url = "$baseUrl/api/auth/getLoginInfo".toHttpUrl()
@@ -458,11 +604,13 @@ object WeReadWebAuth {
                         val webLoginVid = obj.get("webLoginVid")?.asString
                         if (!accessToken.isNullOrEmpty() && !webLoginVid.isNullOrEmpty()) {
                             val username = fetchUsername(webLoginVid)
-                            logger.info("微信读书登录成功: username=$username, vid=$webLoginVid")
+                            logger.info("微信读书登录成功(新接口，无 refreshToken): username=$username, vid=$webLoginVid")
                             return WeReadWebCredentials(
                                 wrSkey = accessToken,
                                 wrVid = webLoginVid,
                                 wrRt = "",
+                                wrPf = "1",
+                                wrQl = "0",
                                 username = username,
                                 loginTime = System.currentTimeMillis(),
                                 lastRefreshTime = System.currentTimeMillis(),
@@ -472,11 +620,8 @@ object WeReadWebAuth {
                         val logicCode = obj.get("logicCode")?.asString ?: ""
                         when (logicCode) {
                             "LOGIN_TIMEOUT" -> {
-                                // 单次 getLoginInfo 长轮询约 60s；AAOS 侧拉起微信、扫码并等
-                                // WebView 渲染经常需要更久。只要总 deadline 未到就继续下一轮，
-                                // 不要在第一轮 60s 边界就放弃（否则扫码稍慢就整体失败）。
                                 if (System.currentTimeMillis() + 1_000L < deadline) {
-                                    logger.info("微信读书本轮长轮询超时，继续等待扫码确认（剩余 ${(deadline - System.currentTimeMillis()) / 1000}s）")
+                                    logger.info("微信读书本轮长轮询超时，继续等待扫码确认")
                                 } else {
                                     logger.warn("微信读书扫码等待超时")
                                     return null
@@ -491,13 +636,82 @@ object WeReadWebAuth {
                     }
                 }
             } catch (e: Exception) {
-                logger.warn("轮询微信读书扫码状态异常: ${e.message}")
+                logger.warn("轮询微信读书扫码状态(新接口)异常: ${e.message}")
             }
             Thread.sleep(2000)
         }
         logger.warn("微信读书扫码等待超时")
         return null
     }
+
+    private data class OldLoginInfo(val vid: String, val skey: String, val code: String, val otp: String?)
+
+    private fun urlEncodeCookie(value: String): String =
+        if (value.isEmpty()) "" else URLEncoder.encode(value, "UTF-8").replace("+", "%20").replace("%7E", "~")
+
+    /**
+     * 用 wr_rt 换发新的 wr_skey（浏览器端在 -2012/-2014 时调用同一接口）。
+     * 成功后把 Set-Cookie 合并回账号池；失败返回 false，由调用方决定是否转扫码。
+     */
+    fun renewSession(vid: String, reason: String = "renewal"): Boolean {
+        val account = WeReadAccountPool.get(vid) ?: return false
+        val creds = account.credentials
+        if (!creds.canRenew()) {
+            logger.info("微信读书 Web 账号无 wr_rt，无法自动续期: vid=$vid, reason=$reason")
+            return false
+        }
+        return try {
+            val payload = JsonObject().apply {
+                addProperty("rq", encodeJsUrl("$baseUrl/web/shelf"))
+                addProperty("ql", creds.wrQl == "1")
+            }
+            val req = Request.Builder()
+                .url("$baseUrl/web/login/renewal")
+                .header("Cookie", creds.toCookieString())
+                .header("Referer", "$baseUrl/")
+                .header("User-Agent", UA)
+                .header("Origin", baseUrl)
+                .header("Accept", "application/json, text/plain, */*")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                val obj = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull()
+                val ok = obj?.get("succ")?.asInt == 1 || obj?.get("success")?.asInt == 1
+                val cookies = resp.headers.values("Set-Cookie")
+                val updated = WeReadAccountPool.updateFromSetCookie(vid, cookies)
+                if (ok || updated) {
+                    logger.info("微信读书 Web 续期成功: vid=$vid, reason=$reason, cookies=${cookies.size}")
+                    // 续期成功即视为凭证可用：清掉 EXPIRED，让账号立刻回到调度池；
+                    // 若仍处于 -2041，下一次探测会重新标记 HUMAN_VERIFY_REQUIRED。
+                    if (WeReadAccountPool.get(vid)?.status == AccountStatus.EXPIRED) {
+                        WeReadAccountPool.setEnabled(vid, true)
+                    }
+                    true
+                } else {
+                    WeReadAccountPool.markRefreshFailed(vid)
+                    logger.warn(
+                        "微信读书 Web 续期失败: vid=$vid, reason=$reason, http=${resp.code}, " +
+                            "body=${raw.take(120)}",
+                    )
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            WeReadAccountPool.markRefreshFailed(vid)
+            logger.warn("微信读书 Web 续期异常: vid=$vid, reason=$reason, ${e.message}")
+            false
+        }
+    }
+
+    private fun encodeJsUrl(value: String): String =
+        URLEncoder.encode(value, "UTF-8")
+            .replace("+", "%20")
+            .replace("%7E", "~")
+            .replace("%21", "!")
+            .replace("%27", "'")
+            .replace("%28", "(")
+            .replace("%29", ")")
 
     /**
      * 获取用户昵称（登录成功后调用）
@@ -584,15 +798,17 @@ object WeReadWebAuth {
     }
 
     /**
-     * 新版 Web 登录只返回 accessToken，没有 refreshToken；HEAD / 只能探活，不能续签。
-     * 保留该方法作为旧调用方兼容入口，但不再发起会被误判为续签的网络请求。
+     * 主动续期：用 wr_rt 换发新的 wr_skey。只有旧版单账号凭证（无 wr_rt）才回退到
+     * 原来的"只探活、不续签"行为。
      */
-    @Deprecated("Web accessToken cannot be renewed; use E-Ink refreshToken flow")
     fun proactiveRefresh(vid: String): Boolean {
         val account = WeReadAccountPool.get(vid) ?: return false
         if (!account.hasWebCredentials()) return false
+        if (account.credentials.canRenew()) {
+            return renewSession(vid, "proactive")
+        }
         WeReadAccountPool.markRefreshFailed(vid)
-        logger.warn("Web accessToken 不支持自动续签，跳过 HEAD 伪刷新并等待重新扫码或 E-Ink 通道: vid=$vid")
+        logger.warn("微信读书 Web 凭证缺少 wr_rt，无法自动续期，等待重新扫码或 E-Ink 通道: vid=$vid")
         return false
     }
 
@@ -707,4 +923,6 @@ object WeReadWebAuth {
 
     private const val UA =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+    private const val EMPTY_JSON = "{}"
 }

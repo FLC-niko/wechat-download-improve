@@ -1,6 +1,8 @@
 package com.wamp.download.weread.eink
 
 import com.wamp.download.config.AppConfig
+import com.wamp.download.weread.AccountStatus
+import com.wamp.download.weread.WeReadAccountPool
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -104,7 +106,7 @@ fun Route.weReadEinkVerificationRoutes() {
 
     // 兼容旧版不带 vid 的续期入口：定位到需要验证的账号（否则主账号）。
     get("/weread/eink/verify/refresh") {
-        val vid = WeReadEinkRuntime.verificationTargetVid()
+        val vid = verificationTargetVid()
         if (vid == null) {
             call.respondText(
                 einkVerificationNoticeHtml(
@@ -122,10 +124,11 @@ fun Route.weReadEinkVerificationRoutes() {
     post("/api/weread/eink/verify/start") {
         val requested = call.request.queryParameters["vid"]?.takeIf { it.isNotBlank() }
         val vid = when {
-            requested != null && WeReadEinkRuntime.hasAccount(requested) -> requested
-            else -> WeReadEinkRuntime.verificationTargetVid()
+            requested != null &&
+                (WeReadEinkRuntime.hasAccount(requested) || WeReadAccountPool.get(requested) != null) -> requested
+            else -> verificationTargetVid()
         }
-        if (vid == null || !WeReadEinkRuntime.requiresHumanVerification(vid)) {
+        if (vid == null || !(WeReadEinkRuntime.requiresHumanVerification(vid) || webNeedsVerification(vid))) {
             call.respond(
                 HttpStatusCode.Conflict,
                 mapOf(
@@ -172,7 +175,7 @@ private suspend fun completeVerification(call: ApplicationCall, vid: String, non
 private suspend fun respondVerificationRefresh(call: ApplicationCall, vid: String) {
     call.response.header(HttpHeaders.CacheControl, "no-store, max-age=0")
     val refreshPath = refreshPathForVid(vid)
-    if (vid.isBlank() || !WeReadEinkRuntime.hasAccount(vid)) {
+    if (vid.isBlank() || (!WeReadEinkRuntime.hasAccount(vid) && WeReadAccountPool.get(vid) == null)) {
         call.respondText(
             einkVerificationNoticeHtml(
                 message = "该 E-Ink 账号不存在或已移除。",
@@ -231,6 +234,20 @@ private fun applyVerificationPageHeaders(call: ApplicationCall, captchaScriptUrl
         "default-src 'self' https:; $scriptSrc; $connectSrc; " +
             "style-src 'self' 'unsafe-inline'; frame-src https:; img-src 'self' data: https:",
     )
+}
+
+/** Web 账号（weread.qq.com）是否处于待人工验证状态。 */
+private fun webNeedsVerification(vid: String): Boolean {
+    val account = WeReadAccountPool.get(vid) ?: return false
+    return account.hasWebCredentials() && account.status == AccountStatus.HUMAN_VERIFY_REQUIRED
+}
+
+/** 验证目标：优先 Web 待验证账号，其次沿用 E-Ink 的定位逻辑。 */
+internal fun verificationTargetVid(): String? {
+    WeReadAccountPool.list()
+        .firstOrNull { it.status == AccountStatus.HUMAN_VERIFY_REQUIRED && it.hasWebCredentials() }
+        ?.let { return it.vid }
+    return WeReadEinkRuntime.verificationTargetVid()
 }
 
 internal fun refreshPathForVid(vid: String): String =

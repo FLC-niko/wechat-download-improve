@@ -233,7 +233,7 @@ object WeReadAccountPool {
             if (value.isEmpty()) return@mapNotNull null
             name to value
         }.toMap()
-        if (parsed.keys.none { it == "wr_skey" || it == "wr_vid" || it == "wr_rt" }) return false
+        if (parsed.keys.none { it == "wr_skey" || it == "wr_vid" || it == "wr_rt" || it == "wr_ql" || it == "wr_pf" }) return false
 
         return mutateIf(vid) { account ->
             val creds = account.credentials
@@ -242,6 +242,8 @@ object WeReadAccountPool {
                 wrSkey = parsed["wr_skey"] ?: creds.wrSkey,
                 wrVid = parsed["wr_vid"] ?: creds.wrVid,
                 wrRt = parsed["wr_rt"] ?: creds.wrRt,
+                wrQl = parsed["wr_ql"] ?: creds.wrQl,
+                wrPf = parsed["wr_pf"] ?: creds.wrPf,
                 username = username ?: creds.username,
                 lastRefreshTime = System.currentTimeMillis(),
                 refreshFailCount = 0,

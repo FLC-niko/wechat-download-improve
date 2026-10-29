@@ -151,6 +151,19 @@ fun main() {
                 kotlinx.coroutines.delay(AppConfig.wereadEinkHealthCheckInterval * 1000L)
             }
         }
+        // 人工验证恢复不受“实时任务让路”闸门限制：后台探测可能被持续任务饿死，
+        // 导致账号卡在 HUMAN_VERIFY 数小时不尝试解题。内部仍遵守 in-flight 与尝试冷却。
+        scope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(60_000)
+            while (isActive) {
+                try {
+                    WeReadEinkRuntime.recoverPendingHumanVerify()
+                } catch (e: Exception) {
+                    logger.warn("E-Ink 人工验证恢复调度异常: ${e.message}")
+                }
+                kotlinx.coroutines.delay(5 * 60 * 1000L)
+            }
+        }
         scope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(10_000)
             while (isActive) {
@@ -387,6 +400,21 @@ fun main() {
                     "result" to result.name,
                     "message" to com.wamp.download.weread.CredentialHealthChecker.recoveryMessage(result),
                 ))
+            }
+            // 手动触发 Web 会话续期（wr_rt → 新 wr_skey），用于验证/运维自愈能力。
+            post("/api/weread/account/renew") {
+                val vid = call.request.queryParameters["vid"]
+                    ?.takeIf { it.isNotBlank() }
+                    ?: runCatching { call.receive<Map<String, String>>()["vid"] }.getOrNull().orEmpty()
+                if (vid.isBlank()) {
+                    call.respond(
+                        io.ktor.http.HttpStatusCode.BadRequest,
+                        mapOf("ok" to false, "error" to "vid required"),
+                    )
+                    return@post
+                }
+                val ok = com.wamp.download.weread.WeReadWebAuth.renewSession(vid, "manual")
+                call.respond(mapOf("ok" to ok, "vid" to vid))
             }
             // Web 登录刷新页：展示当前有效二维码（有效期内复用），附一键续期按钮。
             get("/weread/web/login/refresh") {

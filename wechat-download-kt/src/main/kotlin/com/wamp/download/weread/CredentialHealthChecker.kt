@@ -65,7 +65,7 @@ object CredentialHealthChecker {
         }
     }
 
-    /** Web 渠道：探测 ACTIVE 账号，并恢复持久化的 EXPIRED / 等待人工验证账号。 */
+    /** Web 渠道：先尝试用 wr_rt 续期，再探测；续期失败才走扫码恢复。 */
     suspend fun checkWebAccounts() {
         val accounts = WeReadAccountPool.list().filter {
             it.status in setOf(
@@ -80,11 +80,12 @@ object CredentialHealthChecker {
         }
 
         val expired = mutableListOf<Pair<String, WeReadWebAuth.ReloginRequestResult>>()
-        for (account in accounts) {
+        for (initial in accounts) {
+            var account = initial
             if (account.status == AccountStatus.HUMAN_VERIFY_REQUIRED) {
                 // 等待人工验证：先做一次轻量探测；风控已解除则直接恢复，
                 // 仍返回 -2041 才转交浏览器自动验证（内部有尝试冷却）。
-                when (webClient.probeAccount(account)) {
+                when (probeWithRenewal(account, "健康检查 人工验证")) {
                     WeReadWebResponseKind.SUCCESS -> {
                         WeReadAccountPool.clearHumanVerificationRequired(account.vid)
                         WeReadAccountPool.markProbeSuccess(account.vid)
@@ -95,17 +96,35 @@ object CredentialHealthChecker {
                         expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
                     }
                     WeReadWebResponseKind.HUMAN_VERIFY -> {
-                        WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 账号等待人工验证")
+                        WeReadWebHumanVerification.requestRecovery(account.vid, "Web 账号等待人工验证")
                     }
                     else -> Unit
                 }
                 continue
             }
+
             if (account.status == AccountStatus.EXPIRED) {
-                expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
-                continue
+                // wr_rt 有效时先自愈，不依赖手机扫码。
+                val renewed = account.credentials.canRenew() &&
+                    WeReadWebAuth.renewSession(account.vid, "健康检查 已过期")
+                if (!renewed) {
+                    expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
+                    continue
+                }
+                WeReadAccountPool.setEnabled(account.vid, true)
+                account = WeReadAccountPool.get(account.vid) ?: account
             }
-            when (webClient.probeAccount(account)) {
+
+            // wr_skey 只有约 90 分钟；按 weread.refresh_interval（默认 50 分钟）主动换发，
+            // 心跳间隔 5 分钟，不会等到 401 才处理。
+            if (account.status == AccountStatus.ACTIVE && account.credentials.needRefresh()) {
+                if (WeReadWebAuth.renewSession(account.vid, "健康检查 主动续期")) {
+                    account = WeReadAccountPool.get(account.vid) ?: account
+                    logger.info("凭证检测: Web 账号已主动续期: vid=${account.vid}")
+                }
+            }
+
+            when (probeWithRenewal(account, "健康检查 探测 401/-2012")) {
                 WeReadWebResponseKind.AUTH_EXPIRED -> {
                     WeReadAccountPool.markAuthExpired(account.vid, "凭证检测:凭证失效(401/-2012)")
                     expired += account.vid to WeReadWebAuth.requestReloginIfNeeded(account.vid, force = true)
@@ -116,7 +135,7 @@ object CredentialHealthChecker {
                 }
                 WeReadWebResponseKind.HUMAN_VERIFY -> {
                     WeReadAccountPool.markHumanVerificationRequired(account.vid)
-                    WeReadEinkRuntime.requestHumanVerificationRecovery(account.vid, "Web 探测 -2041")
+                    WeReadWebHumanVerification.requestRecovery(account.vid, "Web 探测 -2041")
                 }
                 else -> Unit  // 存活 / 频控 / 网络异常均不动作
             }
@@ -157,6 +176,16 @@ object CredentialHealthChecker {
         } else {
             logger.info("凭证检测: 微信读书 Web 账号全部存活（${accounts.size} 个）")
         }
+    }
+
+    /** 探测；遇到 401/-2012 时先尝试 wr_rt 续期，再探测一次。 */
+    private fun probeWithRenewal(account: WeReadAccount, reason: String): WeReadWebResponseKind {
+        val first = webClient.probeAccount(account)
+        if (first != WeReadWebResponseKind.AUTH_EXPIRED) return first
+        if (!account.credentials.canRenew()) return first
+        if (!WeReadWebAuth.renewSession(account.vid, reason)) return first
+        val refreshed = WeReadAccountPool.get(account.vid) ?: account
+        return webClient.probeAccount(refreshed)
     }
 
     internal fun recoveryMessage(result: WeReadWebAuth.ReloginRequestResult): String = when (result) {

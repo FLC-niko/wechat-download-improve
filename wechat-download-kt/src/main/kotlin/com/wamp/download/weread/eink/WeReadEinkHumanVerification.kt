@@ -47,6 +47,8 @@ internal class WeReadEinkHumanVerificationCoordinator(
     private val clock: () -> Long = System::currentTimeMillis,
     private val nonceGenerator: () -> String = ::secureNonce,
     private val probe: (String) -> Boolean,
+    private val probeRetries: Int = 0,
+    private val probeRetryDelayMs: Long = 15_000L,
 ) {
     private class Challenge(
         val vid: String,
@@ -153,13 +155,31 @@ internal class WeReadEinkHumanVerificationCoordinator(
                     val current = challenges[vid]
                     if (current?.evaluationId == verificationSessionId &&
                         current.state == WeReadEinkVerificationState.VERIFYING) {
-                        transientHeaders = mapOf("wr_ticket" to ticket!!, "wr_randstr" to randstr!!)
+                        transientHeaders = mapOf(
+                            "wr_ticket" to ticket!!,
+                            "wr_randstr" to randstr!!,
+                        )
                         true
                     } else false
                 }
                 if (activeSession) {
                     try {
-                        probe(vid)
+                        // 票据通过后账号状态有传播延迟：第一次带票据探测，之后无票据重试。
+                        // 手动页面与自动解题保持一致，避免"做对了还让用户再做一题"。
+                        var ok = probe(vid)
+                        if (!ok) {
+                            synchronized(lock) { transientHeaders = emptyMap() }
+                            repeat(probeRetries.coerceAtLeast(0)) {
+                                if (!ok) {
+                                    try { Thread.sleep(probeRetryDelayMs.coerceAtLeast(0L)) } catch (_: InterruptedException) {
+                                        Thread.currentThread().interrupt()
+                                        return@synchronized false
+                                    }
+                                    ok = try { probe(vid) } catch (_: Exception) { false }
+                                }
+                            }
+                        }
+                        ok
                     } finally {
                         synchronized(lock) { transientHeaders = emptyMap() }
                     }
@@ -249,9 +269,22 @@ internal class WeReadEinkHumanVerificationCoordinator(
 }
 
 object WeReadEinkHumanVerification {
+    private val manualProbeRetries =
+        System.getProperty("eink.verify.probeRetries")?.toIntOrNull() ?: 2
     private val coordinator = WeReadEinkHumanVerificationCoordinator(
+        probeRetries = manualProbeRetries,
         probe = { vid ->
-            WeReadEinkRequestGate.asVerificationProbe { WeReadEinkRuntime.probeAccount(vid) }
+            // 同一套验证码票据同时服务 Web（weread.qq.com）与 E-Ink（i.weread.qq.com）：
+            // 有 Web 凭证的账号优先用 Web 探测，否则走 E-Ink。
+            val webAccount = com.wamp.download.weread.WeReadAccountPool.get(vid)
+            WeReadEinkRequestGate.asVerificationProbe {
+                if (webAccount != null && webAccount.hasWebCredentials()) {
+                    com.wamp.download.weread.WeReadWebClient()
+                        .probeAccount(webAccount) == com.wamp.download.weread.WeReadWebResponseKind.SUCCESS
+                } else {
+                    WeReadEinkRuntime.probeAccount(vid)
+                }
+            }
         },
     )
 
@@ -279,6 +312,12 @@ object WeReadEinkHumanVerification {
 
     fun complete(vid: String, nonce: String, ticket: String?, randstr: String?): WeReadEinkVerificationResult {
         val result = coordinator.complete(vid, nonce, ticket, randstr)
+        if (result.ok && result.code == "RECOVERED") {
+            val webAccount = com.wamp.download.weread.WeReadAccountPool.get(vid)
+            if (webAccount != null && webAccount.hasWebCredentials()) {
+                com.wamp.download.weread.WeReadAccountPool.clearHumanVerificationRequired(vid)
+            }
+        }
         if (result.code != "PROBE_FAILED") return result
         val replacement = coordinator.createOrReuse(vid, AppConfig.siteUrl)
         WeReadEinkRuntime.allowHumanVerificationNotificationRetry(vid)
