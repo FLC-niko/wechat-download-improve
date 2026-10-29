@@ -265,6 +265,20 @@ object WeReadEinkRuntime {
     /** 任务路径的选号入口：返回 least_used 可用账号的 service；全部熔断时返回 null。 */
     fun syncService(): WeReadEinkSyncService? = selectForTask()?.service
 
+    /** 后台补缓存单独选号：验证窗口、恢复温和期与启动静默期均不发起后台请求。 */
+    fun backgroundSyncService(): WeReadEinkSyncService? = synchronized(runtimeLock) {
+        pickLeastUsedAccount(::scheduledSyncSuppressed) { WeReadEinkRequestGate.canRunBackgroundRequests(it) }?.also {
+            it.lastUsedAt = System.currentTimeMillis()
+            lastSelectedVid = it.vid
+        }?.service
+    }
+
+    fun canContinueBackgroundSync(service: WeReadEinkSyncService): Boolean = synchronized(runtimeLock) {
+        accounts.values.firstOrNull { it.service === service }?.let {
+            !scheduledSyncSuppressed(it.authState) && WeReadEinkRequestGate.canRunBackgroundRequests(it.vid)
+        } ?: false
+    }
+
     /** 兼容访问：主账号 session（健康检查等旧调用点使用）。 */
     fun session(): WeReadEinkSession? = synchronized(runtimeLock) { primaryAccount()?.session }
 
@@ -695,7 +709,7 @@ object WeReadEinkRuntime {
         // observing recovery after the user completes verification in the official client.
         if (!backgroundWorkAllowed()) return false
         val account = synchronized(runtimeLock) {
-            pickLeastUsedAccount(::scheduledSyncSuppressed)?.also {
+            pickLeastUsedAccount(::scheduledSyncSuppressed) { WeReadEinkRequestGate.canRunBackgroundRequests(it) }?.also {
                 it.lastUsedAt = System.currentTimeMillis()
                 lastSelectedVid = it.vid
             }
@@ -716,7 +730,7 @@ object WeReadEinkRuntime {
             it.lastScheduledSyncTarget = target.fakeid
         }
         return try {
-            service.sync(target, backgroundWorkAllowed)
+            service.sync(target) { backgroundWorkAllowed() && canContinueBackgroundSync(service) }
             account.scheduledSyncSuccessCount.incrementAndGet()
             val previousState = account.authState
             val updated = updateAccount(account.vid) {
@@ -734,7 +748,7 @@ object WeReadEinkRuntime {
             updated
         } catch (_: WeReadEinkBackgroundYieldException) {
             updateAccount(account.vid) { it.lastScheduledSyncResult = "YIELDED_TO_REALTIME_TASK" }
-            logger.info("E-Ink 后台增量同步已让出给实时任务: vid=${account.vid}")
+            logger.info("E-Ink 后台增量同步因调度条件变化暂停: vid=${account.vid}")
             false
         } catch (error: Exception) {
             account.scheduledSyncFailureCount.incrementAndGet()
@@ -1041,13 +1055,14 @@ object WeReadEinkRuntime {
     /**
      * 调度选号核心（纯函数，便于单测）：过滤熔断账号后取 least_used；
      * lastUsedAt 相同时按 vid 升序保证确定性。任务路径与后台同步共用，
-     * 差异只在传入的熔断判定（taskSyncSuppressed / scheduledSyncSuppressed）。
+     * 差异由熔断判定与 eligible（后台静默期）共同控制。
      */
     internal fun leastUsedEinkAccount(
         candidates: List<WeReadEinkAccountCandidate>,
         suppressed: (String) -> Boolean,
+        eligible: (String) -> Boolean = { true },
     ): WeReadEinkAccountCandidate? = candidates
-        .filter { !suppressed(it.authState) }
+        .filter { !suppressed(it.authState) && eligible(it.vid) }
         .minWithOrNull(compareBy<WeReadEinkAccountCandidate> { it.lastUsedAt }.thenBy { it.vid })
 
     fun status(now: Long = System.currentTimeMillis()): Map<String, Any?> {
@@ -1130,6 +1145,8 @@ object WeReadEinkRuntime {
             "device_model" to account.record.deviceModel,
             "auth_state" to account.authState,
             "operational" to (account.authState == "HEALTHY"),
+            "background_sync_allowed" to (!scheduledSyncSuppressed(account.authState) &&
+                WeReadEinkRequestGate.canRunBackgroundRequests(account.vid, now)),
             "task_sync_suppressed" to taskSyncSuppressed(account.authState),
             "last_used_at" to account.lastUsedAt.takeIf { it > 0L },
             "last_probe_at" to account.lastProbeAt.takeIf { it > 0L },
@@ -1164,10 +1181,14 @@ object WeReadEinkRuntime {
     }
 
     /** 在 accounts 视图上执行选号；调用方必须已持有 runtimeLock。 */
-    private fun pickLeastUsedAccount(suppressed: (String) -> Boolean): AccountRuntime? =
+    private fun pickLeastUsedAccount(
+        suppressed: (String) -> Boolean,
+        eligible: (String) -> Boolean = { true },
+    ): AccountRuntime? =
         leastUsedEinkAccount(
             accounts.values.map { WeReadEinkAccountCandidate(it.vid, it.lastUsedAt, it.authState) },
             suppressed,
+            eligible,
         )?.let { pick -> accounts[pick.vid] }
 
     /** 通过 service 实例精确定位账号；缺失时回退最近选号或主账号。 */

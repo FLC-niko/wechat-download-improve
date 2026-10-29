@@ -1,5 +1,6 @@
 package com.wamp.download.weread.eink
 
+import com.wamp.download.task.IdleHistoryPoller
 import com.wamp.download.store.ArticleStore
 import com.wamp.download.store.Database
 import com.wamp.download.store.PublicAccountCollectionCheckpointStore
@@ -14,6 +15,23 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class WeReadEinkSyncCoverageTest {
+    @Test
+    fun `idle poller respects completed eink sync even when generic lastPoll is stale`() {
+        withTemporaryDatabase {
+            val sub = subscription("idle-dedup")
+            val service = serviceWith("""{"data":[],"synckey":9,"hasMore":0}""")
+            val now = System.currentTimeMillis() / 1000L
+            val interval = com.wamp.download.config.AppConfig.wereadEinkSyncInterval
+            assertTrue(now - sub.lastPoll > 43200L)
+            assertEquals(listOf(sub), IdleHistoryPoller.dueSubscriptions(listOf(sub), service, now))
+            service.sync(sub)
+            val state = checkNotNull(WeReadEinkSyncStateStore.get("vid-coverage", sub.wereadMpId))
+            assertTrue(IdleHistoryPoller.dueSubscriptions(listOf(sub), service, state.lastSuccessAt).isEmpty())
+            assertTrue(IdleHistoryPoller.dueSubscriptions(listOf(sub), service, state.lastSuccessAt + interval - 1).isEmpty())
+            assertEquals(listOf(sub), IdleHistoryPoller.dueSubscriptions(listOf(sub), service, state.lastSuccessAt + interval))
+        }
+    }
+
     @Test
     fun `全部文章映射失败时不推进游标也不声明缓存覆盖`() {
         withTemporaryDatabase {
