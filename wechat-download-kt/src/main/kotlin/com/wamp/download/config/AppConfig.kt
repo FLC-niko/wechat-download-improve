@@ -78,6 +78,8 @@ object AppConfig {
         get() = getInt("weread.eink.page_size", 50).coerceIn(1, 100)
     val wereadEinkMaxPages: Int
         get() = getInt("weread.eink.max_pages", 1000).coerceAtLeast(1)
+    val wereadEinkTargetedMaxPages: Int
+        get() = getInt("weread.eink.targeted_max_pages", 20).coerceAtLeast(1)
     val wereadEinkRefreshCheckInterval: Long
         get() = getLong("weread.eink.refresh_check_interval", 60L).coerceAtLeast(10L)
     val wereadEinkHealthCheckInterval: Long
@@ -183,7 +185,6 @@ object AppConfig {
     // 空页重试
     val wereadEmptyRetryMax: Int get() = getInt("weread.empty_retry_max", 3)
     val wereadEmptyRetryBackoff: Long get() = getLong("weread.empty_retry_backoff", 15L)
-
     // ADB 自动恢复设备探查
     val adbPollIntervalMs: Long
         get() = getLong("adb.poll_interval_ms", 15_000L).coerceAtLeast(1_000L)

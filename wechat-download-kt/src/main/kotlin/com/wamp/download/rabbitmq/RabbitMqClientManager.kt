@@ -11,6 +11,9 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** Marker for durable progress continuations that must not consume the finite failure retry budget. */
+interface RabbitQueueDeferred
+
 /**
  * RabbitMQ 客户端管理器 — 参照 Worker 的 RabbitMqClientManager 实现
  *
@@ -479,9 +482,14 @@ class RabbitMqClientManager(
     }
 
     private fun shouldRequeue(ctx: DeliveryContext): Boolean {
-        val retry = ctx.retryCount
-        return retry < MAX_TASK_RETRY
+        return shouldRequeue(ctx.retryCount, deferred = false)
     }
+
+    internal fun shouldRequeue(retryCount: Int, deferred: Boolean): Boolean =
+        deferred || retryCount < MAX_TASK_RETRY
+
+    internal fun nextRetryCount(retryCount: Int, deferred: Boolean): Int =
+        if (deferred) retryCount else retryCount + 1
 
     private suspend fun acknowledge(ch: Channel, ctx: DeliveryContext) {
         channelOperationMutex.withLock {
@@ -527,7 +535,9 @@ class RabbitMqClientManager(
     /** 将失败消息重新发布并增加重试次数；超过上限后可靠转入死信队列。 */
     private suspend fun retryOrDeadLetter(ch: Channel, ctx: DeliveryContext, error: Exception) {
         try {
-            if (shouldRequeue(ctx) && TASK_RETRY_DELAY_MS > 0) {
+            val deferred = error is RabbitQueueDeferred
+            val willRequeue = shouldRequeue(ctx.retryCount, deferred)
+            if (willRequeue && TASK_RETRY_DELAY_MS > 0) {
                 delay(TASK_RETRY_DELAY_MS)
             }
             channelOperationMutex.withLock {
@@ -537,10 +547,10 @@ class RabbitMqClientManager(
                 }
 
                 val headers = ctx.headers.toMutableMap()
-                val nextRetry = ctx.retryCount + 1
+                val nextRetry = nextRetryCount(ctx.retryCount, deferred)
                 headers["x-last-error"] = error.javaClass.simpleName
 
-                if (shouldRequeue(ctx)) {
+                if (willRequeue) {
                     headers["x-retry-count"] = nextRetry
                     val retryProperties = ctx.delivery.properties.builder().headers(headers).build()
                     // xdag 走 archive.new-media.retry.v2 / <queue>.retry；其余走 new-media-backend
@@ -554,7 +564,11 @@ class RabbitMqClientManager(
                         body = ctx.body,
                     )
                     ch.basicAck(ctx.delivery.envelope.deliveryTag, false)
-                    logger.warn("【RabbitMQ】任务处理失败，已安排第 $nextRetry 次重试")
+                    if (deferred) {
+                        logger.info("【RabbitMQ】任务已有持久化采集进度，安排延迟续跑，未消耗失败重试次数")
+                    } else {
+                        logger.warn("【RabbitMQ】任务处理失败，已安排第 $nextRetry 次重试")
+                    }
                 } else {
                     headers["x-original-queue"] = ctx.queue
                     val deadProperties = ctx.delivery.properties.builder().headers(headers).build()

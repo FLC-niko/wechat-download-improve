@@ -24,6 +24,7 @@ import com.wamp.download.weread.WeReadSubscriptionRegistrar
 import com.wamp.download.weread.WeReadSubscriptionResolver
 import com.wamp.download.weread.WeReadWebClient
 import com.wamp.download.weread.eink.WeReadEinkSyncService
+import com.wamp.download.weread.eink.WeReadEinkTargetedBudgetExhaustedException
 import com.wamp.download.weread.eink.WeReadEinkRuntime
 import com.wamp.download.article.ArticleIdentityResolver
 import com.wamp.download.wx.WxApiClient
@@ -146,19 +147,11 @@ class TaskProcessor(
         val currentEinkService = einkSyncServiceProvider?.invoke() ?: einkSyncService
         val cached = fetchFromLocalCache(fakeid, startTs, endTs)
         val cacheHasUsableArticles = cached.any { it.link.isNotBlank() }
-        val verifiedIntervals = if (cacheHasUsableArticles) {
-            emptyList()
-        } else {
-            loadVerifiedCoverage(fakeid, startTs, coverageEndTs)
-        }
-        val missingRanges = if (cacheHasUsableArticles) {
-            emptyList()
-        } else {
-            CollectionCoverage.missingRanges(startTs, coverageEndTs, verifiedIntervals)
-        }
+        val verifiedIntervals = loadVerifiedCoverage(fakeid, startTs, coverageEndTs)
+        val missingRanges = CollectionCoverage.missingRanges(startTs, coverageEndTs, verifiedIntervals)
         if (cacheHasUsableArticles) {
             logger.info(
-                "【缓存优先】命中 ${cached.size} 篇可用文章，直接返回并跳过全部远端通道: " +
+                "【缓存优先】命中 ${cached.size} 篇可用文章；覆盖记录仍决定是否需要补齐缺口: " +
                     "fakeid=${fakeid.take(8)}...",
             )
         } else if (missingRanges.isEmpty()) {
@@ -373,6 +366,12 @@ class TaskProcessor(
         service ?: return null
         return try {
             val syncResult = service.syncIfNeeded(subscription, startTs, endTs)
+            if (syncResult.budgetExhausted) {
+                throw WeReadEinkTargetedBudgetExhaustedException(
+                    "E-Ink targeted scan made durable progress but exhausted its page budget: " +
+                        "pages=${syncResult.pages}, fakeid=${subscription.fakeid.take(8)}...",
+                )
+            }
             if (!syncResult.cacheCovered) einkRequestSucceeded(service)
 
             val (articles, total) = ArticleStore.getByFakeidAndRange(
@@ -393,6 +392,7 @@ class TaskProcessor(
                 detail = if (covered) "range-covered" else "sync-finished-without-range-coverage",
             )
         } catch (error: Exception) {
+            if (error is WeReadEinkTargetedBudgetExhaustedException) throw error
             einkRequestFailed(service, error)
             logger.warn(
                 "【E-Ink】同步失败，转 Web 回退: fakeid=${subscription.fakeid.take(8)}..., ${error.message}",

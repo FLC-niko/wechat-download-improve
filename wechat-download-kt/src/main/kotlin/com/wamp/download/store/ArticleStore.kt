@@ -1,7 +1,9 @@
 package com.wamp.download.store
 
 import org.jetbrains.exposed.sql.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.slf4j.LoggerFactory
+import com.wamp.download.weread.WeReadLinkNormalizer
 import java.time.Instant
 
 data class Article(
@@ -33,10 +35,15 @@ object ArticleStore {
     fun saveAll(fakeid: String, articles: List<Article>, source: String = "poll"): Int =
         Database.query {
             var inserted = 0
-            for (a in articles) {
+            for (rawArticle in articles) {
+                val a = rawArticle.copy(link = canonicalizeWeChatLink(rawArticle.link, source))
                 val existing = Articles.selectAll()
                     .where { (Articles.fakeid eq fakeid) and (Articles.link eq a.link) }
                     .singleOrNull()
+                    ?: a.aid.takeIf(String::isNotBlank)?.let { aid ->
+                        Articles.selectAll().where { (Articles.fakeid eq fakeid) and (Articles.aid eq aid) }
+                            .singleOrNull()
+                    }
 
                 if (existing == null) {
                     Articles.insert {
@@ -55,7 +62,7 @@ object ArticleStore {
                     }
                     inserted++
                 } else if (a.content.isNotEmpty() && existing[Articles.content].isEmpty()) {
-                    Articles.update({ (Articles.fakeid eq fakeid) and (Articles.link eq a.link) }) {
+                    Articles.update({ Articles.id eq existing[Articles.id] }) {
                         it[Articles.content] = a.content
                         it[Articles.plainContent] = a.plainContent
                         if (a.author.isNotEmpty() && existing[Articles.author].isEmpty()) {
@@ -66,6 +73,15 @@ object ArticleStore {
             }
             inserted
         }
+
+    private fun canonicalizeWeChatLink(link: String, source: String): String {
+        val parsed = link.trim().toHttpUrlOrNull()
+        if (source.startsWith("eink") || parsed?.host == "mp.weixin.qq.com") {
+            return WeReadLinkNormalizer.sanitizeArticleUrl(link)
+                ?: throw IllegalArgumentException("article URL is not a valid mp.weixin.qq.com article path")
+        }
+        return link
+    }
 
     fun getByFakeid(fakeid: String, limit: Int = 20): List<Article> = Database.query {
         Articles.selectAll()
