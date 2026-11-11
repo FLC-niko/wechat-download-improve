@@ -42,6 +42,26 @@ class WeReadLinkNormalizerTest {
     }
 
     @Test
+    fun `full article url captured from e-ink app is preserved`() {
+        val url = "https://mp.weixin.qq.com/s?__biz=MzI0MzYzODA1NQ==&mid=2247488959" +
+            "&idx=1&sn=7ec8f4620a5f6c05f7e562898844897f&scene=294&subscene=0" +
+            "&clicktag=mp-common-profile&clickpos=0&from_safari=0&ascene=0" +
+            "&devicetype=android-34&version=28004c55&nettype=WIFI&lang=zh_CN"
+
+        assertEquals(url, WeReadLinkNormalizer.normalizeArticleUrl(url))
+        assertEquals(url, WeReadLinkNormalizer.articleUrlFromOriginalId(url))
+    }
+
+    @Test
+    fun `short article url with fragment keeps fragment after token normalization`() {
+        val normalized = WeReadLinkNormalizer.normalizeArticleUrl(
+            "https://mp.weixin.qq.com/s/TdqGgGK~LztBeKkLYF00qw#rd",
+        )
+
+        assertEquals("https://mp.weixin.qq.com/s/TdqGgGK_LztBeKkLYF00qw#rd", normalized)
+    }
+
+    @Test
     fun `original ids are converted to canonical short links`() {
         assertEquals(
             "https://mp.weixin.qq.com/s/TdqGgGK_LztBeKkLYF00qw",
