@@ -730,7 +730,15 @@ object WeReadEinkRuntime {
             it.lastScheduledSyncTarget = target.fakeid
         }
         return try {
-            service.sync(target) { backgroundWorkAllowed() && canContinueBackgroundSync(service) }
+            val syncResult = service.sync(target) { backgroundWorkAllowed() && canContinueBackgroundSync(service) }
+            if (syncResult.budgetExhausted) {
+                updateAccount(account.vid) { it.lastScheduledSyncResult = "PARTIAL_BUDGET" }
+                logger.info(
+                    "E-Ink 后台历史同步达到本轮页数预算，已保存续扫游标: vid=${account.vid}, " +
+                        "fakeid=${target.fakeid.take(8)}..., pages=${syncResult.pages}",
+                )
+                return true
+            }
             account.scheduledSyncSuccessCount.incrementAndGet()
             val previousState = account.authState
             val updated = updateAccount(account.vid) {
@@ -1133,6 +1141,7 @@ object WeReadEinkRuntime {
                 "vid_allowlist" to AppConfig.wereadEinkMobileSyncActivationVidAllowlist.sorted(),
                 "stats" to WeReadEinkTerminalActivationStats.snapshot(),
             ),
+            "review_single_backfills" to WeReadEinkReviewSingleStats.snapshot(),
         )
     }
 

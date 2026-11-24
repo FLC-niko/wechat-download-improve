@@ -49,6 +49,8 @@ data class WeReadEinkArticlesPage(
     val nextOffset: Long? = null,
     val synckey: Long? = null,
     val hasMore: Int? = null,
+    /** Parsed for diagnostics only; real pagination semantics have not been established. */
+    val clearAll: Boolean? = null,
 )
 
 class WeReadEinkChaptersClient(
@@ -205,8 +207,8 @@ class WeReadEinkChaptersClient(
             .addQueryParameter("count", count.toString())
         if (offset != null) {
             builder.addQueryParameter("offset", offset.toString())
-        } else {
-            builder.addQueryParameter("synckey", (synckey ?: 0L).toString())
+        } else if (synckey != null) {
+            builder.addQueryParameter("synckey", synckey.toString())
         }
         return builder.build()
     }
@@ -228,10 +230,14 @@ class WeReadEinkChaptersClient(
             val articles = data.asJsonArray.map { parseArticle(it) }
             val synckey = longField(obj, "synckey")
             val hasMore = longField(obj, "hasMore")?.toInt()?.takeIf { it == 0 || it == 1 }
-            val nextOffset = if (articles.size >= count) {
-                Math.addExact(requestedOffset, articles.size.toLong())
-            } else {
-                null
+            val serverNextOffset = longField(obj, "nextOffset")
+                ?: longField(obj, "next_offset")
+            val nextOffset = when {
+                serverNextOffset != null && serverNextOffset >= 0L -> serverNextOffset
+                hasMore == 1 -> Math.addExact(requestedOffset, count.toLong())
+                hasMore == 0 -> null
+                articles.size >= count -> Math.addExact(requestedOffset, articles.size.toLong())
+                else -> null
             }
             return WeReadEinkArticlesPage(
                 accountId = accountId,
@@ -241,6 +247,7 @@ class WeReadEinkChaptersClient(
                 nextOffset = nextOffset,
                 synckey = synckey,
                 hasMore = hasMore,
+                clearAll = booleanField(obj, "clearAll"),
             )
         } catch (error: WeReadEinkParseException) {
             throw error
@@ -284,6 +291,22 @@ class WeReadEinkChaptersClient(
     private fun longField(obj: JsonObject, name: String): Long? = obj.get(name)
         ?.takeIf { it.isJsonPrimitive }
         ?.let { runCatching { it.asLong }.getOrNull() }
+
+    private fun booleanField(obj: JsonObject, name: String): Boolean? {
+        val value = obj.get(name)?.takeIf { it.isJsonPrimitive } ?: return null
+        return runCatching {
+            when {
+                value.asJsonPrimitive.isBoolean -> value.asBoolean
+                value.asJsonPrimitive.isNumber -> when (value.asInt) { 0 -> false; 1 -> true; else -> null }
+                value.asJsonPrimitive.isString -> when (value.asString.lowercase()) {
+                    "true", "1" -> true
+                    "false", "0" -> false
+                    else -> null
+                }
+                else -> null
+            }
+        }.getOrNull()
+    }
 
     /**
      * Resolves the article URL for a given reviewId by calling `/review/single`.

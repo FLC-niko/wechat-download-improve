@@ -6,7 +6,9 @@ import com.wamp.download.store.PublicAccountCollectionCheckpointStore
 import com.wamp.download.store.Subscription
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.store.WeReadEinkSyncStateStore
+import com.wamp.download.store.WeReadEinkTargetedScanStore
 import com.wamp.download.config.AppConfig
+import com.wamp.download.rabbitmq.RabbitQueueDeferred
 import com.wamp.download.weread.WeReadLinkNormalizer
 import org.slf4j.LoggerFactory
 import java.util.Base64
@@ -18,6 +20,7 @@ import kotlin.math.max
 class WeReadEinkSyncException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
 
 class WeReadEinkBackgroundYieldException : RuntimeException("real-time task requires the E-Ink channel")
+class WeReadEinkTargetedBudgetExhaustedException(message: String) : RuntimeException(message), RabbitQueueDeferred
 
 data class WeReadEinkSyncResult(
     val fakeid: String,
@@ -30,6 +33,9 @@ data class WeReadEinkSyncResult(
     val synckey: Long?,
     val historyComplete: Boolean,
     val cacheCovered: Boolean = false,
+    val reviewSingleBackfills: Int = 0,
+    val partial: Boolean = false,
+    val budgetExhausted: Boolean = false,
 )
 
 /** Synchronizes one subscribed public account through the E-Ink chapters endpoint. */
@@ -38,6 +44,8 @@ class WeReadEinkSyncService(
     private val baseUrl: String = DEFAULT_BASE_URL,
     private val pageSize: Int = DEFAULT_PAGE_SIZE,
     private val maxPages: Int = DEFAULT_MAX_PAGES,
+    private val targetedMaxPages: Int = AppConfig.wereadEinkTargetedMaxPages,
+    private val clockSeconds: () -> Long = { System.currentTimeMillis() / 1000 },
     private val clientFactory: (WeReadEinkSession, String) -> WeReadEinkChaptersClient = { activeSession, url ->
         WeReadEinkChaptersClient(
             credentials = activeSession.credentials(),
@@ -51,6 +59,7 @@ class WeReadEinkSyncService(
     init {
         require(pageSize in 1..100) { "pageSize must be between 1 and 100" }
         require(maxPages >= 1) { "maxPages must be at least 1" }
+        require(targetedMaxPages >= 1) { "targetedMaxPages must be at least 1" }
     }
 
     /** Returns true only when persisted state proves the complete requested range was checked. */
@@ -81,6 +90,7 @@ class WeReadEinkSyncService(
         require(intervalSeconds >= 0) { "intervalSeconds must not be negative" }
         val mpId = resolveMpId(subscription)
         if (mpId.isBlank()) return false
+        if (WeReadEinkTargetedScanStore.get(session.credentials().vid, mpId, 0L, "history") != null) return true
         val state = WeReadEinkSyncStateStore.get(session.credentials().vid, mpId) ?: return true
         if (state.status == "FAILED" && state.lastSyncAt > 0L) {
             return now - state.lastSyncAt >= AppConfig.wereadEinkSyncRetryBackoff
@@ -93,7 +103,9 @@ class WeReadEinkSyncService(
         val mpId = resolveMpId(subscription)
         if (mpId.isBlank()) return false
         val accountVid = session.credentials().vid
-        val synckey = WeReadEinkSyncStateStore.get(accountVid, mpId)?.synckey ?: 0L
+        val synckey = WeReadEinkSyncStateStore.get(accountVid, mpId)
+            ?.takeIf { it.coverageVersion == WeReadEinkSyncStateStore.CURRENT_COVERAGE_VERSION }
+            ?.synckey
         clientFactory(session, baseUrl).fetchArticles(mpId, count = 1, synckey = synckey)
         return true
     }
@@ -110,7 +122,8 @@ class WeReadEinkSyncService(
             throw WeReadEinkSyncException("cannot derive E-Ink mpId for fakeid=${subscription.fakeid.take(8)}...")
         }
         return withSyncLock(session.credentials().vid, mpId) {
-            if (isRangeCovered(subscription, startTime, endTime)) {
+            val pendingScan = WeReadEinkTargetedScanStore.get(session.credentials().vid, mpId, startTime, "targeted")
+            if (pendingScan == null && isRangeCovered(subscription, startTime, endTime)) {
                 return@withSyncLock WeReadEinkSyncResult(
                     fakeid = subscription.fakeid,
                     accountVid = session.credentials().vid,
@@ -165,35 +178,53 @@ class WeReadEinkSyncService(
 
         val fakeid = subscription.fakeid
         val accountVid = session.credentials().vid
-        val scanStartedAt = System.currentTimeMillis() / 1000
+        val scanMode = if (requestedStartTime == null) "history" else "targeted"
+        val scanStartKey = requestedStartTime ?: 0L
+        val pendingScan = WeReadEinkTargetedScanStore.get(accountVid, mpId, scanStartKey, scanMode)
+        val effectiveRequestedEnd = pendingScan?.requestedEnd ?: requestedEndTime
+        val scanStartedAt = pendingScan?.scanStartedAt ?: clockSeconds()
         val storedState = WeReadEinkSyncStateStore.get(accountVid, mpId)
         // Version 0 includes historical rows that could be marked complete even when every
         // returned record failed mapping. Re-baseline those rows from synckey=0.
         val previousState = storedState?.takeIf {
             it.coverageVersion == WeReadEinkSyncStateStore.CURRENT_COVERAGE_VERSION
         }
-        val initialSynckey = previousState?.synckey ?: 0L
+        val initialSynckey = pendingScan?.baseSynckey ?: previousState?.synckey
         val client = clientFactory(session, baseUrl)
         var pages = 0
         var fetchedArticles = 0
         var skippedArticles = 0
         var savedArticles = 0
-        var requestedOffset: Long? = null
-        var nextSynckey: Long? = previousState?.synckey
+        var reviewSingleBackfills = 0
+        var requestedOffset: Long? = when {
+            pendingScan != null -> (pendingScan.nextOffset - pageSize).coerceAtLeast(0L)
+            requestedStartTime != null -> null
+            else -> null
+        }
+        var budgetPages = 0
+        var nextSynckey: Long? = pendingScan?.synckey ?: previousState?.synckey
         var cycleComplete = false
         var targetedRangeComplete = false
         var filteredForRequestedRange = false
-        var cycleOldestCollectedAt: Long? = null
+        var cycleOldestCollectedAt: Long? = pendingScan?.oldestCollectedAt
+        val pageBudget = if (requestedStartTime != null) targetedMaxPages else maxPages
+        var budgetExhausted = false
 
         try {
-            while (pages < maxPages) {
+            while (budgetPages < pageBudget) {
                 ensureShouldContinue(shouldContinue)
+                val isResumeOverlapPage = pendingScan != null && pages == 0
                 val page = if (requestedOffset == null) {
-                    client.fetchArticles(mpId, count = pageSize, synckey = initialSynckey)
+                    client.fetchArticles(
+                        mpId,
+                        count = pageSize,
+                        synckey = if (requestedStartTime == null) initialSynckey else null,
+                    )
                 } else {
                     client.fetchArticles(mpId, count = pageSize, offset = requestedOffset)
                 }
                 pages++
+                if (!isResumeOverlapPage) budgetPages++
                 fetchedArticles += page.articles.size
                 nextSynckey = page.synckey ?: nextSynckey
 
@@ -210,7 +241,7 @@ class WeReadEinkSyncService(
                     }
                     val candidates = supplemental + cover
                     if (candidates.isNotEmpty()) {
-                        val mapped = candidates.mapNotNull { it.toArticle(fakeid, client) }
+                        val mapped = candidates.mapNotNull { it.toArticle(fakeid, client) { reviewSingleBackfills++ } }
                             .filter { it.publishTime > 0L }
                         savedArticles += ArticleStore.saveAll(fakeid, mapped, source = "eink-fallback")
                         fetchedArticles += candidates.size
@@ -245,7 +276,7 @@ class WeReadEinkSyncService(
                 )
                 val mapped = articlesToPersist.mapNotNull { article ->
                     ensureShouldContinue(shouldContinue)
-                    article.toArticle(fakeid, client, cachedArticles[article.reviewId]) ?: run {
+                    article.toArticle(fakeid, client, cachedArticles[article.reviewId]) { reviewSingleBackfills++ } ?: run {
                         logger.warn(
                             "跳过无效的 E-Ink 文章: vid=$accountVid, fakeid=${fakeid.take(8)}..., " +
                                 "reviewId=${article.reviewId.orEmpty().take(32)}",
@@ -284,22 +315,48 @@ class WeReadEinkSyncService(
                         pagesDelta = 1,
                         articlesDelta = mapped.size,
                     )
-                    targetedRangeComplete = requestedStartTime != null && requestedEndTime != null &&
-                        checkpoint.covers(requestedStartTime, requestedEndTime)
+                    targetedRangeComplete = requestedStartTime != null && effectiveRequestedEnd != null &&
+                        checkpoint.covers(requestedStartTime, effectiveRequestedEnd)
                 }
 
                 if (naturalEnd) cycleComplete = true
-                if (targetedRangeComplete || naturalEnd) break
+                if (nextOffset != null) {
+                    WeReadEinkTargetedScanStore.saveProgress(
+                        accountVid = accountVid,
+                        mpId = mpId,
+                        requestedStart = scanStartKey,
+                        requestedEnd = effectiveRequestedEnd ?: 0L,
+                        scanMode = scanMode,
+                        nextOffset = nextOffset,
+                        baseSynckey = previousState?.synckey,
+                        synckey = nextSynckey,
+                        scanStartedAt = scanStartedAt,
+                        oldestCollectedAt = cycleOldestCollectedAt,
+                    )
+                }
+                if (targetedRangeComplete || naturalEnd) {
+                    WeReadEinkTargetedScanStore.delete(accountVid, mpId, scanStartKey, scanMode)
+                    break
+                }
                 requestedOffset = nextOffset
             }
 
             if (!cycleComplete && !targetedRangeComplete) {
-                throw WeReadEinkSyncException("E-Ink pagination exceeded maxPages=$maxPages")
+                budgetExhausted = true
+            }
+            if (requestedStartTime != null && requestedEndTime != null &&
+                effectiveRequestedEnd != null && requestedEndTime > scanStartedAt &&
+                (cycleComplete || targetedRangeComplete)
+            ) {
+                // Finish the frozen window first; a later retry creates a separate scan for its
+                // newer tail instead of claiming the old snapshot covers it.
+                budgetExhausted = true
+                targetedRangeComplete = false
             }
 
-            val completedFullCycle = cycleComplete && !filteredForRequestedRange
+            val completedFullCycle = requestedStartTime == null && cycleComplete && !filteredForRequestedRange
             val historyComplete = previousState?.historyComplete == true ||
-                (completedFullCycle && initialSynckey == 0L)
+                (completedFullCycle && (initialSynckey == null || initialSynckey == 0L))
             if (completedFullCycle) {
                 val coverageStart = if (historyComplete) 0L else previousState?.coverageStart
                 val coverageEnd = max(scanStartedAt, previousState?.coverageEnd ?: 0L)
@@ -313,13 +370,14 @@ class WeReadEinkSyncService(
                     historyComplete = historyComplete,
                 )
             }
-            SubscriptionStore.updateLastPoll(fakeid)
+            if (!budgetExhausted) SubscriptionStore.updateLastPoll(fakeid)
 
             logger.info(
                 // 多账号下成功日志必须带 vid，与失败日志对齐，便于按账号归属统计成功率
                 "E-Ink 同步完成: vid=$accountVid, fakeid=${fakeid.take(8)}..., pages=$pages, " +
-                    "fetched=$fetchedArticles, skipped=$skippedArticles, saved=$savedArticles, " +
-                    "targetCovered=$targetedRangeComplete, fullCycle=$completedFullCycle",
+                "fetched=$fetchedArticles, skipped=$skippedArticles, saved=$savedArticles, " +
+                "review_single_backfills=$reviewSingleBackfills, targetCovered=$targetedRangeComplete, " +
+                    "partial=$budgetExhausted, fullCycle=$completedFullCycle",
             )
             return WeReadEinkSyncResult(
                 fakeid = fakeid,
@@ -331,6 +389,9 @@ class WeReadEinkSyncService(
                 savedArticles = savedArticles,
                 synckey = if (completedFullCycle) nextSynckey else previousState?.synckey,
                 historyComplete = historyComplete,
+                reviewSingleBackfills = reviewSingleBackfills,
+                partial = budgetExhausted,
+                budgetExhausted = budgetExhausted,
             )
         } catch (error: Exception) {
             if (error is WeReadEinkBackgroundYieldException) throw error
@@ -341,7 +402,7 @@ class WeReadEinkSyncService(
                 is WeReadEinkSyncException -> "SYNC_ERROR"
                 else -> "ERROR"
             }
-            runCatching {
+            if (error !is WeReadEinkTargetedBudgetExhaustedException) runCatching {
                 WeReadEinkSyncStateStore.saveFailure(
                     accountVid = accountVid,
                     fakeid = fakeid,
@@ -393,18 +454,15 @@ class WeReadEinkSyncService(
         fakeid: String,
         client: WeReadEinkChaptersClient,
         cachedArticle: Article? = null,
+        onReviewSingleAttempt: () -> Unit = {},
     ): Article? {
         var link = mpInfo?.docUrl
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
-            ?.let(WeReadLinkNormalizer::normalizeArticleUrl)
+            ?.let(WeReadLinkNormalizer::sanitizeArticleUrl)
 
         if (link == null && cachedArticle?.link?.isNotBlank() == true) {
-            link = cachedArticle.link
-        }
-
-        if (link == null && !reviewId.isNullOrBlank()) {
-            link = WeReadLinkNormalizer.shortLinkFromReviewId(reviewId)
+            link = WeReadLinkNormalizer.sanitizeArticleUrl(cachedArticle.link)
         }
 
         if (link == null) {
@@ -414,7 +472,13 @@ class WeReadEinkSyncService(
         }
 
         if (link == null && !reviewId.isNullOrBlank()) {
+            link = WeReadLinkNormalizer.shortLinkFromReviewId(reviewId)
+        }
+
+        if (link == null && !reviewId.isNullOrBlank()) {
             logger.info("文章缺少 docUrl，尝试通过 /review/single 补全: reviewId=$reviewId")
+            onReviewSingleAttempt()
+            WeReadEinkReviewSingleStats.recordAttempt(session.credentials().vid)
             val backfilledUrl = try {
                 client.fetchSingleReviewArticleUrl(reviewId)
             } catch (e: Exception) {
@@ -422,6 +486,7 @@ class WeReadEinkSyncService(
                 null
             }
             link = backfilledUrl?.trim()?.takeIf { it.isNotBlank() }
+                ?.let(WeReadLinkNormalizer::sanitizeArticleUrl)
         }
         
         if (link == null) return null
@@ -447,4 +512,10 @@ class WeReadEinkSyncService(
         const val DEFAULT_MAX_PAGES = 1000
         val SYNC_LOCKS = ConcurrentHashMap<String, ReentrantLock>()
     }
+}
+
+object WeReadEinkReviewSingleStats {
+    private val attempts = ConcurrentHashMap<String, java.util.concurrent.atomic.LongAdder>()
+    fun recordAttempt(vid: String) { attempts.computeIfAbsent(vid) { java.util.concurrent.atomic.LongAdder() }.increment() }
+    fun snapshot(): Map<String, Long> = attempts.mapValues { it.value.sum() }
 }

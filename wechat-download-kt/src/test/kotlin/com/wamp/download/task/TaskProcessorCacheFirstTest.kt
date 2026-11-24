@@ -10,10 +10,11 @@ import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.nio.file.Files
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
 
 class TaskProcessorCacheFirstTest {
     @Test
-    fun `缓存已有可用文章时不需要覆盖记录也不会进入远端抓取计划`() {
+    fun `缓存有文章但缺少覆盖记录时仍检查远端缺口`() {
         withTemporaryDatabase {
             val (start, _) = CaptureWindowParser.parse(listOf("2025-01-01", "2025-01-02"))
             val startTs = checkNotNull(start)
@@ -32,10 +33,11 @@ class TaskProcessorCacheFirstTest {
                 source = "test",
             )
             val processor = TaskProcessor(
-                einkRequestAllowed = { error("缓存已有可用文章时不应规划 E-Ink 请求") },
+                einkRequestAllowed = { error("覆盖未证实，必须继续检查远端缺口") },
             )
-            processor.process(
-                GzhAutoFromBackend(
+            assertFailsWith<IllegalStateException> {
+                runBlocking { processor.process(
+                    GzhAutoFromBackend(
                     queueName = "gzh-auto-BTA-queue",
                     image = "",
                     gzhName = "缓存公众号",
@@ -43,8 +45,9 @@ class TaskProcessorCacheFirstTest {
                     url = "",
                     jobId = 1L,
                     correlationId = "cache-first-test",
-                ),
-            )
+                    ),
+                ) }
+            }
         }
     }
 

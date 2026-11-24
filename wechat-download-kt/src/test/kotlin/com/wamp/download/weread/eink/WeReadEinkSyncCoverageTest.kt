@@ -6,6 +6,7 @@ import com.wamp.download.store.Database
 import com.wamp.download.store.PublicAccountCollectionCheckpointStore
 import com.wamp.download.store.SubscriptionStore
 import com.wamp.download.store.WeReadEinkSyncStateStore
+import com.wamp.download.store.WeReadEinkTargetedScanStore
 import java.io.File
 import java.nio.file.Files
 import kotlin.test.Test
@@ -197,16 +198,130 @@ class WeReadEinkSyncCoverageTest {
                 },
             )
 
-            service.syncIfNeeded(subscription, startTime = 200L, endTime = 230L)
+            val firstWindow = service.syncIfNeeded(subscription, startTime = 200L, endTime = 230L)
+            assertEquals(1, firstWindow.reviewSingleBackfills)
             assertEquals(1, reviewRequests)
             assertEquals(1, chapterRequests)
 
-            service.syncIfNeeded(subscription, startTime = 100L, endTime = 230L)
+            val expandedWindow = service.syncIfNeeded(subscription, startTime = 100L, endTime = 230L)
+            assertEquals(0, expandedWindow.reviewSingleBackfills)
 
             assertEquals(1, reviewRequests)
             assertEquals(3, chapterRequests)
             assertEquals(2, ArticleStore.getByFakeid(subscription.fakeid).size)
             assertTrue(service.isRangeCovered(subscription, 100L, 230L))
+        }
+    }
+
+    @Test
+    fun `originalId wins over reviewId short link and avoids review single`() {
+        withTemporaryDatabase {
+            val sub = subscription("original-id-priority")
+            val fullUrl = "https://mp.weixin.qq.com/s?__biz=Biz&mid=22&idx=1&sn=secure&pass_ticket=secret"
+            val service = serviceWith(
+                """{"data":[{"reviewId":"MP_WXS_test_review-token","title":"Original","createTime":1700000000,"mpInfo":{"originalId":"$fullUrl"}}],"hasMore":0}""",
+            )
+
+            val result = service.syncIfNeeded(sub, startTime = 1_700_000_000L, endTime = 1_700_000_010L)
+
+            assertEquals(0, result.reviewSingleBackfills)
+            assertEquals(
+                "https://mp.weixin.qq.com/s?__biz=Biz&mid=22&idx=1&sn=secure",
+                ArticleStore.getByFakeid(sub.fakeid).single().link,
+            )
+        }
+    }
+
+    @Test
+    fun `targeted budget resumes after database restart with overlap and refreshes a newer frozen-window tail`() {
+        val dbFile = Files.createTempFile("targeted-budget-restart-", ".db").toFile().apply { delete() }
+        var clock = 10_000L
+        try {
+            Database.init(dbFile.absolutePath)
+            val sub = subscription("target-budget-resume")
+            val start = 8_000L
+            val firstEnd = 9_500L
+            val laterEnd = 10_001L
+            val chapterRequests = mutableListOf<Pair<String?, Boolean>>()
+            val firstPage = """{"data":[{"reviewId":"r-new","title":"new","createTime":9900,"mpInfo":{"doc_url":"https://mp.weixin.qq.com/s/new"}}],"hasMore":1,"nextOffset":1,"synckey":11}"""
+            val boundaryPage = """{"data":[{"reviewId":"r-old","title":"old","createTime":8000,"mpInfo":{"doc_url":"https://mp.weixin.qq.com/s/old"}}],"hasMore":0,"synckey":12}"""
+            fun service() = WeReadEinkSyncService(
+                session = session(), baseUrl = "https://eink.example.test", pageSize = 1, maxPages = 20,
+                targetedMaxPages = 1, clockSeconds = { clock },
+                clientFactory = { activeSession, baseUrl ->
+                    WeReadEinkChaptersClient(
+                        credentials = activeSession.credentials(),
+                        transport = WeReadEinkTransport { request ->
+                            if (request.url.encodedPath.endsWith("/mp/chapters")) {
+                                val offset = request.url.queryParameter("offset")
+                                chapterRequests += offset to request.url.queryParameterNames.contains("synckey")
+                                WeReadEinkResponse(200, if (offset == "1") boundaryPage else firstPage)
+                            } else WeReadEinkResponse(404, "not used")
+                        },
+                        baseUrl = baseUrl, session = activeSession,
+                        requestGate = { _, block -> block() }, maxTransientRetries = 0,
+                    )
+                },
+            )
+
+            val first = service().syncIfNeeded(sub, start, firstEnd)
+            assertTrue(first.partial && first.budgetExhausted)
+            assertEquals(null to false, chapterRequests[0])
+            val saved = checkNotNull(WeReadEinkTargetedScanStore.get("vid-coverage", sub.wereadMpId, start, "targeted"))
+            assertEquals(firstEnd, saved.requestedEnd)
+            assertEquals(1L, saved.nextOffset)
+            assertEquals(null, saved.baseSynckey)
+            assertEquals(11L, saved.synckey)
+
+            // Reopening the same offline SQLite database models process restart.
+            Database.init(dbFile.absolutePath)
+            val resumed = service().syncIfNeeded(sub, start, laterEnd)
+            assertTrue(resumed.partial && resumed.budgetExhausted)
+            assertEquals(listOf(null to false, "0" to false, "1" to false), chapterRequests)
+            assertEquals(2, ArticleStore.getByFakeid(sub.fakeid).size)
+            assertEquals(null, WeReadEinkTargetedScanStore.get("vid-coverage", sub.wereadMpId, start, "targeted"))
+            assertFalse(service().isRangeCovered(sub, start, laterEnd))
+
+            clock = 10_002L
+            val final = service().syncIfNeeded(sub, start, laterEnd)
+            assertFalse(final.partial)
+            assertTrue(service().isRangeCovered(sub, start, laterEnd))
+            assertEquals(listOf(null to false, "0" to false, "1" to false, null to false), chapterRequests)
+        } finally {
+            listOf(dbFile.absolutePath, "${dbFile.absolutePath}-wal", "${dbFile.absolutePath}-shm").forEach { File(it).delete() }
+        }
+    }
+
+    @Test
+    fun `failed resumed page leaves targeted offset unchanged`() {
+        withTemporaryDatabase {
+            val sub = subscription("target-budget-failed-page")
+            val now = System.currentTimeMillis() / 1000L
+            val start = now - 1_000L
+            val requests = mutableListOf<String?>()
+            val firstPage = """{"data":[{"reviewId":"r-new","title":"new","createTime":${now - 100},"mpInfo":{"doc_url":"https://mp.weixin.qq.com/s/new"}}],"hasMore":1,"nextOffset":1}"""
+            val service = WeReadEinkSyncService(
+                session = session(), baseUrl = "https://eink.example.test", pageSize = 1, maxPages = 10,
+                targetedMaxPages = 1,
+                clientFactory = { activeSession, baseUrl ->
+                    WeReadEinkChaptersClient(
+                        credentials = activeSession.credentials(),
+                        transport = WeReadEinkTransport { request ->
+                            val offset = request.url.queryParameter("offset")
+                            requests += offset
+                            if (offset == "1") throw java.io.IOException("synthetic offline page failure")
+                            WeReadEinkResponse(200, firstPage)
+                        },
+                        baseUrl = baseUrl, session = activeSession,
+                        requestGate = { _, block -> block() }, maxTransientRetries = 0,
+                    )
+                },
+            )
+            service.syncIfNeeded(sub, start, now - 500L)
+            assertFailsWith<java.io.IOException> { service.syncIfNeeded(sub, start, now - 500L) }
+            val pending = checkNotNull(WeReadEinkTargetedScanStore.get("vid-coverage", sub.wereadMpId, start, "targeted"))
+            assertEquals(1L, pending.nextOffset)
+            assertEquals(listOf(null, "0", "1"), requests)
         }
     }
 

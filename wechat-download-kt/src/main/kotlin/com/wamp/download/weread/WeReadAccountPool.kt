@@ -29,8 +29,13 @@ object WeReadAccountPool {
     private val registryLock = Any()
     private val saveLock = Any()
     private val scheduleLock = Any()
+    @Volatile private var accountDirOverrideForTest: File? = null
 
-    private fun accountDir(): File = File(AppConfig.wereadAccountDir).apply { mkdirs() }
+    private fun accountDir(): File = (accountDirOverrideForTest ?: File(AppConfig.wereadAccountDir)).apply { mkdirs() }
+
+    internal fun setAccountDirForTest(path: String?) {
+        accountDirOverrideForTest = path?.let(::File)
+    }
 
     init {
         loadAll()
@@ -64,6 +69,22 @@ object WeReadAccountPool {
                 } catch (e: Exception) {
                     logger.warn("微信读书账号解析失败: ${file.name}, ${e.message}")
                 }
+            }
+    }
+
+    /** Loads only a caller-provided test directory and never attempts legacy credential migration. */
+    internal fun loadDirectoryForTest(path: String) {
+        accounts.clear()
+        inUse.clear()
+        persistenceErrors.clear()
+        probeSuccessAt.clear()
+        File(path).listFiles()
+            ?.filter { it.isFile && it.name.endsWith(".json") }
+            ?.forEach { file ->
+                runCatching { gson.fromJson(file.readText(), WeReadAccount::class.java).normalized() }
+                    .getOrNull()
+                    ?.takeIf { it.vid.isNotBlank() }
+                    ?.let { accounts[it.vid] = it }
             }
     }
 
@@ -450,11 +471,12 @@ object WeReadAccountPool {
         }
     }
 
-    /** 账号级人工验证已通过（如浏览器自动解题）：恢复启用，等待下一次探测确认。 */
+    /** 账号级人工验证已通过：立即恢复启用，丢弃此前人工验证和过期冷却状态。 */
     fun clearHumanVerificationRequired(vid: String): Boolean {
         val cleared = mutateIf(vid) { account ->
             if (account.status != AccountStatus.HUMAN_VERIFY_REQUIRED) return@mutateIf false
             account.status = AccountStatus.ACTIVE
+            account.cooldownUntil = 0L
             account.disabledReason = ""
             true
         }

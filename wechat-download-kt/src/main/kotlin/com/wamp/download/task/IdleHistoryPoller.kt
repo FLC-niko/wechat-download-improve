@@ -98,9 +98,15 @@ object IdleHistoryPoller {
                     },
                 )
                 
-                WeReadEinkRuntime.recordTaskRequestSuccess(einkService)
-                
-                logger.info("闲时回源成功: fakeid=${sub.fakeid.take(8)}..., 获取 ${result.fetchedArticles} 篇")
+                if (result.budgetExhausted) {
+                    logger.info(
+                        "闲时历史回源达到本轮页数预算，已保存续扫游标: " +
+                            "fakeid=${sub.fakeid.take(8)}..., pages=${result.pages}",
+                    )
+                } else {
+                    WeReadEinkRuntime.recordTaskRequestSuccess(einkService)
+                    logger.info("闲时回源成功: fakeid=${sub.fakeid.take(8)}..., 获取 ${result.fetchedArticles} 篇")
+                }
                 
                 // Sleep between accounts to avoid hitting API limits
                 delay(Random.nextLong(10000L, 30000L))

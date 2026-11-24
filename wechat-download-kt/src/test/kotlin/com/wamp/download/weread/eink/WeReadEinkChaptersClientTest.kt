@@ -12,6 +12,34 @@ import kotlin.test.assertTrue
 
 class WeReadEinkChaptersClientTest {
     @Test
+    fun `first request omits synckey when there is no stored incremental cursor`() {
+        val transport = RecordingTransport(WeReadEinkResponse(200, """{"data":[],"hasMore":0}"""))
+        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test", requestGate = { _, request -> request() })
+
+        client.fetchArticles("MP_WXS_1", count = 50, synckey = null)
+
+        assertFalse(transport.requests.single().url.queryParameterNames.contains("synckey"))
+    }
+
+    @Test
+    fun `synthetic hasMore short page advances by requested page size and parses clearAll`() {
+        val transport = RecordingTransport(
+            WeReadEinkResponse(200, """{"data":[{"reviewId":"x"}],"hasMore":1,"clearAll":1}"""),
+            WeReadEinkResponse(200, """{"data":[],"hasMore":0,"clearAll":false}"""),
+        )
+        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test", requestGate = { _, request -> request() })
+
+        val first = client.fetchArticles("MP_WXS_1", count = 50, offset = 100)
+        val second = client.fetchArticles("MP_WXS_1", count = 50, offset = first.nextOffset)
+
+        assertEquals(150L, first.nextOffset)
+        assertEquals(true, first.clearAll)
+        assertEquals(150L, second.requestedOffset)
+        assertNull(second.nextOffset)
+        assertEquals(false, second.clearAll)
+    }
+
+    @Test
     fun `first request uses synckey and later request uses offset`() {
         val transport = RecordingTransport(
             WeReadEinkResponse(
@@ -38,6 +66,7 @@ class WeReadEinkChaptersClientTest {
             credentials = credentials(),
             transport = transport,
             baseUrl = "https://eink.example.test",
+            requestGate = { _, request -> request() },
         )
 
         val first = client.fetchArticles(accountId = "MP_WXS_1", count = 2, synckey = 0)
@@ -69,7 +98,7 @@ class WeReadEinkChaptersClientTest {
     @Test
     fun `synckey and offset cannot be mixed`() {
         val transport = RecordingTransport()
-        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test")
+        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test", requestGate = { _, request -> request() })
 
         assertFailsWith<IllegalArgumentException> {
             client.fetchArticles("MP_WXS_1", synckey = 1, offset = 0)
@@ -82,7 +111,7 @@ class WeReadEinkChaptersClientTest {
         val transport = RecordingTransport(
             WeReadEinkResponse(200, "{\"errCode\":-2041,\"errMsg\":\"verify\"}"),
         )
-        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test")
+        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test", requestGate = { _, request -> request() })
 
         val error = assertFailsWith<WeReadEinkApiException> {
             client.fetchArticles("MP_WXS_1")
@@ -102,6 +131,7 @@ class WeReadEinkChaptersClientTest {
             credentials = credentials(),
             transport = transport,
             baseUrl = "https://eink.example.test",
+            requestGate = { _, request -> request() },
             verificationHeaders = {
                 mapOf("wr_ticket" to "ticket-value", "wr_randstr" to "randstr-value")
             },
@@ -197,6 +227,7 @@ class WeReadEinkChaptersClientTest {
             credentials = credentials(),
             transport = transport,
             baseUrl = "https://eink.example.test",
+            requestGate = { _, request -> request() },
             stringRequestGate = { _, block -> block() },
         )
 
@@ -214,7 +245,7 @@ class WeReadEinkChaptersClientTest {
     @Test
     fun `missing data array is a parse error`() {
         val transport = RecordingTransport(WeReadEinkResponse(200, "{\"synckey\":1}"))
-        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test")
+        val client = WeReadEinkChaptersClient(credentials(), transport, "https://eink.example.test", requestGate = { _, request -> request() })
 
         assertFailsWith<WeReadEinkParseException> {
             client.fetchArticles("MP_WXS_1")

@@ -43,6 +43,7 @@ object Articles : IntIdTable("articles") {
     init {
         uniqueIndex("idx_articles_fakeid_link", fakeid, link)
         index("idx_articles_fakeid_time", isUnique = false, fakeid, publishTime)
+        index("idx_articles_fakeid_aid", isUnique = false, fakeid, aid)
     }
 }
 
@@ -62,6 +63,22 @@ object WeReadEinkSyncStates : Table("weread_eink_sync_states") {
     val errorMessage = text("error_message").default("")
 
     override val primaryKey = PrimaryKey(accountVid, mpId)
+}
+
+/** Durable cursor for bounded real-time backfills, isolated from incremental background sync. */
+object WeReadEinkTargetedScans : Table("weread_eink_targeted_scans") {
+    val accountVid = varchar("account_vid", 255)
+    val mpId = text("mp_id")
+    val scanMode = varchar("scan_mode", 16)
+    val requestedStart = long("requested_start")
+    val requestedEnd = long("requested_end")
+    val nextOffset = long("next_offset")
+    val baseSynckey = long("base_synckey").nullable()
+    val synckey = long("synckey").nullable()
+    val scanStartedAt = long("scan_started_at")
+    val oldestCollectedAt = long("oldest_collected_at").nullable()
+
+    override val primaryKey = PrimaryKey(accountVid, mpId, scanMode, requestedStart)
 }
 
 /**
@@ -160,6 +177,7 @@ object Database {
                 Articles,
                 RabbitInbox,
                 WeReadEinkSyncStates,
+                WeReadEinkTargetedScans,
                 PublicAccountCollectionCheckpoints,
                 ArticleCoverageIntervals,
             )
